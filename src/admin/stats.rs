@@ -1,4 +1,4 @@
-use crate::state::{MetricsWindow, RouterState};
+use crate::state::{list_request_log_archives, MetricsWindow, RouterState};
 use crate::util::{now_ms, query_get};
 use hyper::{Body, Response};
 use serde::Serialize;
@@ -176,7 +176,7 @@ pub(crate) async fn api_requests_history(state: Arc<RouterState>, uri: &http::Ur
         .clamp(1, 5000);
     let before: Option<u64> = query_get(uri, "before").and_then(|s| s.parse().ok());
 
-    let path = state.requests_log_path.clone();
+    let path = state.requests_log_dir.clone();
     let items = match tokio::task::spawn_blocking(move || {
         read_request_log_reverse(&path, limit, before)
     }).await {
@@ -436,9 +436,48 @@ fn write_prometheus_keys(buf: &mut String, upstreams: &[Arc<crate::state::Upstre
     let _ = writeln!(buf, "gptload_keys_cooldown {}", cooldown_keys);
 }
 
-/// Read JSONL log file from end to start using reverse chunk reading.
-/// Avoids loading the entire file into memory — only accumulates matching entries.
+/// Read historical requests from the log directory (current file + archives), newest first.
+/// Archives are `requests-YYYY-MM-DD.jsonl` files; the current file is `requests.jsonl`.
+/// Files are read in reverse-chronological order; within each file, entries are read from
+/// the tail using 4 KB chunked reverse reads.
 fn read_request_log_reverse(
+    dir: &std::path::Path,
+    limit: usize,
+    before: Option<u64>,
+) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(limit);
+    let mut cursor = before;
+
+    // 1. Current file (today's entries, newest first).
+    let current = dir.join("requests.jsonl");
+    if current.exists() {
+        let items = read_single_log_reverse(&current, limit - out.len(), cursor);
+        if let Some(oldest) = items.last().and_then(|v| v.get("ts_ms").and_then(|t| t.as_u64())) {
+            cursor = Some(oldest);
+        }
+        out.extend(items);
+    }
+
+    // 2. Archive files (newest first).
+    if out.len() < limit {
+        let archives = list_request_log_archives(dir);
+        for (_date, path) in archives.iter().rev() {
+            if out.len() >= limit {
+                break;
+            }
+            let items = read_single_log_reverse(path, limit - out.len(), cursor);
+            if let Some(oldest) = items.last().and_then(|v| v.get("ts_ms").and_then(|t| t.as_u64())) {
+                cursor = Some(oldest);
+            }
+            out.extend(items);
+        }
+    }
+
+    out
+}
+
+/// Reverse chunk reader for a single JSONL file. Reads from end to start in 4 KB chunks.
+fn read_single_log_reverse(
     path: &std::path::Path,
     limit: usize,
     before: Option<u64>,
