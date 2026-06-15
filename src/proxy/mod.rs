@@ -58,7 +58,7 @@ pub(crate) struct RequestLogContext {
     pub(crate) billing_model: Option<String>,
     pub(crate) billing_key: Option<String>,
     pub(crate) req_bytes: usize,
-    pub(crate) request_headers: Option<std::collections::BTreeMap<String, String>>,
+    /// Kept in-memory for token estimation; NOT persisted to RequestLogEntry.
     pub(crate) request_body: Option<String>,
     pub(crate) queue_ms: u64,
     pub(crate) is_stream: Option<bool>,
@@ -74,7 +74,6 @@ impl RequestLogContext {
         model: Option<String>,
         upstream_id: Option<String>,
         req_bytes: usize,
-        request_headers: Option<std::collections::BTreeMap<String, String>>,
         request_body: Option<String>,
         queue_ms: u64,
     ) -> Self {
@@ -88,7 +87,6 @@ impl RequestLogContext {
             billing_model: None,
             billing_key: None,
             req_bytes,
-            request_headers,
             request_body,
             queue_ms,
             is_stream: None, // set later when parsing req body

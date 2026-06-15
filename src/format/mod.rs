@@ -47,6 +47,6 @@ pub async fn adapt_response(
     up_resp: Response<Body>,
     stream_request: bool,
     model: Option<String>,
-) -> Response<Body> {
+) -> (Response<Body>, Option<String>) {
     adapt_response_inner(format, up_resp, stream_request, model).await
 }

@@ -3,24 +3,6 @@ use crate::state::{RouterState, HDR_AUTHORIZATION};
 use hyper::header::CONTENT_TYPE;
 use hyper::{Body, Response};
 
-pub(super) fn sanitize_log_headers(
-    headers: &hyper::HeaderMap,
-) -> Option<std::collections::BTreeMap<String, String>> {
-    if headers.is_empty() {
-        return None;
-    }
-    let mut out = std::collections::BTreeMap::new();
-    for (name, value) in headers.iter() {
-        let key = name.as_str().to_ascii_lowercase();
-        if key == "authorization" || key == "x-api-key" || key.contains("token") {
-            out.insert(key, "<redacted>".to_string());
-        } else if let Ok(v) = value.to_str() {
-            out.insert(key, v.chars().take(512).collect());
-        }
-    }
-    Some(out)
-}
-
 pub(super) fn extract_api_key(headers: &hyper::HeaderMap) -> Option<String> {
     // Validate key chars inline (hot path, no allocation for invalid keys).
     fn key_ok(k: &str) -> bool {

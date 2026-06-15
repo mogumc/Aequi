@@ -4,27 +4,32 @@ use std::path::Path;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RequestLogEntry {
+    // ── Identity ──
     pub id: u64,
     pub ts_ms: u64,
+    // ── Request ──
     pub client_ip: String,
     pub method: String,
     pub path: String,
     pub model: Option<String>,
     pub upstream_id: Option<String>,
+    pub is_stream: Option<bool>,
     pub billing_key: Option<String>,
+    // ── Response ──
     pub status: u16,
     pub latency_ms: u64,
+    pub timing: RequestTiming,
+    // ── Size ──
     pub req_bytes: usize,
     pub resp_bytes: usize,
+    // ── Usage ──
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub thought_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub token_source: Option<String>,
-    pub request_headers: Option<BTreeMap<String, String>>,
-    pub request_body: Option<String>,
-    pub timing: RequestTiming,
-    pub is_stream: Option<bool>,
+    // ── Error ──
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]

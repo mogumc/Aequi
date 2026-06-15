@@ -121,7 +121,6 @@ async fn handle_inner(
         None,
         0,
         None,
-        None,
         0,
     );
 
@@ -144,6 +143,7 @@ async fn handle_inner(
                 &base_log_ctx,
                 resp.status().as_u16(),
                 resp_bytes,
+                None,
                 None,
             );
             resp
