@@ -1,6 +1,6 @@
 [package]
 name = "aequi"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
 license = "MIT"
 description = "High-performance OpenAI-format transparent proxy with multi-upstream + multi-key load balancing, admin API/UI, hot key reload, and realtime stats."

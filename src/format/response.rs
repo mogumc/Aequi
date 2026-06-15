@@ -11,23 +11,64 @@ pub(super) async fn adapt_response_inner(
     up_resp: Response<Body>,
     stream_request: bool,
     model: Option<String>,
-) -> Response<Body> {
+) -> (Response<Body>, Option<String>) {
+    // Non-2xx: unified error handling for all formats.
+    if !up_resp.status().is_success() {
+        return handle_upstream_error(up_resp).await;
+    }
+
     match format {
-        UpstreamFormat::Openai => up_resp,
+        UpstreamFormat::Openai => (up_resp, None),
         UpstreamFormat::Anthropic => {
             if stream_request {
-                transform_sse_response(up_resp, model, anthropic_sse_to_openai)
+                (transform_sse_response(up_resp, model, anthropic_sse_to_openai), None)
             } else {
-                transform_json_response(up_resp, model, anthropic_json_to_openai).await
+                let resp = transform_json_response(up_resp, model, anthropic_json_to_openai).await;
+                (resp, None)
             }
         }
         UpstreamFormat::Gemini => {
             if stream_request {
-                transform_sse_response(up_resp, model, gemini_sse_to_openai)
+                (transform_sse_response(up_resp, model, gemini_sse_to_openai), None)
             } else {
-                transform_json_response(up_resp, model, gemini_json_to_openai).await
+                let resp = transform_json_response(up_resp, model, gemini_json_to_openai).await;
+                (resp, None)
             }
         }
+    }
+}
+
+/// Handle upstream non-2xx responses: read the error body for logging,
+/// return a sanitized gateway error to the client.
+/// The upstream's original error message is only recorded in the request log,
+/// never exposed to the client (prevents sensitive data leakage from non-standard APIs).
+async fn handle_upstream_error(up_resp: Response<Body>) -> (Response<Body>, Option<String>) {
+    let (parts, body) = up_resp.into_parts();
+    let body_bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
+    // Original error — logged only, never sent to client.
+    let error_msg = extract_upstream_error(&body_bytes);
+    let error_type = map_upstream_error_type(parts.status.as_u16());
+    let error_body = serde_json::json!({
+        "error": {
+            "message": error_type,
+            "code": parts.status.as_u16()
+        }
+    });
+    let resp = Response::from_parts(parts, Body::from(error_body.to_string()));
+    (resp, Some(error_msg))
+}
+
+/// Map upstream HTTP status to a unified error description.
+/// Serves as both the client-facing message and error type — ensures consistent
+/// output regardless of which upstream or error format produced the failure.
+fn map_upstream_error_type(status: u16) -> &'static str {
+    match status {
+        400 => "upstream_invalid_request",
+        401 | 403 => "upstream_authentication_failed",
+        404 => "upstream_resource_not_found",
+        429 => "upstream_rate_limit_exceeded",
+        500..=599 => "upstream_server_error",
+        _ => "upstream_error",
     }
 }
 
@@ -49,21 +90,11 @@ async fn transform_json_response(
             );
             return Response::from_parts(
                 parts,
-                Body::from(r#"{"error":{"message":"failed to read upstream response"}}"#),
+                Body::from(r#"{"error":{"message":"failed to read upstream response","type":"upstream_error"}}"#),
             );
         }
     };
-    if !parts.status.is_success() {
-        let error_msg = extract_upstream_error(&body);
-        let error_body = serde_json::json!({
-            "error": {
-                "message": error_msg,
-                "type": "upstream_error",
-                "code": parts.status.as_u16()
-            }
-        });
-        return Response::from_parts(parts, Body::from(error_body.to_string()));
-    }
+    // Non-2xx is handled by handle_upstream_error before reaching here.
     parts.headers.remove(CONTENT_LENGTH);
     parts.headers.remove(CONTENT_ENCODING);
     parts.headers.insert(
@@ -87,9 +118,7 @@ fn transform_sse_response(
     f: fn(&serde_json::Value, Option<&str>) -> Vec<serde_json::Value>,
 ) -> Response<Body> {
     let (mut parts, body) = up_resp.into_parts();
-    if !parts.status.is_success() {
-        return Response::from_parts(parts, body);
-    }
+    // Caller (adapt_response_inner) guarantees 2xx — non-2xx is handled by handle_upstream_error.
     parts.headers.remove(CONTENT_LENGTH);
     parts.headers.remove(CONTENT_ENCODING);
     parts.headers.insert(

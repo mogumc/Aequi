@@ -21,38 +21,44 @@ pub(super) fn record_request(
     status: u16,
     resp_bytes: usize,
     usage: Option<UsageTokens>,
+    upstream_error: Option<String>,
 ) {
     if !ctx.path.starts_with("/v1") {
         return;
     }
     let total_ms = ctx.start.elapsed().as_millis() as u64;
     let entry = RequestLogEntry {
+        // ── Identity ──
         id: REQUEST_LOG_ID.fetch_add(1, Ordering::Relaxed),
         ts_ms: now_ms(),
+        // ── Request ──
         client_ip: ctx.client_ip.clone(),
         method: ctx.method.clone(),
         path: ctx.path.clone(),
         model: ctx.model.clone(),
         upstream_id: ctx.upstream_id.clone(),
+        is_stream: ctx.is_stream,
         billing_key: ctx.billing_key.clone(),
+        // ── Response ──
         status,
         latency_ms: total_ms,
-        req_bytes: ctx.req_bytes,
-        resp_bytes,
-        prompt_tokens: usage.as_ref().map(|u| u.prompt),
-        completion_tokens: usage.as_ref().map(|u| u.billing_completion()),
-        thought_tokens: usage.as_ref().map(|u| u.thought),
-        total_tokens: usage.map(|u| u.total),
-        token_source: ctx.token_source.clone(),
-        request_headers: ctx.request_headers.clone(),
-        request_body: ctx.request_body.clone(),
         timing: RequestTiming {
             queue_ms: ctx.queue_ms,
             upstream_ms: total_ms.saturating_sub(ctx.queue_ms),
             total_ms,
             attempts: 0,
         },
-        is_stream: ctx.is_stream,
+        // ── Size ──
+        req_bytes: ctx.req_bytes,
+        resp_bytes,
+        // ── Usage ──
+        prompt_tokens: usage.as_ref().map(|u| u.prompt),
+        completion_tokens: usage.as_ref().map(|u| u.billing_completion()),
+        thought_tokens: usage.as_ref().map(|u| u.thought),
+        total_tokens: usage.map(|u| u.total),
+        token_source: ctx.token_source.clone(),
+        // ── Error ──
+        error: upstream_error,
     };
     state.record_request(entry);
 }
@@ -73,7 +79,7 @@ pub(super) fn logged_response(
     ctx: &RequestLogContext,
     resp: Response<Body>,
 ) -> Response<Body> {
-    record_request(state, ctx, resp.status().as_u16(), 0, None);
+    record_request(state, ctx, resp.status().as_u16(), 0, None, None);
     resp
 }
 
@@ -182,6 +188,7 @@ pub(super) async fn proxy_upstream_response(
     stream_request: bool,
     billing_key: Option<String>,
     lifecycle: Option<RequestLifecycle>,
+    upstream_error: Option<String>,
 ) -> Response<Body> {
     let (mut parts, body) = up_resp.into_parts();
     sanitize_hop_headers(&mut parts.headers);
@@ -210,6 +217,7 @@ pub(super) async fn proxy_upstream_response(
             &state,
             &log_ctx,
             billing_key.as_deref(),
+            upstream_error,
         )
         .await;
 
@@ -239,6 +247,7 @@ pub(super) async fn proxy_upstream_response(
     let state_w = state.clone();
     let log_ctx_w = log_ctx.clone();
     let billing_key_w = billing_key.clone();
+    let upstream_error_w = upstream_error.clone();
 
     let bill_handle = tokio::spawn(async move {
         let _lifecycle = lifecycle;
@@ -324,7 +333,7 @@ pub(super) async fn proxy_upstream_response(
 
         let mut ctx_with_source = log_ctx.clone();
         ctx_with_source.token_source = token_source;
-        record_request(&state, &ctx_with_source, status.as_u16(), resp_bytes, effective);
+        record_request(&state, &ctx_with_source, status.as_u16(), resp_bytes, effective, upstream_error);
     });
 
     // Watchdog: if the billing task panics, release the reservation so the
@@ -335,7 +344,7 @@ pub(super) async fn proxy_upstream_response(
                 if let Some(key) = billing_key_w.as_deref() {
                     let _ = state_w.billing.release_reservation(key);
                 }
-                record_request(&state_w, &log_ctx_w, status.as_u16(), 0, None);
+                record_request(&state_w, &log_ctx_w, status.as_u16(), 0, None, upstream_error_w);
             }
         }
     });
@@ -353,6 +362,7 @@ async fn read_and_bill_body(
     state: &Arc<RouterState>,
     log_ctx: &RequestLogContext,
     billing_key: Option<&str>,
+    upstream_error: Option<String>,
 ) -> (Vec<u8>, bool) {
     use hyper::body::HttpBody;
     const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -477,7 +487,7 @@ async fn read_and_bill_body(
     }
     let mut ctx_with_source = log_ctx.clone();
     ctx_with_source.token_source = token_source;
-    record_request(state, &ctx_with_source, status.as_u16(), resp_bytes, usage);
+    record_request(state, &ctx_with_source, status.as_u16(), resp_bytes, usage, upstream_error);
 
     (out_bytes, was_decompressed)
 }

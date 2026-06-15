@@ -1,30 +1,36 @@
 use super::*;
 
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RequestLogEntry {
+    // ── Identity ──
     pub id: u64,
     pub ts_ms: u64,
+    // ── Request ──
     pub client_ip: String,
     pub method: String,
     pub path: String,
     pub model: Option<String>,
     pub upstream_id: Option<String>,
+    pub is_stream: Option<bool>,
     pub billing_key: Option<String>,
+    // ── Response ──
     pub status: u16,
     pub latency_ms: u64,
+    pub timing: RequestTiming,
+    // ── Size ──
     pub req_bytes: usize,
     pub resp_bytes: usize,
+    // ── Usage ──
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub thought_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub token_source: Option<String>,
-    pub request_headers: Option<BTreeMap<String, String>>,
-    pub request_body: Option<String>,
-    pub timing: RequestTiming,
-    pub is_stream: Option<bool>,
+    // ── Error ──
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -98,9 +104,21 @@ impl RequestsLog {
     pub fn record(&self, entry: RequestLogEntry) {
         let _ = self.broadcast_tx.send(entry.clone());
         if let Some(tx) = &self.tx {
-            if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) = tx.try_send(entry.clone()) {
-                if !self.writer_dead.swap(true, Ordering::Relaxed) {
-                    tracing::error!("request log writer task has died — file logging disabled for remaining process lifetime");
+            match tx.try_send(entry.clone()) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    if !self.writer_dead.swap(true, Ordering::Relaxed) {
+                        tracing::error!("request log writer task has died — file logging disabled for remaining process lifetime");
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(e)) => {
+                    // Channel saturated — retry asynchronously to avoid losing this entry to disk.
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        if tx.send(e).await.is_err() {
+                            tracing::error!("request log writer channel closed during retry");
+                        }
+                    });
                 }
             }
         }
@@ -239,7 +257,56 @@ pub(super) fn update_bucket(
     }
 }
 
-pub(super) fn start_request_log_writer(path: PathBuf, pause: Arc<AtomicBool>) -> Option<mpsc::Sender<RequestLogEntry>> {
+/// Format a Unix timestamp as "YYYY-MM-DD" in UTC.
+fn format_utc_date(secs: u64) -> String {
+    let days = secs / 86400;
+    // Howard Hinnant's civil_from_days algorithm (public domain).
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// List archive files (`requests-YYYY-MM-DD.jsonl`) in `dir`, sorted oldest-first.
+pub fn list_request_log_archives(dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut archives: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("requests-")
+                && name.ends_with(".jsonl")
+                && name.len() == "requests-YYYY-MM-DD.jsonl".len()
+            {
+                let date = name["requests-".len()..name.len() - ".jsonl".len()].to_string();
+                // Basic date format validation.
+                if date.len() == 10
+                    && date.as_bytes()[4] == b'-'
+                    && date.as_bytes()[7] == b'-'
+                    && date.chars().all(|c| c.is_ascii_digit() || c == '-')
+                {
+                    Some((date, e.path()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+    archives.sort_by(|a, b| a.0.cmp(&b.0));
+    archives
+}
+
+pub(super) fn start_request_log_writer(path: PathBuf) -> Option<mpsc::Sender<RequestLogEntry>> {
     // Open the file synchronously so we can detect failure immediately.
     let file = match std::fs::OpenOptions::new()
         .create(true)
@@ -257,153 +324,168 @@ pub(super) fn start_request_log_writer(path: PathBuf, pause: Arc<AtomicBool>) ->
     let std_file = file;
 
     tokio::spawn(async move {
-        let mut file = tokio::fs::File::from_std(std_file);
+        // Option<File> tracks ownership across rotation: take() releases the handle
+        // for rename, then Some(new_file) replaces it. The borrow checker requires
+        // this because drop(file) invalidates the binding until reassignment.
+        let mut file: Option<tokio::fs::File> = Some(tokio::fs::File::from_std(std_file));
 
         let mut pending = 0usize;
+        // Periodic flush safety net — ensures unflushed data doesn't linger during low traffic.
         let mut tick = tokio::time::interval(Duration::from_secs(1));
-        let mut pause_buf: Vec<RequestLogEntry> = Vec::new();
-        let mut was_paused = false;
+
+        // Track current date for daily rotation.
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut current_date = format_utc_date(now_secs);
 
         loop {
+            // Check if the UTC day has changed — rotate if so.
+            let new_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let new_date = format_utc_date(new_secs);
+            if new_date != current_date {
+                // Flush and release the current file handle.
+                if let Some(f) = file.as_mut() {
+                    let _ = f.flush().await;
+                }
+                let old_file = file.take();
+                drop(old_file);
+
+                // Skip rotation for empty files — avoids creating zero-byte archives
+                // when no requests were received all day.
+                let file_size = tokio::fs::metadata(&path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+
+                if file_size > 0 {
+                    let archive_path = path.with_file_name(format!("requests-{current_date}.jsonl"));
+                    match tokio::fs::rename(&path, &archive_path).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                archive = %archive_path.display(),
+                                "rotated request log to archive"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                src = %path.display(),
+                                dst = %archive_path.display(),
+                                error = %e,
+                                "failed to rotate request log"
+                            );
+                        }
+                    }
+                }
+
+                // Always open a (new or existing) file for the new day.
+                // If rename failed the old file remains; append mode preserves its content.
+                match tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .await
+                {
+                    Ok(f) => file = Some(f),
+                    Err(e) => {
+                        tracing::error!(
+                            path = %path.display(),
+                            error = %e,
+                            "failed to open new request log after rotation — file logging disabled"
+                        );
+                        break;
+                    }
+                }
+
+                current_date = new_date;
+                pending = 0;
+            }
+
             tokio::select! {
                 entry = rx.recv() => {
                     let Some(entry) = entry else { break; };
-                    if pause.load(Ordering::Relaxed) {
-                        pause_buf.push(entry);
-                        continue;
-                    }
-                    if let Ok(line) = serde_json::to_string(&entry) {
-                        if file.write_all(line.as_bytes()).await.is_ok() {
-                            let _ = file.write_all(b"\n").await;
-                            pending += 1;
+                    if let Some(f) = file.as_mut() {
+                        if let Ok(line) = serde_json::to_string(&entry) {
+                            if f.write_all(line.as_bytes()).await.is_ok() {
+                                let _ = f.write_all(b"\n").await;
+                                pending += 1;
+                            }
                         }
-                    }
-                    if pending >= 256 {
-                        let _ = file.flush().await;
-                        pending = 0;
+                        // Flush in batches of 256 to balance throughput and durability.
+                        if pending >= 256 {
+                            let _ = f.flush().await;
+                            pending = 0;
+                        }
                     }
                 }
                 _ = tick.tick() => {
-                    let paused = pause.load(Ordering::Relaxed);
-                    if paused {
-                        was_paused = true;
-                    } else {
-                        // Reopen file after cleanup may have renamed it.
-                        if was_paused {
-                            was_paused = false;
-                            let _ = file.flush().await;
-                            match tokio::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(&path)
-                                .await
-                            {
-                                Ok(f) => file = f,
-                                Err(e) => tracing::warn!(
-                                    path = %path.display(), error = %e,
-                                    "request log reopen failed after cleanup"
-                                ),
-                            }
+                    if pending > 0 {
+                        if let Some(f) = file.as_mut() {
+                            let _ = f.flush().await;
                         }
-                        // Drain any buffered entries in FIFO order.
-                        for entry in pause_buf.drain(..) {
-                            if let Ok(line) = serde_json::to_string(&entry) {
-                                if file.write_all(line.as_bytes()).await.is_ok() {
-                                    let _ = file.write_all(b"\n").await;
-                                    pending += 1;
-                                }
-                            }
-                            if pending >= 256 {
-                                let _ = file.flush().await;
-                                pending = 0;
-                            }
-                        }
-                        if pending > 0 {
-                            let _ = file.flush().await;
-                            pending = 0;
-                        }
+                        pending = 0;
                     }
                 }
             }
         }
 
-        let _ = file.flush().await;
+        if let Some(f) = file.as_mut() {
+            let _ = f.flush().await;
+        }
     });
 
     Some(tx)
 }
 
-/// Clean old request log entries from the JSONL file.
-/// Uses temp-file + rename to avoid data loss from concurrent writes.
-/// Returns (entries_kept, entries_removed).
+/// Delete archive files older than `retention_days`. Archives are named `requests-YYYY-MM-DD.jsonl`,
+/// so we compare the date in the filename against the cutoff — no need to read file contents.
+/// Returns (files_kept, files_removed).
 pub(super) async fn cleanup_request_log(
-    path: &Path,
+    dir: &Path,
     retention_days: u64,
-    pause: &AtomicBool,
 ) -> (usize, usize) {
     if retention_days == 0 {
         return (0, 0);
     }
-    let cutoff_ms = now_ms().saturating_sub(retention_days * 86_400_000);
 
-    // Pause log writer to prevent concurrent writes.
-    pause.store(true, Ordering::Relaxed);
-    // Brief wait for in-flight writes to finish (writer flushes every 1s).
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let cutoff_date = format_utc_date(now_secs.saturating_sub(retention_days * 86_400));
 
-    let content = match tokio::fs::read_to_string(path).await {
-        Ok(c) => c,
-        Err(_) => {
-            pause.store(false, Ordering::Relaxed);
-            return (0, 0);
-        }
-    };
-
+    let archives = list_request_log_archives(dir);
     let mut kept = 0usize;
     let mut removed = 0usize;
-    let mut new_content = String::with_capacity(content.len());
 
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(ts) = v.get("ts_ms").and_then(|t| t.as_u64()) {
-                if ts < cutoff_ms {
+    for (date, path) in &archives {
+        if date.as_str() < cutoff_date.as_str() {
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => {
+                    tracing::info!(file = %path.display(), "deleted expired request log archive");
                     removed += 1;
-                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(file = %path.display(), error = %e, "failed to delete expired request log archive");
+                    kept += 1;
                 }
             }
-        }
-        new_content.push_str(line);
-        new_content.push('\n');
-        kept += 1;
-    }
-
-    if removed > 0 {
-        let tmp_path = path.with_extension("jsonl.tmp");
-        let result = async {
-            tokio::fs::write(&tmp_path, &new_content).await?;
-            tokio::fs::rename(&tmp_path, path).await?;
-            Ok::<_, std::io::Error>(())
-        }.await;
-
-        if let Err(e) = result {
-            tracing::warn!(path = %path.display(), error = %e, "request log cleanup write failed");
-            pause.store(false, Ordering::Relaxed);
-            return (0, 0);
+        } else {
+            kept += 1;
         }
     }
 
-    pause.store(false, Ordering::Relaxed);
     (kept, removed)
 }
 
 /// Sleep until the next occurrence of the given UTC time-of-day (seconds since midnight).
 pub(super) async fn sleep_until_utc(target_secs: u64) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let day_secs: u64 = 86_400;
     let today_target = (now.as_secs() / day_secs) * day_secs + target_secs;
@@ -415,8 +497,8 @@ pub(super) async fn sleep_until_utc(target_secs: u64) {
     tokio::time::sleep(Duration::from_secs(next_target.saturating_sub(now.as_secs()))).await;
 }
 
-/// Spawn a task that cleans old request log entries once daily at a fixed time (03:00 UTC).
-pub fn spawn_request_log_cleanup(path: PathBuf, retention_days: u64, pause: Arc<AtomicBool>) {
+/// Spawn a task that deletes expired request log archives daily at 03:00 UTC.
+pub fn spawn_request_log_cleanup(dir: PathBuf, retention_days: u64) {
     if retention_days == 0 {
         return;
     }
@@ -424,9 +506,8 @@ pub fn spawn_request_log_cleanup(path: PathBuf, retention_days: u64, pause: Arc<
         loop {
             sleep_until_utc(3 * 3600).await;
 
-            let (kept, removed) = cleanup_request_log(&path, retention_days, &pause).await;
+            let (kept, removed) = cleanup_request_log(&dir, retention_days).await;
             tracing::info!(
-                path = %path.display(),
                 kept,
                 removed,
                 retention_days,

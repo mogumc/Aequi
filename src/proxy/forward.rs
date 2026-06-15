@@ -2,7 +2,7 @@ use super::response::{
     build_upstream_request, logged_json_error, logged_response, parse_retry_after_ms,
     proxy_upstream_response, should_retry_status,
 };
-use super::usage::{ensure_stream_usage, parse_request_json, sanitize_log_headers};
+use super::usage::{ensure_stream_usage, parse_request_json};
 use super::{RequestLogContext, RequestLifecycle};
 use crate::billing::ReserveResult;
 use crate::config::UpstreamFormat;
@@ -191,7 +191,7 @@ async fn execute_attempt(
                 }
             }
 
-            let up_resp = format::adapt_response(
+            let (up_resp, upstream_error) = format::adapt_response(
                 upstream.format,
                 up_resp,
                 stream_request,
@@ -206,6 +206,7 @@ async fn execute_attempt(
                 stream_request,
                 Some(billing_key.to_string()),
                 lifecycle.take(),
+                upstream_error,
             )
             .await)
         }
@@ -329,7 +330,6 @@ pub(super) async fn forward(
     let out_method = parts.method.clone();
     let version = parts.version;
     let headers = parts.headers.clone();
-    let request_headers = sanitize_log_headers(&headers);
 
     // Read body into bytes for potential retries.
     let body_bytes = match read_request_body(body).await {
@@ -337,6 +337,7 @@ pub(super) async fn forward(
         Err(resp) => return resp,
     };
     let req_bytes = body_bytes.len();
+    // Kept in-memory for token estimation only — NOT persisted to the request log.
     let request_body = String::from_utf8(body_bytes.to_vec())
         .ok()
         .filter(|s| s.len() <= 16 * 1024);
@@ -366,7 +367,6 @@ pub(super) async fn forward(
         model.clone(),
         None,
         req_bytes,
-        request_headers,
         request_body,
         0,
     );

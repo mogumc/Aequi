@@ -48,7 +48,7 @@ pub struct RouterState {
     pub model_routes_path: PathBuf,
     pub model_costs_path: PathBuf,
     pub upstreams_path: PathBuf,
-    pub requests_log_path: PathBuf,
+    pub requests_log_dir: PathBuf,
 
     pub snapshot: ArcSwap<RouterSnapshot>,
     pub sched_rr: Arc<AtomicUsize>,
@@ -65,7 +65,6 @@ pub struct RouterState {
     pub listen_addr: String,
     pub worker_threads: Option<usize>,
     pub data_dir: PathBuf,
-    pub log_write_pause: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -132,7 +131,7 @@ impl Clone for RouterState {
             model_routes_path: self.model_routes_path.clone(),
             model_costs_path: self.model_costs_path.clone(),
             upstreams_path: self.upstreams_path.clone(),
-            requests_log_path: self.requests_log_path.clone(),
+            requests_log_dir: self.requests_log_dir.clone(),
             snapshot: ArcSwap::from(self.snapshot.load_full()),
             sched_rr: Arc::new(AtomicUsize::new(
                 self.sched_rr.load(std::sync::atomic::Ordering::Relaxed),
@@ -148,7 +147,6 @@ impl Clone for RouterState {
             listen_addr: self.listen_addr.clone(),
             worker_threads: self.worker_threads,
             data_dir: self.data_dir.clone(),
-            log_write_pause: self.log_write_pause.clone(),
         }
     }
 }
@@ -305,30 +303,47 @@ impl RouterState {
         let model_routes_path = data_dir.join("models_routes.json");
         let model_costs_path = data_dir.join("models_costs.json");
         let upstreams_path = data_dir.join("upstreams.json");
-        let requests_log_path = data_dir.join("requests.jsonl");
-        let log_pause = Arc::new(AtomicBool::new(false));
-        let log_tx = start_request_log_writer(requests_log_path.clone(), log_pause.clone());
+        let requests_log_dir = data_dir.clone();
+        let requests_log_path = requests_log_dir.join("requests.jsonl");
+        let log_tx = start_request_log_writer(requests_log_path.clone());
         let requests = Arc::new(RequestsLog::new(5000, log_tx));
 
-        // Load last 5000 entries from file into memory (no file write, already persisted).
-        if let Ok(content) = std::fs::read_to_string(&requests_log_path) {
-            let mut loaded = 0usize;
-            let entries: Vec<RequestLogEntry> = content
-                .lines()
-                .rev()
-                .take(5000)
-                .filter_map(|line| {
-                    let entry = serde_json::from_str::<RequestLogEntry>(line.trim()).ok()?;
-                    loaded += 1;
-                    Some(entry)
-                })
-                .collect();
-            requests.load_history(entries.into_iter().rev());
-            tracing::info!(
-                path = %requests_log_path.display(),
-                loaded,
-                "loaded historical request logs"
-            );
+        // Load up to 5000 recent entries from current + archive files into memory.
+        {
+            let mut all_entries: Vec<RequestLogEntry> = Vec::new();
+
+            // Current file (today's entries).
+            if let Ok(content) = std::fs::read_to_string(&requests_log_path) {
+                let entries: Vec<RequestLogEntry> = content
+                    .lines()
+                    .rev()
+                    .filter_map(|line| serde_json::from_str(line.trim()).ok())
+                    .collect();
+                all_entries.extend(entries.into_iter().rev());
+            }
+
+            // Recent archive files (newest first), until we reach the 5000 cap.
+            if all_entries.len() < 5000 {
+                let archives = list_request_log_archives(&requests_log_dir);
+                for (_date, path) in archives.iter().rev() {
+                    if all_entries.len() >= 5000 {
+                        break;
+                    }
+                    if let Ok(content) = std::fs::read_to_string(path) {
+                        let entries: Vec<RequestLogEntry> = content
+                            .lines()
+                            .rev()
+                            .take(5000 - all_entries.len())
+                            .filter_map(|line| serde_json::from_str(line.trim()).ok())
+                            .collect();
+                        all_entries.extend(entries.into_iter().rev());
+                    }
+                }
+            }
+
+            let loaded = all_entries.len().min(5000);
+            requests.load_history(all_entries.into_iter().rev().take(5000).rev());
+            tracing::info!(dir = %requests_log_dir.display(), loaded, "loaded historical request logs");
         }
 
         // Check monthly usage reset.
@@ -338,7 +353,7 @@ impl RouterState {
         spawn_monthly_reset_check(store.clone());
 
         let retention_days = runtime.server.request_log_retention_days;
-        spawn_request_log_cleanup(requests_log_path.clone(), retention_days, log_pause.clone());
+        spawn_request_log_cleanup(data_dir.clone(), retention_days);
 
         let mut upstream_configs: Vec<UpstreamConfig> = Vec::new();
         if let Ok(list) = load_upstreams_override(&upstreams_path) {
@@ -410,7 +425,7 @@ impl RouterState {
             model_routes_path,
             model_costs_path,
             upstreams_path,
-            requests_log_path,
+            requests_log_dir,
             snapshot: ArcSwap::from(Arc::new(snapshot)),
             sched_rr: Arc::new(AtomicUsize::new(0)),
             client,
@@ -424,7 +439,6 @@ impl RouterState {
             listen_addr: cfg.listen_addr.clone(),
             worker_threads: cfg.worker_threads,
             data_dir,
-            log_write_pause: log_pause,
         })
     }
 
