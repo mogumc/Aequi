@@ -144,55 +144,6 @@ fn openai_part_to_anthropic(part: &serde_json::Value) -> Option<serde_json::Valu
     None
 }
 
-/// Convert OpenAI-format content (string or array) to Gemini parts.
-fn content_to_gemini_parts(content: &serde_json::Value) -> Vec<serde_json::Value> {
-    match content {
-        serde_json::Value::Array(parts) => parts
-            .iter()
-            .filter_map(|part| openai_part_to_gemini(part))
-            .collect(),
-        serde_json::Value::String(s) => {
-            if s.len() > MAX_DECODED_BYTES {
-                tracing::warn!(text_len = s.len(), "gemini: text content dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
-                return vec![];
-            }
-            vec![serde_json::json!({"text": s})]
-        }
-        _ => {
-            let text = content_to_text(content);
-            if text.is_empty() { return vec![]; }
-            if text.len() > MAX_DECODED_BYTES {
-                tracing::warn!(text_len = text.len(), "gemini: fallback text content dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
-                return vec![];
-            }
-            vec![serde_json::json!({"text": text})]
-        }
-    }
-}
-
-/// Convert a single OpenAI content part to a Gemini part.
-fn openai_part_to_gemini(part: &serde_json::Value) -> Option<serde_json::Value> {
-    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-    let text = part
-        .get("text")
-        .and_then(|t| t.as_str())
-        .or_else(|| part.get("content").and_then(|t| t.as_str()));
-    if let Some(s) = text {
-        if part_type.is_empty() || part_type == "text" {
-            return Some(serde_json::json!({"text": s}));
-        }
-    }
-
-    if let Some(att) = extract_binary_attachment(part, "gemini") {
-        return Some(serde_json::json!({"inlineData": {"mimeType": att.mime, "data": att.data}}));
-    }
-    if matches!(part_type, "image_url" | "input_audio" | "file") {
-        return None;
-    }
-
-    None
-}
 
 /// Parse a data URI "data:<mime>;base64,<data>" → (mime, data).
 /// Returns None if the decoded data exceeds `max_bytes`.
@@ -348,6 +299,7 @@ pub(super) fn adapt_request_inner(
         path_and_query: http::uri::PathAndQuery::from_static("/v1/messages"),
         body: Bytes::from(out.to_string()),
         auth_style: AuthStyle::AnthropicKey,
+        extra_headers: Vec::new(),
     })
 }
 
@@ -355,7 +307,6 @@ pub(super) fn adapt_request_inner_gemini(
     original_pq: &http::uri::PathAndQuery,
     body: &Bytes,
     model: &str,
-    key: &str,
 ) -> Result<AdaptedRequest, Response<Body>> {
     if !is_chat_completions_path(original_pq.path()) {
         return Err(format_error(
@@ -374,7 +325,7 @@ pub(super) fn adapt_request_inner_gemini(
     let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     let mut system_parts = Vec::new();
-    let mut contents = Vec::new();
+    let mut input = Vec::new();
     if let Some(input_messages) = v.get("messages").and_then(|m| m.as_array()) {
         for msg in input_messages {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
@@ -389,38 +340,46 @@ pub(super) fn adapt_request_inner_gemini(
                 }
                 continue;
             }
-            let parts = content_to_gemini_parts(&content);
-            if parts.is_empty() {
+            let text = content_to_text(&content);
+            if text.is_empty() {
                 continue;
             }
-            let out_role = if role == "assistant" { "model" } else { "user" };
-            contents.push(serde_json::json!({
-                "role": out_role,
-                "parts": parts,
+            // Interactions API uses Step objects for stateless multi-turn input.
+            let step_type = if role == "assistant" { "model_output" } else { "user_input" };
+            input.push(serde_json::json!({
+                "type": step_type,
+                "content": [{"type": "text", "text": text}],
             }));
         }
     }
 
-    let mut out = serde_json::json!({ "contents": contents });
+    // Build Interactions API request body.
+    let mut out = serde_json::json!({
+        "model": model,
+        "input": input,
+        "store": false,
+    });
     if !system_parts.is_empty() {
-        out["systemInstruction"] = serde_json::json!({
-            "parts": [{"text": system_parts.join("\n\n")}]
-        });
+        out["system_instruction"] = serde_json::Value::String(system_parts.join("\n\n"));
+    }
+    if stream {
+        out["stream"] = serde_json::Value::Bool(true);
     }
 
+    // generation_config with snake_case field names (Interactions API).
     let mut generation = serde_json::Map::new();
     if let Some(n) = v
         .get("max_tokens")
         .or_else(|| v.get("max_completion_tokens"))
         .and_then(|n| n.as_u64())
     {
-        generation.insert("maxOutputTokens".to_string(), serde_json::json!(n));
+        generation.insert("max_output_tokens".to_string(), serde_json::json!(n));
     }
     if let Some(n) = v.get("temperature").and_then(|n| n.as_f64()) {
         generation.insert("temperature".to_string(), serde_json::json!(n));
     }
     if let Some(n) = v.get("top_p").and_then(|n| n.as_f64()) {
-        generation.insert("topP".to_string(), serde_json::json!(n));
+        generation.insert("top_p".to_string(), serde_json::json!(n));
     }
     if let Some(stop) = v.get("stop") {
         let stops = match stop {
@@ -429,42 +388,27 @@ pub(super) fn adapt_request_inner_gemini(
             _ => Vec::new(),
         };
         if !stops.is_empty() {
-            generation.insert("stopSequences".to_string(), serde_json::Value::Array(stops));
+            generation.insert("stop_sequences".to_string(), serde_json::Value::Array(stops));
         }
     }
     if !generation.is_empty() {
-        out["generationConfig"] = serde_json::Value::Object(generation);
+        out["generation_config"] = serde_json::Value::Object(generation);
     }
 
-    let model_path = if model.starts_with("models/") {
-        model.to_string()
-    } else {
-        format!("models/{model}")
-    };
-    let action = if stream {
-        "streamGenerateContent"
-    } else {
-        "generateContent"
-    };
-    let encoded_key = crate::util::url_encode(key);
-    let path = if stream {
-        format!("/v1beta/{model_path}:{action}?alt=sse&key={encoded_key}")
-    } else {
-        format!("/v1beta/{model_path}:{action}?key={encoded_key}")
-    };
+    let path_and_query = http::uri::PathAndQuery::from_static("/v1beta/interactions");
 
-    let path_and_query = path.parse().map_err(|_| {
-        format_error(
-            http::StatusCode::BAD_GATEWAY,
-            "invalid gemini upstream path",
-            "invalid_upstream_uri",
-        )
-    })?;
+    // Api-Revision header to opt into the latest Interactions API schema.
+    let extra_headers = vec![(
+        hyper::header::HeaderName::from_static("api-revision"),
+        hyper::header::HeaderValue::from_static("2026-05-20"),
+    )];
+
     Ok(AdaptedRequest {
         method: Method::POST,
         path_and_query,
         body: Bytes::from(out.to_string()),
-        auth_style: AuthStyle::None,
+        auth_style: AuthStyle::GeminiKey,
+        extra_headers,
     })
 }
 
@@ -486,7 +430,6 @@ mod tests {
             &Method::POST,
             &body,
             "claude-3",
-            "sk-ant-test",
         )
         .unwrap();
         assert_eq!(adapted.path_and_query.as_str(), "/v1/messages");
@@ -497,24 +440,60 @@ mod tests {
     }
 
     #[test]
-    fn gemini_request_uses_generate_content_path() {
+    fn gemini_request_uses_interactions_api() {
         let body = Bytes::from_static(
-            br#"{"model":"gemini-1.5-pro","messages":[{"role":"user","content":"hi"}],"stream":false}"#,
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"system","content":"you are helpful"},{"role":"user","content":"hi"}],"stream":false}"#,
         );
         let adapted = adapt_request(
             UpstreamFormat::Gemini,
             &"/v1/chat/completions".parse().unwrap(),
             &Method::POST,
             &body,
-            "gemini-1.5-pro",
-            "AIza test",
+            "gemini-3.5-flash",
         )
         .unwrap();
-        assert!(adapted
-            .path_and_query
-            .as_str()
-            .starts_with("/v1beta/models/gemini-1.5-pro:generateContent?key="));
+        // Path should be /v1beta/interactions with no key in query string
+        assert_eq!(adapted.path_and_query.as_str(), "/v1beta/interactions");
+        // No alt=sse for Interactions API
+        assert!(!adapted.path_and_query.as_str().contains("key="));
         let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
-        assert_eq!(v["contents"][0]["role"], "user");
+        assert_eq!(v["model"], "gemini-3.5-flash");
+        // Input uses Step objects: {type: "user_input", content: [{type: "text", text: "..."}]}
+        assert_eq!(v["input"][0]["type"], "user_input");
+        assert_eq!(v["input"][0]["content"][0]["type"], "text");
+        assert_eq!(v["input"][0]["content"][0]["text"], "hi");
+        assert!(v["input"][0].get("role").is_none(), "Step objects must not have 'role' field");
+        assert!(v["input"][0].get("parts").is_none(), "Interactions API must not use 'parts' field");
+        assert_eq!(v["system_instruction"], "you are helpful");
+        assert_eq!(v["store"], false);
+        // Api-Revision header
+        assert!(adapted.extra_headers.iter().any(|(n, v)| n.as_str() == "api-revision" && v == "2026-05-20"));
+        // Auth via GeminiKey
+        assert!(matches!(adapted.auth_style, AuthStyle::GeminiKey));
+    }
+
+    /// Multi-turn: assistant messages become "model_output" steps.
+    #[test]
+    fn gemini_multiturn_uses_step_objects() {
+        let body = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"role":"user","content":"again"}],"stream":false}"#,
+        );
+        let adapted = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "user_input");
+        assert_eq!(input[0]["content"][0]["text"], "hello");
+        assert_eq!(input[1]["type"], "model_output");
+        assert_eq!(input[1]["content"][0]["text"], "hi");
+        assert_eq!(input[2]["type"], "user_input");
+        assert_eq!(input[2]["content"][0]["text"], "again");
     }
 }

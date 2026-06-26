@@ -250,8 +250,6 @@ pub(crate) struct UpstreamInfo {
     responses_3xx: u64,
     responses_4xx: u64,
     responses_5xx: u64,
-    errors_timeout: u64,
-    errors_network: u64,
 }
 
 pub(crate) fn build_upstream_info(u: &crate::state::Upstream, global_max: u32) -> UpstreamInfo {
@@ -304,14 +302,6 @@ pub(crate) fn build_upstream_info(u: &crate::state::Upstream, global_max: u32) -
         responses_5xx: u
             .stats
             .responses_5xx
-            .load(std::sync::atomic::Ordering::Relaxed),
-        errors_timeout: u
-            .stats
-            .errors_timeout
-            .load(std::sync::atomic::Ordering::Relaxed),
-        errors_network: u
-            .stats
-            .errors_network
             .load(std::sync::atomic::Ordering::Relaxed),
     }
 }

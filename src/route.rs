@@ -2,6 +2,7 @@ use crate::admin;
 use crate::state::RouterState;
 use bytes::Bytes;
 use hyper::{Body, Method, Request, Response};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
@@ -154,16 +155,34 @@ async fn stats_stream(state: Arc<RouterState>) -> Response<Body> {
     let state2 = state.clone();
 
     tokio::spawn(async move {
-        let mut last_total = state2
-            .stats
-            .requests_total
-            .load(std::sync::atomic::Ordering::Relaxed);
+        // Sliding window RPM: track request totals over 3 minutes at 2-second intervals.
+        // This avoids the old approach (2s delta × 30) which always reads 0 under low traffic.
+        const WINDOW_SECS: u64 = 180; // 3-minute sliding window
+        const TICK_MS: u64 = 2_000;
+        let max_samples = (WINDOW_SECS * 1_000 / TICK_MS) as usize; // 90
+        let mut window: VecDeque<u64> = VecDeque::with_capacity(max_samples + 1);
+
         loop {
             let snap = admin::build_snapshot(&state2);
             let total = snap.requests_total;
-            let raw = total.saturating_sub(last_total); // requests since last tick (2s)
-            last_total = total;
-            let rpm = raw.saturating_mul(30); // extrapolate to per-minute
+
+            window.push_back(total);
+            if window.len() > max_samples {
+                window.pop_front();
+            }
+
+            // Rolling RPM = requests_in_window / window_duration_in_minutes
+            // Need ≥2 samples to compute a meaningful rate.
+            let rpm = if window.len() >= 2 {
+                let oldest = *window.front().unwrap();
+                let newest = *window.back().unwrap();
+                let intervals = (window.len() - 1) as u64;
+                let window_secs = intervals * (TICK_MS / 1_000);
+                let reqs = newest.saturating_sub(oldest);
+                reqs * 60 / window_secs.max(1)
+            } else {
+                0
+            };
 
             let mut v = serde_json::to_value(&snap)
                 .unwrap_or(serde_json::json!({"error":"snapshot_failed"}));

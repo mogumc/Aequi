@@ -92,6 +92,7 @@ pub(super) fn build_upstream_request(
     sel: &crate::state::Selected,
     injected: bool,
     auth_style: AuthStyle,
+    extra_headers: &[(hyper::header::HeaderName, hyper::header::HeaderValue)],
 ) -> Result<Request<Body>, Response<Body>> {
     let mut builder = hyper::Request::builder()
         .method(method)
@@ -119,6 +120,7 @@ pub(super) fn build_upstream_request(
     out_req.headers_mut().remove(HDR_AUTHORIZATION);
     out_req.headers_mut().remove("x-api-key");
     out_req.headers_mut().remove("anthropic-version");
+    out_req.headers_mut().remove("x-goog-api-key");
     match auth_style {
         AuthStyle::OpenAiBearer => {
             out_req
@@ -139,13 +141,22 @@ pub(super) fn build_upstream_request(
                 http::HeaderValue::from_static("2023-06-01"),
             );
         }
-        AuthStyle::None => {}
+        AuthStyle::GeminiKey => {
+            let key = http::HeaderValue::from_str(sel.key.key.as_ref()).map_err(|_| {
+                RouterState::json_error(
+                    http::StatusCode::BAD_GATEWAY,
+                    "invalid upstream key header",
+                    "request_build_error",
+                )
+            })?;
+            out_req.headers_mut().insert("x-goog-api-key", key);
+        }
     }
     // Apply custom header overrides (skip protected auth headers).
     if !sel.upstream.custom_headers.is_empty() {
         for (name, val) in sel.upstream.custom_headers.iter() {
             let lower = name.to_ascii_lowercase();
-            if lower == "authorization" || lower == "x-api-key" || lower == "anthropic-version" {
+            if lower == "authorization" || lower == "x-api-key" || lower == "anthropic-version" || lower == "x-goog-api-key" {
                 continue;
             }
             match val {
@@ -164,6 +175,10 @@ pub(super) fn build_upstream_request(
                 }
             }
         }
+    }
+    // Apply format-specific extra headers (e.g. Api-Revision for Gemini Interactions API).
+    for (name, value) in extra_headers {
+        out_req.headers_mut().insert(name.clone(), value.clone());
     }
     if injected || !body_bytes.is_empty() {
         out_req.headers_mut().remove(CONTENT_LENGTH);

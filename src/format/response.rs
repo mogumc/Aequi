@@ -115,7 +115,7 @@ async fn transform_json_response(
 fn transform_sse_response(
     up_resp: Response<Body>,
     model: Option<String>,
-    f: fn(&serde_json::Value, Option<&str>) -> Vec<serde_json::Value>,
+    f: fn(&serde_json::Value, Option<&str>, &str) -> Vec<serde_json::Value>,
 ) -> Response<Body> {
     let (mut parts, body) = up_resp.into_parts();
     // Caller (adapt_response_inner) guarantees 2xx — non-2xx is handled by handle_upstream_error.
@@ -130,6 +130,7 @@ fn transform_sse_response(
         use hyper::body::HttpBody;
         let mut body = body;
         let mut buf = String::new();
+        let mut current_event = String::new();
         while let Some(chunk) = body.data().await {
             let Ok(chunk) = chunk else {
                 break;
@@ -138,6 +139,10 @@ fn transform_sse_response(
             while let Some(pos) = buf.find('\n') {
                 let line = buf[..pos].trim_end_matches('\r').to_string();
                 buf.drain(..=pos);
+                if let Some(event) = line.strip_prefix("event:") {
+                    current_event = event.trim().to_string();
+                    continue;
+                }
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
                 };
@@ -148,7 +153,7 @@ fn transform_sse_response(
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
                     continue;
                 };
-                for chunk in f(&value, model.as_deref()) {
+                for chunk in f(&value, model.as_deref(), &current_event) {
                     let msg = format!("data: {}\n\n", chunk);
                     if tx.send(Ok(Bytes::from(msg))).await.is_err() {
                         return;
@@ -201,47 +206,47 @@ fn anthropic_json_to_openai(v: &serde_json::Value, model: Option<String>) -> ser
 
 fn gemini_json_to_openai(v: &serde_json::Value, model: Option<String>) -> serde_json::Value {
     let model = model.unwrap_or_default();
-    let candidate = v
-        .get("candidates")
-        .and_then(|c| c.as_array())
-        .and_then(|a| a.first())
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let content = candidate
-        .get("content")
-        .and_then(|c| c.get("parts"))
-        .and_then(|p| p.as_array())
-        .map(|parts| {
-            parts
+
+    // Extract text from steps[type="model_output"].content[*].text
+    let content = v
+        .get("steps")
+        .and_then(|s| s.as_array())
+        .map(|steps| {
+            steps
                 .iter()
+                .filter(|s| s.get("type").and_then(|t| t.as_str()) == Some("model_output"))
+                .filter_map(|s| s.get("content").and_then(|c| c.as_array()))
+                .flatten()
                 .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
                 .collect::<Vec<_>>()
                 .join("")
         })
         .unwrap_or_default();
-    let prompt = v
-        .get("usageMetadata")
-        .and_then(|u| u.get("promptTokenCount"))
-        .and_then(|n| n.as_u64())
+
+    // Extract usage — API returns total_input_tokens / total_output_tokens / total_thought_tokens / total_tokens.
+    // Also accepts prompt_tokens / completion_tokens for forward compatibility.
+    let usage = v.get("usage");
+    let prompt = usage
+        .and_then(|u| {
+            u.get("prompt_tokens")
+                .and_then(|n| n.as_u64())
+                .or_else(|| u.get("total_input_tokens").and_then(|n| n.as_u64()))
+        })
         .unwrap_or(0);
-    let candidates = v
-        .get("usageMetadata")
-        .and_then(|u| u.get("candidatesTokenCount"))
-        .and_then(|n| n.as_u64())
+    let completion = usage
+        .and_then(|u| {
+            u.get("completion_tokens")
+                .and_then(|n| n.as_u64())
+                .or_else(|| u.get("total_output_tokens").and_then(|n| n.as_u64()))
+        })
         .unwrap_or(0);
-    let thought = v
-        .get("usageMetadata")
-        .and_then(|u| u.get("thoughtsTokenCount"))
-        .and_then(|n| n.as_u64())
+    let thought = usage
+        .and_then(|u| u.get("total_thought_tokens").and_then(|n| n.as_u64()))
         .unwrap_or(0);
-    // completion_tokens = candidates only (visible output).
-    // thought_tokens tracked separately; billing layer sums them via UsageTokens::billing_completion().
-    let completion = candidates;
-    let total = v
-        .get("usageMetadata")
-        .and_then(|u| u.get("totalTokenCount"))
-        .and_then(|n| n.as_u64())
+    let total = usage
+        .and_then(|u| u.get("total_tokens").and_then(|n| n.as_u64()))
         .unwrap_or(prompt + completion + thought);
+
     let mut resp = chat_completion_json("chatcmpl-gemini", &model, content, prompt, completion);
     resp["usage"]["thought_tokens"] = serde_json::json!(thought);
     resp["usage"]["total_tokens"] = serde_json::json!(total);
@@ -273,7 +278,7 @@ fn chat_completion_json(
     })
 }
 
-fn anthropic_sse_to_openai(v: &serde_json::Value, model: Option<&str>) -> Vec<serde_json::Value> {
+fn anthropic_sse_to_openai(v: &serde_json::Value, model: Option<&str>, _event_type: &str) -> Vec<serde_json::Value> {
     let ty = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
     match ty {
         "message_start" => {
@@ -366,77 +371,83 @@ fn anthropic_sse_to_openai(v: &serde_json::Value, model: Option<&str>) -> Vec<se
     }
 }
 
-fn gemini_sse_to_openai(v: &serde_json::Value, model: Option<&str>) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    if let Some(candidate) = v
-        .get("candidates")
-        .and_then(|c| c.as_array())
-        .and_then(|a| a.first())
-    {
-        let text = candidate
-            .get("content")
-            .and_then(|c| c.get("parts"))
-            .and_then(|p| p.as_array())
-            .map(|parts| {
-                parts
-                    .iter()
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .unwrap_or_default();
-        if !text.is_empty() {
-            out.push(chat_chunk_json(
+fn gemini_sse_to_openai(v: &serde_json::Value, model: Option<&str>, event_type: &str) -> Vec<serde_json::Value> {
+    match event_type {
+        "step.delta" => {
+            // Only forward text deltas; skip thought and arguments types.
+            let delta = v.get("delta");
+            let delta_type = delta.and_then(|d| d.get("type")).and_then(|t| t.as_str()).unwrap_or("text");
+            if delta_type != "text" {
+                return Vec::new();
+            }
+            let text = delta
+                .and_then(|d| d.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            if text.is_empty() {
+                return Vec::new();
+            }
+            vec![chat_chunk_json(
                 "chatcmpl-gemini",
                 model.unwrap_or(""),
                 serde_json::json!({"content": text}),
                 None,
                 None,
-            ));
+            )]
         }
-        if candidate.get("finishReason").is_some() {
-            out.push(chat_chunk_json(
+        "interaction.completed" => {
+            // Completion event with usage: {"type": "interaction.completed", "interaction": {"id": "...", "status": "completed", "usage": {...}}}
+            let interaction = v.get("interaction");
+            let usage = interaction.and_then(|i| i.get("usage"));
+
+            // Emit finish reason
+            let mut out = vec![chat_chunk_json(
                 "chatcmpl-gemini",
                 model.unwrap_or(""),
                 serde_json::json!({}),
                 Some("stop"),
                 None,
-            ));
+            )];
+
+            // Emit usage if present — API returns total_input_tokens / total_output_tokens;
+            // also accepts prompt_tokens / completion_tokens for forward compatibility.
+            if let Some(usage) = usage {
+                let prompt = usage
+                    .get("prompt_tokens")
+                    .and_then(|n| n.as_u64())
+                    .or_else(|| usage.get("total_input_tokens").and_then(|n| n.as_u64()))
+                    .unwrap_or(0);
+                let completion = usage
+                    .get("completion_tokens")
+                    .and_then(|n| n.as_u64())
+                    .or_else(|| usage.get("total_output_tokens").and_then(|n| n.as_u64()))
+                    .unwrap_or(0);
+                let thought = usage
+                    .get("total_thought_tokens")
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(0);
+                let total = usage
+                    .get("total_tokens")
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(prompt + completion + thought);
+                out.push(chat_chunk_json(
+                    "chatcmpl-gemini",
+                    model.unwrap_or(""),
+                    serde_json::json!({}),
+                    None,
+                    Some(serde_json::json!({
+                        "prompt_tokens": prompt,
+                        "completion_tokens": completion,
+                        "thought_tokens": thought,
+                        "total_tokens": total
+                    })),
+                ));
+            }
+            out
         }
+        // step.start, step.stop, interaction.created, interaction.in_progress — ignored
+        _ => Vec::new(),
     }
-    if let Some(usage) = v.get("usageMetadata") {
-        let prompt = usage
-            .get("promptTokenCount")
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0);
-        let completion = usage
-            .get("candidatesTokenCount")
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0);
-        let thought = usage
-            .get("thoughtsTokenCount")
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0);
-        // Use Gemini's native totalTokenCount which includes thoughts.
-        // Fallback to sum if missing.
-        let total = usage
-            .get("totalTokenCount")
-            .and_then(|n| n.as_u64())
-            .unwrap_or(prompt + completion + thought);
-        out.push(chat_chunk_json(
-            "chatcmpl-gemini",
-            model.unwrap_or(""),
-            serde_json::json!({}),
-            None,
-            Some(serde_json::json!({
-                "prompt_tokens": prompt,
-                "completion_tokens": completion,
-                "thought_tokens": thought,
-                "total_tokens": total
-            })),
-        ));
-    }
-    out
 }
 
 /// Extract a human-readable error message from an upstream error response.
@@ -481,31 +492,31 @@ fn chat_chunk_json(
 mod tests {
     use super::*;
 
-    /// Round-trip: Gemini JSON → OpenAI format → serialize → parse → verify usage fields.
+    /// Round-trip: Gemini Interactions API JSON → OpenAI format → serialize → parse → verify usage fields.
+    /// API returns total_input_tokens / total_output_tokens / total_thought_tokens / total_tokens.
     #[test]
     fn gemini_json_to_openai_produces_correct_usage() {
         let gemini_resp = serde_json::json!({
-            "candidates": [{
-                "content": {
-                    "parts": [{"text": "Hello from Gemini"}],
-                    "role": "model"
-                },
-                "finishReason": "STOP",
-                "index": 0
+            "id": "int_test123",
+            "model": "gemini-3.5-flash",
+            "object": "interaction",
+            "status": "completed",
+            "steps": [{
+                "type": "model_output",
+                "content": [{"type": "text", "text": "Hello from Gemini"}]
             }],
-            "usageMetadata": {
-                "promptTokenCount": 15,
-                "candidatesTokenCount": 25,
-                "thoughtsTokenCount": 5,
-                "totalTokenCount": 45
-            },
-            "modelVersion": "gemini-2.0-flash"
+            "usage": {
+                "total_input_tokens": 15,
+                "total_output_tokens": 25,
+                "total_thought_tokens": 5,
+                "total_tokens": 45
+            }
         });
 
-        let converted = gemini_json_to_openai(&gemini_resp, Some("gemini-2.0-flash".to_string()));
+        let converted = gemini_json_to_openai(&gemini_resp, Some("gemini-3.5-flash".to_string()));
 
         assert_eq!(converted["usage"]["prompt_tokens"], 15);
-        assert_eq!(converted["usage"]["completion_tokens"], 25); // candidates only
+        assert_eq!(converted["usage"]["completion_tokens"], 25);
         assert_eq!(converted["usage"]["thought_tokens"], 5);
         assert_eq!(converted["usage"]["total_tokens"], 45);
 
@@ -518,6 +529,46 @@ mod tests {
         assert_eq!(parsed["usage"]["completion_tokens"], 25);
         assert_eq!(parsed["usage"]["thought_tokens"], 5);
         assert_eq!(parsed["usage"]["total_tokens"], 45);
+
+        // Verify content extraction from steps
+        assert_eq!(
+            parsed["choices"][0]["message"]["content"],
+            "Hello from Gemini"
+        );
+    }
+
+    /// SSE step.delta: thought and arguments types must be filtered out, only text forwarded.
+    #[test]
+    fn gemini_sse_filters_non_text_deltas() {
+        // text delta — should produce output
+        let text_event = serde_json::json!({
+            "delta": {"type": "text", "text": "hello"}
+        });
+        let result = gemini_sse_to_openai(&text_event, Some("m"), "step.delta");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["choices"][0]["delta"]["content"], "hello");
+
+        // thought delta — must be filtered
+        let thought_event = serde_json::json!({
+            "delta": {"type": "thought", "text": "thinking..."}
+        });
+        let result = gemini_sse_to_openai(&thought_event, Some("m"), "step.delta");
+        assert!(result.is_empty(), "thought deltas must not be forwarded");
+
+        // arguments delta — must be filtered
+        let args_event = serde_json::json!({
+            "delta": {"type": "arguments", "text": "{\"key\":"}
+        });
+        let result = gemini_sse_to_openai(&args_event, Some("m"), "step.delta");
+        assert!(result.is_empty(), "arguments deltas must not be forwarded");
+
+        // no type field — defaults to text (backward compat)
+        let no_type_event = serde_json::json!({
+            "delta": {"text": "fallback"}
+        });
+        let result = gemini_sse_to_openai(&no_type_event, Some("m"), "step.delta");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["choices"][0]["delta"]["content"], "fallback");
     }
 
     /// Round-trip: Anthropic JSON → OpenAI format → serialize → parse → verify usage fields.
@@ -551,29 +602,28 @@ mod tests {
         assert_eq!(parsed["usage"]["total_tokens"], 46);
     }
 
-    /// Edge case: Gemini safety-blocked response still has usage metadata.
+    /// Edge case: Gemini Interactions API failed interaction still has usage.
     #[test]
-    fn gemini_safety_blocked_still_produces_usage() {
+    fn gemini_failed_interaction_still_produces_usage() {
         let gemini_resp = serde_json::json!({
-            "candidates": [{
-                "finishReason": "SAFETY",
-                "safetyRatings": [{"category": "HARM_CATEGORY_HARASSMENT", "probability": "HIGH"}]
-            }],
-            "usageMetadata": {
-                "promptTokenCount": 8,
-                "totalTokenCount": 8
-            },
-            "modelVersion": "gemini-2.0-flash"
+            "id": "int_failed",
+            "model": "gemini-3.5-flash",
+            "status": "failed",
+            "steps": [],
+            "usage": {
+                "total_input_tokens": 8,
+                "total_tokens": 8
+            }
         });
 
-        let converted = gemini_json_to_openai(&gemini_resp, Some("gemini-2.0-flash".to_string()));
+        let converted = gemini_json_to_openai(&gemini_resp, Some("gemini-3.5-flash".to_string()));
 
         let serialized = converted.to_string();
         let parsed: serde_json::Value =
             serde_json::from_str(&serialized).expect("should parse");
 
         assert_eq!(parsed["usage"]["prompt_tokens"], 8);
-        assert_eq!(parsed["usage"]["completion_tokens"], 0); // no candidatesTokenCount
+        assert_eq!(parsed["usage"]["completion_tokens"], 0); // no output tokens
         assert_eq!(parsed["usage"]["total_tokens"], 8);
     }
 

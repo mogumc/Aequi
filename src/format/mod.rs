@@ -10,7 +10,7 @@ use response::adapt_response_inner;
 pub enum AuthStyle {
     OpenAiBearer,
     AnthropicKey,
-    None,
+    GeminiKey,
 }
 
 pub struct AdaptedRequest {
@@ -18,6 +18,8 @@ pub struct AdaptedRequest {
     pub path_and_query: http::uri::PathAndQuery,
     pub body: Bytes,
     pub auth_style: AuthStyle,
+    /// Extra headers to set on the upstream request (e.g. Api-Revision for Gemini).
+    pub extra_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
 }
 
 pub fn adapt_request(
@@ -26,7 +28,6 @@ pub fn adapt_request(
     method: &Method,
     body: &Bytes,
     model: &str,
-    key: &str,
 ) -> Result<AdaptedRequest, Response<Body>> {
     match format {
         UpstreamFormat::Openai => Ok(AdaptedRequest {
@@ -34,10 +35,11 @@ pub fn adapt_request(
             path_and_query: original_pq.clone(),
             body: body.clone(),
             auth_style: AuthStyle::OpenAiBearer,
+            extra_headers: Vec::new(),
         }),
         UpstreamFormat::Anthropic => adapt_request_inner(original_pq, body),
         UpstreamFormat::Gemini => {
-            adapt_request_inner_gemini(original_pq, body, model, key)
+            adapt_request_inner_gemini(original_pq, body, model)
         }
     }
 }
