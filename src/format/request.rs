@@ -144,55 +144,6 @@ fn openai_part_to_anthropic(part: &serde_json::Value) -> Option<serde_json::Valu
     None
 }
 
-/// Convert OpenAI-format content (string or array) to Gemini parts.
-fn content_to_gemini_parts(content: &serde_json::Value) -> Vec<serde_json::Value> {
-    match content {
-        serde_json::Value::Array(parts) => parts
-            .iter()
-            .filter_map(|part| openai_part_to_gemini(part))
-            .collect(),
-        serde_json::Value::String(s) => {
-            if s.len() > MAX_DECODED_BYTES {
-                tracing::warn!(text_len = s.len(), "gemini: text content dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
-                return vec![];
-            }
-            vec![serde_json::json!({"text": s})]
-        }
-        _ => {
-            let text = content_to_text(content);
-            if text.is_empty() { return vec![]; }
-            if text.len() > MAX_DECODED_BYTES {
-                tracing::warn!(text_len = text.len(), "gemini: fallback text content dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
-                return vec![];
-            }
-            vec![serde_json::json!({"text": text})]
-        }
-    }
-}
-
-/// Convert a single OpenAI content part to a Gemini part.
-fn openai_part_to_gemini(part: &serde_json::Value) -> Option<serde_json::Value> {
-    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-    let text = part
-        .get("text")
-        .and_then(|t| t.as_str())
-        .or_else(|| part.get("content").and_then(|t| t.as_str()));
-    if let Some(s) = text {
-        if part_type.is_empty() || part_type == "text" {
-            return Some(serde_json::json!({"text": s}));
-        }
-    }
-
-    if let Some(att) = extract_binary_attachment(part, "gemini") {
-        return Some(serde_json::json!({"inlineData": {"mimeType": att.mime, "data": att.data}}));
-    }
-    if matches!(part_type, "image_url" | "input_audio" | "file") {
-        return None;
-    }
-
-    None
-}
 
 /// Parse a data URI "data:<mime>;base64,<data>" → (mime, data).
 /// Returns None if the decoded data exceeds `max_bytes`.
@@ -389,14 +340,15 @@ pub(super) fn adapt_request_inner_gemini(
                 }
                 continue;
             }
-            let parts = content_to_gemini_parts(&content);
-            if parts.is_empty() {
+            let text = content_to_text(&content);
+            if text.is_empty() {
                 continue;
             }
-            let out_role = if role == "assistant" { "model" } else { "user" };
+            // Interactions API uses Step objects for stateless multi-turn input.
+            let step_type = if role == "assistant" { "model_output" } else { "user_input" };
             input.push(serde_json::json!({
-                "role": out_role,
-                "parts": parts,
+                "type": step_type,
+                "content": [{"type": "text", "text": text}],
             }));
         }
     }
@@ -506,12 +458,42 @@ mod tests {
         assert!(!adapted.path_and_query.as_str().contains("key="));
         let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
         assert_eq!(v["model"], "gemini-3.5-flash");
-        assert_eq!(v["input"][0]["role"], "user");
+        // Input uses Step objects: {type: "user_input", content: [{type: "text", text: "..."}]}
+        assert_eq!(v["input"][0]["type"], "user_input");
+        assert_eq!(v["input"][0]["content"][0]["type"], "text");
+        assert_eq!(v["input"][0]["content"][0]["text"], "hi");
+        assert!(v["input"][0].get("role").is_none(), "Step objects must not have 'role' field");
+        assert!(v["input"][0].get("parts").is_none(), "Interactions API must not use 'parts' field");
         assert_eq!(v["system_instruction"], "you are helpful");
         assert_eq!(v["store"], false);
         // Api-Revision header
         assert!(adapted.extra_headers.iter().any(|(n, v)| n.as_str() == "api-revision" && v == "2026-05-20"));
         // Auth via GeminiKey
         assert!(matches!(adapted.auth_style, AuthStyle::GeminiKey));
+    }
+
+    /// Multi-turn: assistant messages become "model_output" steps.
+    #[test]
+    fn gemini_multiturn_uses_step_objects() {
+        let body = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"role":"user","content":"again"}],"stream":false}"#,
+        );
+        let adapted = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "user_input");
+        assert_eq!(input[0]["content"][0]["text"], "hello");
+        assert_eq!(input[1]["type"], "model_output");
+        assert_eq!(input[1]["content"][0]["text"], "hi");
+        assert_eq!(input[2]["type"], "user_input");
+        assert_eq!(input[2]["content"][0]["text"], "again");
     }
 }

@@ -223,14 +223,22 @@ fn gemini_json_to_openai(v: &serde_json::Value, model: Option<String>) -> serde_
         })
         .unwrap_or_default();
 
-    // Extract usage from Interactions API usage object.
-    // Fields: total_input_tokens, total_output_tokens, total_thought_tokens, total_tokens.
+    // Extract usage — API returns total_input_tokens / total_output_tokens / total_thought_tokens / total_tokens.
+    // Also accepts prompt_tokens / completion_tokens for forward compatibility.
     let usage = v.get("usage");
     let prompt = usage
-        .and_then(|u| u.get("total_input_tokens").and_then(|n| n.as_u64()))
+        .and_then(|u| {
+            u.get("prompt_tokens")
+                .and_then(|n| n.as_u64())
+                .or_else(|| u.get("total_input_tokens").and_then(|n| n.as_u64()))
+        })
         .unwrap_or(0);
     let completion = usage
-        .and_then(|u| u.get("total_output_tokens").and_then(|n| n.as_u64()))
+        .and_then(|u| {
+            u.get("completion_tokens")
+                .and_then(|n| n.as_u64())
+                .or_else(|| u.get("total_output_tokens").and_then(|n| n.as_u64()))
+        })
         .unwrap_or(0);
     let thought = usage
         .and_then(|u| u.get("total_thought_tokens").and_then(|n| n.as_u64()))
@@ -366,9 +374,13 @@ fn anthropic_sse_to_openai(v: &serde_json::Value, model: Option<&str>, _event_ty
 fn gemini_sse_to_openai(v: &serde_json::Value, model: Option<&str>, event_type: &str) -> Vec<serde_json::Value> {
     match event_type {
         "step.delta" => {
-            // Text delta: {"index": N, "delta": {"type": "text", "text": "..."}, "event_type": "step.delta"}
-            let text = v
-                .get("delta")
+            // Only forward text deltas; skip thought and arguments types.
+            let delta = v.get("delta");
+            let delta_type = delta.and_then(|d| d.get("type")).and_then(|t| t.as_str()).unwrap_or("text");
+            if delta_type != "text" {
+                return Vec::new();
+            }
+            let text = delta
                 .and_then(|d| d.get("text"))
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
@@ -397,15 +409,18 @@ fn gemini_sse_to_openai(v: &serde_json::Value, model: Option<&str>, event_type: 
                 None,
             )];
 
-            // Emit usage if present
+            // Emit usage if present — API returns total_input_tokens / total_output_tokens;
+            // also accepts prompt_tokens / completion_tokens for forward compatibility.
             if let Some(usage) = usage {
                 let prompt = usage
-                    .get("total_input_tokens")
+                    .get("prompt_tokens")
                     .and_then(|n| n.as_u64())
+                    .or_else(|| usage.get("total_input_tokens").and_then(|n| n.as_u64()))
                     .unwrap_or(0);
                 let completion = usage
-                    .get("total_output_tokens")
+                    .get("completion_tokens")
                     .and_then(|n| n.as_u64())
+                    .or_else(|| usage.get("total_output_tokens").and_then(|n| n.as_u64()))
                     .unwrap_or(0);
                 let thought = usage
                     .get("total_thought_tokens")
@@ -478,6 +493,7 @@ mod tests {
     use super::*;
 
     /// Round-trip: Gemini Interactions API JSON → OpenAI format → serialize → parse → verify usage fields.
+    /// API returns total_input_tokens / total_output_tokens / total_thought_tokens / total_tokens.
     #[test]
     fn gemini_json_to_openai_produces_correct_usage() {
         let gemini_resp = serde_json::json!({
@@ -519,6 +535,40 @@ mod tests {
             parsed["choices"][0]["message"]["content"],
             "Hello from Gemini"
         );
+    }
+
+    /// SSE step.delta: thought and arguments types must be filtered out, only text forwarded.
+    #[test]
+    fn gemini_sse_filters_non_text_deltas() {
+        // text delta — should produce output
+        let text_event = serde_json::json!({
+            "delta": {"type": "text", "text": "hello"}
+        });
+        let result = gemini_sse_to_openai(&text_event, Some("m"), "step.delta");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["choices"][0]["delta"]["content"], "hello");
+
+        // thought delta — must be filtered
+        let thought_event = serde_json::json!({
+            "delta": {"type": "thought", "text": "thinking..."}
+        });
+        let result = gemini_sse_to_openai(&thought_event, Some("m"), "step.delta");
+        assert!(result.is_empty(), "thought deltas must not be forwarded");
+
+        // arguments delta — must be filtered
+        let args_event = serde_json::json!({
+            "delta": {"type": "arguments", "text": "{\"key\":"}
+        });
+        let result = gemini_sse_to_openai(&args_event, Some("m"), "step.delta");
+        assert!(result.is_empty(), "arguments deltas must not be forwarded");
+
+        // no type field — defaults to text (backward compat)
+        let no_type_event = serde_json::json!({
+            "delta": {"text": "fallback"}
+        });
+        let result = gemini_sse_to_openai(&no_type_event, Some("m"), "step.delta");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["choices"][0]["delta"]["content"], "fallback");
     }
 
     /// Round-trip: Anthropic JSON → OpenAI format → serialize → parse → verify usage fields.
