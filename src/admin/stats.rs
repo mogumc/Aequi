@@ -24,8 +24,6 @@ pub(crate) struct StatsSnapshot {
     pub(crate) responses_4xx: u64,
     pub(crate) responses_5xx: u64,
 
-    pub(crate) errors_timeout: u64,
-    pub(crate) errors_network: u64,
     pub(crate) queue_depth: u64,
     pub(crate) queue_timeout_total: u64,
     pub(crate) queue_enabled: bool,
@@ -107,14 +105,6 @@ pub(crate) fn build_snapshot(state: &RouterState) -> StatsSnapshot {
         responses_5xx: state
             .stats
             .responses_5xx
-            .load(std::sync::atomic::Ordering::Relaxed),
-        errors_timeout: state
-            .stats
-            .errors_timeout
-            .load(std::sync::atomic::Ordering::Relaxed),
-        errors_network: state
-            .stats
-            .errors_network
             .load(std::sync::atomic::Ordering::Relaxed),
         queue_depth: state
             .stats
@@ -293,20 +283,6 @@ fn write_prometheus_global(buf: &mut String, state: &RouterState, uptime_s: u64)
         state.stats.responses_5xx.load(std::sync::atomic::Ordering::Relaxed)
     );
 
-    // Errors
-    let _ = writeln!(buf, "# HELP gptload_errors_total Total errors by type");
-    let _ = writeln!(buf, "# TYPE gptload_errors_total counter");
-    let _ = writeln!(
-        buf,
-        "gptload_errors_total{{type=\"timeout\"}} {}",
-        state.stats.errors_timeout.load(std::sync::atomic::Ordering::Relaxed)
-    );
-    let _ = writeln!(
-        buf,
-        "gptload_errors_total{{type=\"network\"}} {}",
-        state.stats.errors_network.load(std::sync::atomic::Ordering::Relaxed)
-    );
-
     // Latency
     let latency_count = state.stats.latency_count.load(std::sync::atomic::Ordering::Relaxed);
     let latency_total_ns = state.stats.latency_ns_total.load(std::sync::atomic::Ordering::Relaxed);
@@ -396,11 +372,6 @@ fn write_prometheus_upstreams(buf: &mut String, upstreams: &[Arc<crate::state::U
         let _ = writeln!(buf, "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"3xx\"}} {}", id, r3);
         let _ = writeln!(buf, "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"4xx\"}} {}", id, r4);
         let _ = writeln!(buf, "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"5xx\"}} {}", id, r5);
-
-        let et = u.stats.errors_timeout.load(std::sync::atomic::Ordering::Relaxed);
-        let en = u.stats.errors_network.load(std::sync::atomic::Ordering::Relaxed);
-        let _ = writeln!(buf, "gptload_upstream_errors_total{{upstream=\"{}\",type=\"timeout\"}} {}", id, et);
-        let _ = writeln!(buf, "gptload_upstream_errors_total{{upstream=\"{}\",type=\"network\"}} {}", id, en);
     }
 }
 

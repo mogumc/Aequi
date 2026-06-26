@@ -172,9 +172,6 @@ pub struct Stats {
     pub responses_4xx: AtomicU64,
     pub responses_5xx: AtomicU64,
 
-    pub errors_timeout: AtomicU64,
-    pub errors_network: AtomicU64,
-
     pub prompt_tokens_total: AtomicU64,
     pub completion_tokens_total: AtomicU64,
     pub thought_tokens_total: AtomicU64,
@@ -194,8 +191,6 @@ pub struct UpstreamStats {
     pub responses_3xx: AtomicU64,
     pub responses_4xx: AtomicU64,
     pub responses_5xx: AtomicU64,
-    pub errors_timeout: AtomicU64,
-    pub errors_network: AtomicU64,
 }
 
 impl Default for UpstreamStats {
@@ -206,8 +201,6 @@ impl Default for UpstreamStats {
             responses_3xx: AtomicU64::new(0),
             responses_4xx: AtomicU64::new(0),
             responses_5xx: AtomicU64::new(0),
-            errors_timeout: AtomicU64::new(0),
-            errors_network: AtomicU64::new(0),
         }
     }
 }
@@ -224,8 +217,6 @@ impl Stats {
             responses_3xx: AtomicU64::new(0),
             responses_4xx: AtomicU64::new(0),
             responses_5xx: AtomicU64::new(0),
-            errors_timeout: AtomicU64::new(0),
-            errors_network: AtomicU64::new(0),
             prompt_tokens_total: AtomicU64::new(0),
             completion_tokens_total: AtomicU64::new(0),
             thought_tokens_total: AtomicU64::new(0),
@@ -621,34 +612,40 @@ impl RouterState {
 
 
 /// Increment the appropriate status-code counter based on HTTP status class.
-#[inline]
-pub(super) fn inc_status_counter(
-    r2xx: &AtomicU64,
-    r3xx: &AtomicU64,
-    r4xx: &AtomicU64,
-    r5xx: &AtomicU64,
-    status: http::StatusCode,
-) {
-    if status.is_success() {
-        r2xx.fetch_add(1, Ordering::Relaxed);
-    } else if status.is_redirection() {
-        r3xx.fetch_add(1, Ordering::Relaxed);
-    } else if status.is_client_error() {
-        r4xx.fetch_add(1, Ordering::Relaxed);
-    } else if status.is_server_error() {
-        r5xx.fetch_add(1, Ordering::Relaxed);
+impl RouterState {
+    /// Record the final outcome of a proxy request. Increments both global and
+    /// per-upstream response counters. Timeouts and network errors should be
+    /// reported here as 504 / 502 so they land in `responses_5xx`.
+    #[inline]
+    pub fn inc_upstream_status(
+        &self,
+        upstream: &crate::state::Upstream,
+        status: http::StatusCode,
+    ) {
+        let bump = |r2: &AtomicU64, r3: &AtomicU64, r4: &AtomicU64, r5: &AtomicU64| {
+            if status.is_success() {
+                r2.fetch_add(1, Ordering::Relaxed);
+            } else if status.is_redirection() {
+                r3.fetch_add(1, Ordering::Relaxed);
+            } else if status.is_client_error() {
+                r4.fetch_add(1, Ordering::Relaxed);
+            } else if status.is_server_error() {
+                r5.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        bump(
+            &upstream.stats.responses_2xx,
+            &upstream.stats.responses_3xx,
+            &upstream.stats.responses_4xx,
+            &upstream.stats.responses_5xx,
+        );
+        bump(
+            &self.stats.responses_2xx,
+            &self.stats.responses_3xx,
+            &self.stats.responses_4xx,
+            &self.stats.responses_5xx,
+        );
     }
-}
-
-#[inline]
-pub(super) fn inc_status(stats: &UpstreamStats, status: http::StatusCode) {
-    inc_status_counter(
-        &stats.responses_2xx,
-        &stats.responses_3xx,
-        &stats.responses_4xx,
-        &stats.responses_5xx,
-        status,
-    );
 }
 
 impl RouterState {

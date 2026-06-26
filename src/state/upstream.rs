@@ -46,8 +46,10 @@ pub struct KeyState {
 }
 
 impl RouterState {
-    /// Handle an upstream response status. Only auth errors (401/403) count as
-    /// key failures. 429 (rate limit) sets a short cooldown on the key.
+    /// Handle key-level side effects of an upstream response status.
+    /// Auth errors (401/403) count as key failures; 429 sets a short cooldown.
+    /// Status counters are NOT incremented here — call `inc_upstream_status`
+    /// separately once the final outcome is determined.
     #[inline]
     pub fn on_upstream_status(
         &self,
@@ -55,11 +57,6 @@ impl RouterState {
         status: http::StatusCode,
         retry_after_ms: Option<u64>,
     ) {
-        let u = &sel.upstream;
-
-        inc_status(&u.stats, status);
-        self.inc_global_status(status);
-
         // Only count auth errors as key failures (matches gpt-load behaviour).
         if status == http::StatusCode::UNAUTHORIZED || status == http::StatusCode::FORBIDDEN {
             self.handle_auth_failure(sel);
@@ -101,35 +98,6 @@ impl RouterState {
                 "key blacklisted after auth failures"
             );
         }
-    }
-
-    #[inline]
-    pub fn on_timeout(&self, sel: &Selected) {
-        self.stats.errors_timeout.fetch_add(1, Ordering::Relaxed);
-        sel.upstream
-            .stats
-            .errors_timeout
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn on_network_error(&self, sel: &Selected) {
-        self.stats.errors_network.fetch_add(1, Ordering::Relaxed);
-        sel.upstream
-            .stats
-            .errors_network
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn inc_global_status(&self, status: http::StatusCode) {
-        inc_status_counter(
-            &self.stats.responses_2xx,
-            &self.stats.responses_3xx,
-            &self.stats.responses_4xx,
-            &self.stats.responses_5xx,
-            status,
-        );
     }
 
     pub fn record_latency(&self, latency_ns: u64) {

@@ -191,6 +191,9 @@ async fn execute_attempt(
                 }
             }
 
+            // Final outcome — count this status exactly once.
+            state.inc_upstream_status(upstream, status);
+
             let (up_resp, upstream_error) = format::adapt_response(
                 upstream.format,
                 up_resp,
@@ -218,13 +221,14 @@ async fn execute_attempt(
                 error = %e,
                 "upstream request failed"
             );
-            state.on_network_error(sel);
 
             let model = log_ctx.model.as_deref().unwrap_or_default();
             if let Some(new_sel) = try_retry_or_give_up(state, model, sel, billing_key, "network_error") {
                 return AttemptResult::Retry(new_sel);
             }
 
+            // Final outcome — network error counts as 502.
+            state.inc_upstream_status(upstream, http::StatusCode::BAD_GATEWAY);
             give_up_with_error(
                 state, billing_key, billing_reserved, log_ctx,
                 RouterState::json_error(
@@ -237,13 +241,14 @@ async fn execute_attempt(
         Err(_) => {
             sel.key
                 .record_latency_ms(attempt_start.elapsed().as_millis() as u64);
-            state.on_timeout(sel);
 
             let model = log_ctx.model.as_deref().unwrap_or_default();
             if let Some(new_sel) = try_retry_or_give_up(state, model, sel, billing_key, "timeout") {
                 return AttemptResult::Retry(new_sel);
             }
 
+            // Final outcome — timeout counts as 504.
+            state.inc_upstream_status(upstream, http::StatusCode::GATEWAY_TIMEOUT);
             give_up_with_error(
                 state, billing_key, billing_reserved, log_ctx,
                 RouterState::json_error(
@@ -487,6 +492,9 @@ pub(super) async fn forward(
             AttemptResult::Retry(new_sel) => {
                 retry_count += 1;
                 if retry_count > max_retries {
+                    // Last attempt's status was not counted (deferred for retry).
+                    // Count it now as 502 since we are giving up.
+                    state_c.inc_upstream_status(&sel.upstream, http::StatusCode::BAD_GATEWAY);
                     release_if_reserved(&state, &billing_key, &mut billing_reserved);
                     return logged_json_error(
                         &state,
