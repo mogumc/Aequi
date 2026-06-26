@@ -109,11 +109,7 @@ pub fn spawn_result<T, E: std::fmt::Display>(
     }
 }
 
-// ── URL encoding ──
-
-pub fn url_encode(s: &str) -> String {
-    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
-}
+// ── Query helpers ──
 
 /// Very small query parser for `?a=b&c=d`.
 /// Returns value for `key` if present. No percent-decoding (tokens are expected to be simple).
@@ -348,15 +344,19 @@ fn is_url_delim(ch: char) -> bool {
 
 // ── Key validation ──
 
-/// Validate key string: only [A-Za-z0-9_-] allowed.
+/// Validate key string: only [A-Za-z0-9._-] allowed.
+/// Consecutive dots (..) are rejected to prevent path traversal attacks.
 pub fn validate_key_chars(key: &str) -> Result<(), String> {
     if key.is_empty() {
         return Err("key must not be empty".to_string());
     }
-    if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if key.contains("..") {
+        return Err("key contains invalid consecutive dots (path traversal protection)".to_string());
+    }
+    if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') {
         return Err(format!(
-            "key contains invalid character '{}' (only A-Za-z0-9 _ - allowed)",
-            key.chars().find(|c| !c.is_ascii_alphanumeric() && *c != '_' && *c != '-').unwrap_or(' ')
+            "key contains invalid character '{}' (only A-Za-z0-9 . _ - allowed)",
+            key.chars().find(|c| !c.is_ascii_alphanumeric() && *c != '_' && *c != '-' && *c != '.').unwrap_or(' ')
         ));
     }
     Ok(())

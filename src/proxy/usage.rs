@@ -5,8 +5,11 @@ use hyper::{Body, Response};
 
 pub(super) fn extract_api_key(headers: &hyper::HeaderMap) -> Option<String> {
     // Validate key chars inline (hot path, no allocation for invalid keys).
+    // Allows dots for Gemini keys, but rejects consecutive dots (path traversal).
     fn key_ok(k: &str) -> bool {
-        !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        !k.is_empty()
+            && !k.contains("..")
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
     }
     if let Some(h) = headers.get("x-api-key") {
         if let Ok(s) = h.to_str() {

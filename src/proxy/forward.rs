@@ -96,7 +96,6 @@ async fn execute_attempt(
         out_method,
         body_bytes,
         model,
-        sel.key.key.as_ref(),
     ) {
         Ok(adapted) => adapted,
         Err(resp) => {
@@ -126,6 +125,7 @@ async fn execute_attempt(
         sel,
         injected,
         adapted.auth_style,
+        &adapted.extra_headers,
     ) {
         Ok(req) => req,
         Err(resp) => {
