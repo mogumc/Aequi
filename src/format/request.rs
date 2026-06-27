@@ -398,6 +398,23 @@ pub(super) fn adapt_request_inner_gemini(
                 .get("content")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
+
+            // Tool result → function_result step.
+            if role == "tool" {
+                let tool_call_id = msg.get("tool_call_id").and_then(|id| id.as_str()).unwrap_or("");
+                let name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let result_text = content_to_text(&content);
+                let result_value: serde_json::Value = serde_json::from_str(&result_text)
+                    .unwrap_or_else(|_| serde_json::Value::String(result_text));
+                input.push(serde_json::json!({
+                    "type": "function_result",
+                    "call_id": tool_call_id,
+                    "name": name,
+                    "result": result_value,
+                }));
+                continue;
+            }
+
             if role == "system" {
                 let text = content_to_text(&content);
                 if !text.is_empty() {
@@ -405,12 +422,42 @@ pub(super) fn adapt_request_inner_gemini(
                 }
                 continue;
             }
-            // Convert content to Gemini items (supports multimodal: text, image, audio, file).
+
+            // For assistant messages, handle both text content and tool_calls.
+            if role == "assistant" {
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
+                    // Emit text content as model_output if present.
+                    let items = content_to_gemini_items(&content);
+                    if !items.is_empty() {
+                        input.push(serde_json::json!({
+                            "type": "model_output",
+                            "content": items,
+                        }));
+                    }
+                    // Emit each tool call as a function_call step.
+                    for tc in tool_calls {
+                        let id = tc.get("id").and_then(|id| id.as_str()).unwrap_or("");
+                        let function = tc.get("function");
+                        let name = function.and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
+                        let args_str = function.and_then(|f| f.get("arguments")).and_then(|a| a.as_str()).unwrap_or("{}");
+                        let args: serde_json::Value = serde_json::from_str(args_str)
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        input.push(serde_json::json!({
+                            "type": "function_call",
+                            "id": id,
+                            "name": name,
+                            "arguments": args,
+                        }));
+                    }
+                    continue;
+                }
+            }
+
+            // Regular user/assistant message — convert content to Gemini items.
             let items = content_to_gemini_items(&content);
             if items.is_empty() {
                 continue;
             }
-            // Interactions API uses Step objects for stateless multi-turn input.
             let step_type = if role == "assistant" { "model_output" } else { "user_input" };
             input.push(serde_json::json!({
                 "type": step_type,
@@ -430,6 +477,44 @@ pub(super) fn adapt_request_inner_gemini(
     }
     if stream {
         out["stream"] = serde_json::Value::Bool(true);
+    }
+
+    // Convert OpenAI tools → Gemini function_declarations.
+    if let Some(tools) = v.get("tools").and_then(|t| t.as_array()) {
+        let declarations: Vec<serde_json::Value> = tools
+            .iter()
+            .filter_map(|t| t.get("function"))
+            .map(|f| {
+                serde_json::json!({
+                    "name": f.get("name"),
+                    "description": f.get("description"),
+                    "parameters": f.get("parameters").cloned().unwrap_or(serde_json::json!({"type":"object","properties":{}})),
+                })
+            })
+            .collect();
+        if !declarations.is_empty() {
+            out["tools"] = serde_json::json!([{
+                "function_declarations": declarations,
+            }]);
+        }
+    }
+
+    // Convert OpenAI tool_choice → Gemini tool_config.
+    if let Some(tc) = v.get("tool_choice") {
+        let mode = match tc.as_str() {
+            Some("auto") => "AUTO",
+            Some("required") | Some("any") => "ANY",
+            Some("none") => "NONE",
+            _ if tc.is_object() => "ANY",
+            _ => return Err(format_error(
+                http::StatusCode::BAD_REQUEST,
+                "invalid tool_choice for gemini format",
+                "invalid_tool_choice",
+            )),
+        };
+        out["tool_config"] = serde_json::json!({
+            "function_calling_config": {"mode": mode}
+        });
     }
 
     // generation_config with snake_case field names (Interactions API).
@@ -657,5 +742,104 @@ mod tests {
         assert_eq!(content[1]["type"], "document");
         assert_eq!(content[1]["mime_type"], "application/pdf");
         assert_eq!(content[1]["data"], "JVBERi0=");
+    }
+
+    /// Gemini: OpenAI tools → Gemini function_declarations.
+    #[test]
+    fn gemini_tools_conversion() {
+        let body = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"stream":false}"#,
+        );
+        let adapted = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        let decls = tools[0]["function_declarations"].as_array().unwrap();
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0]["name"], "get_weather");
+        assert_eq!(decls[0]["description"], "Get weather");
+        assert_eq!(decls[0]["parameters"]["required"][0], "city");
+    }
+
+    /// Gemini: tool_choice auto/required/none → tool_config mode.
+    #[test]
+    fn gemini_tool_choice_mapping() {
+        for (choice, expected_mode) in [("auto", "AUTO"), ("required", "ANY"), ("none", "NONE")] {
+            let body_str = format!(
+                r#"{{"model":"gemini-3.5-flash","messages":[{{"role":"user","content":"hi"}}],"tool_choice":"{}","stream":false}}"#,
+                choice
+            );
+            let adapted = adapt_request(
+                UpstreamFormat::Gemini,
+                &"/v1/chat/completions".parse().unwrap(),
+                &Method::POST,
+                &Bytes::from(body_str),
+                "gemini-3.5-flash",
+            )
+            .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
+            assert_eq!(
+                v["tool_config"]["function_calling_config"]["mode"],
+                expected_mode,
+                "tool_choice={} should map to {}",
+                choice,
+                expected_mode
+            );
+        }
+    }
+
+    /// Gemini: tool role message → function_result step.
+    #[test]
+    fn gemini_tool_message_to_function_result() {
+        let body = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"weather?"},{"role":"tool","tool_call_id":"call_1","name":"get_weather","content":"{\"temp\":22}"}],"stream":false}"#,
+        );
+        let adapted = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "user_input");
+        assert_eq!(input[1]["type"], "function_result");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["name"], "get_weather");
+        assert_eq!(input[1]["result"]["temp"], 22);
+    }
+
+    /// Gemini: assistant with tool_calls → function_call steps.
+    #[test]
+    fn gemini_assistant_tool_calls_to_function_call() {
+        let body = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"weather?"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Beijing\"}"}}]}],"stream":false}"#,
+        );
+        let adapted = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "user_input");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["id"], "call_1");
+        assert_eq!(input[1]["name"], "get_weather");
+        assert_eq!(input[1]["arguments"]["city"], "Beijing");
     }
 }

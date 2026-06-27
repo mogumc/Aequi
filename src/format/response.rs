@@ -115,7 +115,7 @@ async fn transform_json_response(
 fn transform_sse_response(
     up_resp: Response<Body>,
     model: Option<String>,
-    f: fn(&serde_json::Value, Option<&str>, &str) -> Vec<serde_json::Value>,
+    f: fn(&serde_json::Value, Option<&str>, &str, bool) -> (Vec<serde_json::Value>, bool),
 ) -> Response<Body> {
     let (mut parts, body) = up_resp.into_parts();
     // Caller (adapt_response_inner) guarantees 2xx — non-2xx is handled by handle_upstream_error.
@@ -131,6 +131,7 @@ fn transform_sse_response(
         let mut body = body;
         let mut buf = String::new();
         let mut current_event = String::new();
+        let mut had_function_call = false;
         while let Some(chunk) = body.data().await {
             let Ok(chunk) = chunk else {
                 break;
@@ -153,7 +154,11 @@ fn transform_sse_response(
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
                     continue;
                 };
-                for chunk in f(&value, model.as_deref(), &current_event) {
+                let (chunks, is_fc) = f(&value, model.as_deref(), &current_event, had_function_call);
+                if is_fc {
+                    had_function_call = true;
+                }
+                for chunk in chunks {
                     let msg = format!("data: {}\n\n", chunk);
                     if tx.send(Ok(Bytes::from(msg))).await.is_err() {
                         return;
@@ -207,10 +212,10 @@ fn anthropic_json_to_openai(v: &serde_json::Value, model: Option<String>) -> ser
 fn gemini_json_to_openai(v: &serde_json::Value, model: Option<String>) -> serde_json::Value {
     let model = model.unwrap_or_default();
 
+    let steps = v.get("steps").and_then(|s| s.as_array());
+
     // Extract text from steps[type="model_output"].content[*].text
-    let content = v
-        .get("steps")
-        .and_then(|s| s.as_array())
+    let content = steps
         .map(|steps| {
             steps
                 .iter()
@@ -220,6 +225,31 @@ fn gemini_json_to_openai(v: &serde_json::Value, model: Option<String>) -> serde_
                 .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
                 .collect::<Vec<_>>()
                 .join("")
+        })
+        .unwrap_or_default();
+
+    // Extract function_call steps → OpenAI tool_calls.
+    let tool_calls: Vec<serde_json::Value> = steps
+        .map(|steps| {
+            steps
+                .iter()
+                .filter(|s| s.get("type").and_then(|t| t.as_str()) == Some("function_call"))
+                .map(|s| {
+                    let id = s.get("id").and_then(|id| id.as_str()).unwrap_or("");
+                    let name = s.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    let arguments = s.get("arguments")
+                        .map(|a| if a.is_string() { a.clone() } else { serde_json::json!(a.to_string()) })
+                        .unwrap_or(serde_json::json!("{}"));
+                    serde_json::json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    })
+                })
+                .collect()
         })
         .unwrap_or_default();
 
@@ -247,7 +277,38 @@ fn gemini_json_to_openai(v: &serde_json::Value, model: Option<String>) -> serde_
         .and_then(|u| u.get("total_tokens").and_then(|n| n.as_u64()))
         .unwrap_or(prompt + completion + thought);
 
-    let mut resp = chat_completion_json("chatcmpl-gemini", &model, content, prompt, completion);
+    let finish_reason = if !tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        match v.get("status").and_then(|s| s.as_str()) {
+            Some("completed") | None => "stop",
+            _ => "content_filter",
+        }
+    };
+    let mut message = serde_json::json!({
+        "role": "assistant",
+        "content": if content.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(content) },
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = serde_json::Value::Array(tool_calls);
+    }
+
+    let mut resp = serde_json::json!({
+        "id": "chatcmpl-gemini",
+        "object": "chat.completion",
+        "created": now_secs(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+        "usage": {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
+        }
+    });
     resp["usage"]["thought_tokens"] = serde_json::json!(thought);
     resp["usage"]["total_tokens"] = serde_json::json!(total);
     resp
@@ -278,9 +339,9 @@ fn chat_completion_json(
     })
 }
 
-fn anthropic_sse_to_openai(v: &serde_json::Value, model: Option<&str>, _event_type: &str) -> Vec<serde_json::Value> {
+fn anthropic_sse_to_openai(v: &serde_json::Value, model: Option<&str>, _event_type: &str, _had_fc: bool) -> (Vec<serde_json::Value>, bool) {
     let ty = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
-    match ty {
+    let chunks = match ty {
         "message_start" => {
             let id = v
                 .get("message")
@@ -368,44 +429,86 @@ fn anthropic_sse_to_openai(v: &serde_json::Value, model: Option<&str>, _event_ty
             None,
         )],
         _ => Vec::new(),
-    }
+    };
+    (chunks, false)
 }
 
-fn gemini_sse_to_openai(v: &serde_json::Value, model: Option<&str>, event_type: &str) -> Vec<serde_json::Value> {
+fn gemini_sse_to_openai(v: &serde_json::Value, model: Option<&str>, event_type: &str, had_function_call: bool) -> (Vec<serde_json::Value>, bool) {
     match event_type {
+        "step.start" => {
+            let step_type = v.get("step").and_then(|s| s.get("type")).and_then(|t| t.as_str()).unwrap_or("");
+            if step_type != "function_call" {
+                return (Vec::new(), false);
+            }
+            let step = v.get("step");
+            let id = step.and_then(|s| s.get("id")).and_then(|id| id.as_str()).unwrap_or("");
+            let name = step.and_then(|s| s.get("name")).and_then(|n| n.as_str()).unwrap_or("");
+            let arguments = step
+                .and_then(|s| s.get("arguments"))
+                .map(|a| if a.is_string() { a.clone() } else { serde_json::json!(a.to_string()) })
+                .unwrap_or(serde_json::json!("{}"));
+            let chunk = chat_chunk_json(
+                "chatcmpl-gemini",
+                model.unwrap_or(""),
+                serde_json::json!({
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    }]
+                }),
+                Some("tool_calls"),
+                None,
+            );
+            (vec![chunk], true)
+        }
         "step.delta" => {
             // Only forward text deltas; skip thought and arguments types.
             let delta = v.get("delta");
             let delta_type = delta.and_then(|d| d.get("type")).and_then(|t| t.as_str()).unwrap_or("text");
             if delta_type != "text" {
-                return Vec::new();
+                return (Vec::new(), false);
             }
             let text = delta
                 .and_then(|d| d.get("text"))
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
             if text.is_empty() {
-                return Vec::new();
+                return (Vec::new(), false);
             }
-            vec![chat_chunk_json(
+            (vec![chat_chunk_json(
                 "chatcmpl-gemini",
                 model.unwrap_or(""),
                 serde_json::json!({"content": text}),
                 None,
                 None,
-            )]
+            )], false)
         }
         "interaction.completed" => {
-            // Completion event with usage: {"type": "interaction.completed", "interaction": {"id": "...", "status": "completed", "usage": {...}}}
+            // Completion event with usage.
             let interaction = v.get("interaction");
             let usage = interaction.and_then(|i| i.get("usage"));
 
-            // Emit finish reason
+            // finish_reason: tool_calls already sent via step.start; otherwise derive from status.
+            let finish_reason = if had_function_call {
+                None
+            } else {
+                match interaction.and_then(|i| i.get("status")).and_then(|s| s.as_str()) {
+                    Some("completed") | None => Some("stop"),
+                    _ => Some("content_filter"),
+                }
+            };
+
+            // Emit finish reason chunk.
             let mut out = vec![chat_chunk_json(
                 "chatcmpl-gemini",
                 model.unwrap_or(""),
                 serde_json::json!({}),
-                Some("stop"),
+                finish_reason,
                 None,
             )];
 
@@ -443,10 +546,10 @@ fn gemini_sse_to_openai(v: &serde_json::Value, model: Option<&str>, event_type: 
                     })),
                 ));
             }
-            out
+            (out, false)
         }
-        // step.start, step.stop, interaction.created, interaction.in_progress — ignored
-        _ => Vec::new(),
+        // step.stop, interaction.created, interaction.in_progress — ignored
+        _ => (Vec::new(), false),
     }
 }
 
@@ -580,29 +683,30 @@ mod tests {
         let text_event = serde_json::json!({
             "delta": {"type": "text", "text": "hello"}
         });
-        let result = gemini_sse_to_openai(&text_event, Some("m"), "step.delta");
+        let (result, is_fc) = gemini_sse_to_openai(&text_event, Some("m"), "step.delta", false);
         assert_eq!(result.len(), 1);
+        assert!(!is_fc);
         assert_eq!(result[0]["choices"][0]["delta"]["content"], "hello");
 
         // thought delta — must be filtered
         let thought_event = serde_json::json!({
             "delta": {"type": "thought", "text": "thinking..."}
         });
-        let result = gemini_sse_to_openai(&thought_event, Some("m"), "step.delta");
+        let (result, _) = gemini_sse_to_openai(&thought_event, Some("m"), "step.delta", false);
         assert!(result.is_empty(), "thought deltas must not be forwarded");
 
         // arguments delta — must be filtered
         let args_event = serde_json::json!({
             "delta": {"type": "arguments", "text": "{\"key\":"}
         });
-        let result = gemini_sse_to_openai(&args_event, Some("m"), "step.delta");
+        let (result, _) = gemini_sse_to_openai(&args_event, Some("m"), "step.delta", false);
         assert!(result.is_empty(), "arguments deltas must not be forwarded");
 
         // no type field — defaults to text (backward compat)
         let no_type_event = serde_json::json!({
             "delta": {"text": "fallback"}
         });
-        let result = gemini_sse_to_openai(&no_type_event, Some("m"), "step.delta");
+        let (result, _) = gemini_sse_to_openai(&no_type_event, Some("m"), "step.delta", false);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["choices"][0]["delta"]["content"], "fallback");
     }
@@ -720,5 +824,112 @@ mod tests {
         let sse_body = b"event: error\ndata: {\"error\":{\"code\":500}}\n\n";
         let msg = extract_upstream_error(sse_body);
         assert_eq!(msg, "upstream error (details unavailable)");
+    }
+
+    /// JSON response with function_call step → OpenAI tool_calls format.
+    #[test]
+    fn gemini_json_function_call_to_tool_calls() {
+        let gemini_resp = serde_json::json!({
+            "steps": [
+                {"type": "model_output", "content": [{"type": "text", "text": ""}]},
+                {"type": "function_call", "id": "call_abc", "name": "get_weather", "arguments": {"city": "Beijing"}}
+            ],
+            "usage": {"total_input_tokens": 10, "total_output_tokens": 5, "total_tokens": 15}
+        });
+        let result = gemini_json_to_openai(&gemini_resp, Some("gemini-3.5-flash".to_string()));
+        assert_eq!(result["choices"][0]["finish_reason"], "tool_calls");
+        let tool_calls = result["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], "call_abc");
+        assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
+        // arguments should be a JSON string
+        let args_str = tool_calls[0]["function"]["arguments"].as_str().unwrap();
+        assert!(args_str.contains("Beijing"));
+    }
+
+    /// JSON response without function_call → finish_reason "stop", no tool_calls.
+    #[test]
+    fn gemini_json_no_function_call_has_stop() {
+        let gemini_resp = serde_json::json!({
+            "steps": [{"type": "model_output", "content": [{"type": "text", "text": "Hello"}]}],
+            "usage": {"total_input_tokens": 5, "total_output_tokens": 3, "total_tokens": 8}
+        });
+        let result = gemini_json_to_openai(&gemini_resp, Some("gemini-3.5-flash".to_string()));
+        assert_eq!(result["choices"][0]["finish_reason"], "stop");
+        assert!(result["choices"][0]["message"].get("tool_calls").is_none());
+    }
+
+    /// SSE step.start with function_call → tool_calls chunk with finish_reason "tool_calls".
+    #[test]
+    fn gemini_sse_function_call_step_start() {
+        let event = serde_json::json!({
+            "step": {
+                "type": "function_call",
+                "id": "call_xyz",
+                "name": "search",
+                "arguments": {"query": "rust"}
+            }
+        });
+        let (chunks, is_fc) = gemini_sse_to_openai(&event, Some("m"), "step.start", false);
+        assert!(is_fc, "function_call should set is_fc=true");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "tool_calls");
+        let tc = &chunks[0]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(tc["id"], "call_xyz");
+        assert_eq!(tc["function"]["name"], "search");
+    }
+
+    /// SSE interaction.completed after function_call → finish_reason is None (not "stop").
+    #[test]
+    fn gemini_sse_completed_after_function_call() {
+        let event = serde_json::json!({
+            "interaction": {"usage": {"total_input_tokens": 10, "total_output_tokens": 5, "total_tokens": 15}}
+        });
+        // had_function_call = true
+        let (chunks, _) = gemini_sse_to_openai(&event, Some("m"), "interaction.completed", true);
+        // First chunk should have finish_reason = null (not "stop")
+        assert!(chunks[0]["choices"][0]["finish_reason"].is_null());
+    }
+
+    /// SSE interaction.completed without function_call → finish_reason "stop".
+    #[test]
+    fn gemini_sse_completed_without_function_call() {
+        let event = serde_json::json!({
+            "interaction": {"usage": {"total_tokens": 10}}
+        });
+        let (chunks, _) = gemini_sse_to_openai(&event, Some("m"), "interaction.completed", false);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// JSON: interaction status "failed" → finish_reason "content_filter".
+    #[test]
+    fn gemini_json_failed_status_content_filter() {
+        let gemini_resp = serde_json::json!({
+            "status": "failed",
+            "steps": [],
+            "usage": {"total_input_tokens": 8, "total_tokens": 8}
+        });
+        let result = gemini_json_to_openai(&gemini_resp, Some("gemini-3.5-flash".to_string()));
+        assert_eq!(result["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    /// SSE: interaction.completed with status "failed" → finish_reason "content_filter".
+    #[test]
+    fn gemini_sse_completed_failed_status() {
+        let event = serde_json::json!({
+            "interaction": {"status": "failed", "usage": {"total_tokens": 8}}
+        });
+        let (chunks, _) = gemini_sse_to_openai(&event, Some("m"), "interaction.completed", false);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    /// SSE: interaction.completed with status "cancelled" → finish_reason "content_filter".
+    #[test]
+    fn gemini_sse_completed_cancelled_status() {
+        let event = serde_json::json!({
+            "interaction": {"status": "cancelled", "usage": {}}
+        });
+        let (chunks, _) = gemini_sse_to_openai(&event, Some("m"), "interaction.completed", false);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "content_filter");
     }
 }
