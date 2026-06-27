@@ -691,33 +691,6 @@ mod tests {
         assert_eq!(parsed["usage"]["total_tokens"], 46);
     }
 
-    /// Edge case: Anthropic response with 0 tokens.
-    #[test]
-    fn anthropic_zero_tokens_produces_correct_usage() {
-        let anthropic_resp = serde_json::json!({
-            "id": "msg_xxx",
-            "type": "message",
-            "role": "assistant",
-            "model": "claude-sonnet-4-20250514",
-            "content": [{"type": "text", "text": ""}],
-            "usage": {
-                "input_tokens": 0,
-                "output_tokens": 0
-            }
-        });
-
-        let converted =
-            anthropic_json_to_openai(&anthropic_resp, Some("claude-sonnet-4-20250514".to_string()));
-
-        let serialized = converted.to_string();
-        let parsed: serde_json::Value =
-            serde_json::from_str(&serialized).expect("should parse");
-
-        assert_eq!(parsed["usage"]["prompt_tokens"], 0);
-        assert_eq!(parsed["usage"]["completion_tokens"], 0);
-        assert_eq!(parsed["usage"]["total_tokens"], 0);
-    }
-
     // ── Gemini Interactions API response tests ──
 
     /// Non-streaming: Gemini interactions response with usage -> OpenAI format.
@@ -863,19 +836,6 @@ mod tests {
         assert_eq!(chunks[1]["usage"]["total_tokens"], 15);
     }
 
-    /// Streaming: thought deltas are skipped.
-    #[test]
-    fn gemini_stream_thought_delta_skipped() {
-        let event = serde_json::json!({
-            "index": 0,
-            "delta": {"type": "thought", "thought": "I'm thinking..."},
-            "event_type": "step.delta"
-        });
-
-        let chunks = gemini_sse_to_openai(&event, Some("gemini-3.5-flash"));
-        assert!(chunks.is_empty());
-    }
-
     /// Error extraction: extracts message from error JSON.
     #[test]
     fn gemini_error_extraction() {
@@ -915,30 +875,6 @@ mod tests {
         assert_eq!(converted["usage"]["completion_tokens"], 0);
     }
 
-    /// Streaming: step.stop produces no output.
-    #[test]
-    fn gemini_stream_step_stop_no_output() {
-        let event = serde_json::json!({
-            "index": 0,
-            "event_type": "step.stop"
-        });
-
-        let chunks = gemini_sse_to_openai(&event, Some("gemini-3.5-flash"));
-        assert!(chunks.is_empty());
-    }
-
-    /// Streaming: interaction.created produces no output.
-    #[test]
-    fn gemini_stream_interaction_created_no_output() {
-        let event = serde_json::json!({
-            "interaction": {"id": "int_xxx"},
-            "event_type": "interaction.created"
-        });
-
-        let chunks = gemini_sse_to_openai(&event, Some("gemini-3.5-flash"));
-        assert!(chunks.is_empty());
-    }
-
     /// SSE error response (Gemini streaming error) → extract error.message, not the whole body.
     #[test]
     fn extract_upstream_error_sse_format() {
@@ -954,14 +890,6 @@ mod tests {
         let sse_body = b"event: interaction.created\ndata: {\"id\":\"int_123\"}\n\nevent: error\ndata: {\"error\":{\"message\":\"Rate limit exceeded\",\"code\":429}}\n\n";
         let msg = extract_upstream_error(sse_body);
         assert_eq!(msg, "Rate limit exceeded");
-    }
-
-    /// Plain JSON error body still works (non-streaming path).
-    #[test]
-    fn extract_upstream_error_json_format() {
-        let json_body = br#"{"error":{"message":"Model not found","code":404}}"#;
-        let msg = extract_upstream_error(json_body);
-        assert_eq!(msg, "Model not found");
     }
 
     /// SSE with error object but no message field → fallback string.

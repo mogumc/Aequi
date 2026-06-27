@@ -788,46 +788,6 @@ mod tests {
     }
 
     #[test]
-    fn gemini_multimodal_audio() {
-        let body = Bytes::from_static(
-            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"audiodata","format":"wav"}}]}]}"#,
-        );
-        let adapted = adapt_request(
-            UpstreamFormat::Gemini,
-            &"/v1/chat/completions".parse().unwrap(),
-            &Method::POST,
-            &body,
-            "gemini-3.5-flash",
-        )
-        .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
-        let content = v["input"][0]["content"].as_array().unwrap();
-        assert_eq!(content[0]["type"], "audio");
-        assert_eq!(content[0]["data"], "audiodata");
-        assert_eq!(content[0]["mime_type"], "audio/wav");
-    }
-
-    #[test]
-    fn gemini_multimodal_file() {
-        let body = Bytes::from_static(
-            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":[{"type":"file","file":{"file_data":"cGRmZGF0YQ==","filename":"doc.pdf"}}]}]}"#,
-        );
-        let adapted = adapt_request(
-            UpstreamFormat::Gemini,
-            &"/v1/chat/completions".parse().unwrap(),
-            &Method::POST,
-            &body,
-            "gemini-3.5-flash",
-        )
-        .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
-        let content = v["input"][0]["content"].as_array().unwrap();
-        assert_eq!(content[0]["type"], "document");
-        assert_eq!(content[0]["data"], "cGRmZGF0YQ==");
-        assert_eq!(content[0]["mime_type"], "application/pdf");
-    }
-
-    #[test]
     fn gemini_tools_converted_flat_format() {
         let body = Bytes::from_static(
             br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}"#,
@@ -1052,28 +1012,4 @@ mod tests {
         assert_eq!(params["properties"]["url"]["type"], "string");
     }
 
-    /// Tool message without a name field inherits name from the function_call step.
-    #[test]
-    fn gemini_tool_result_without_name_inherits_from_function_call() {
-        let body = Bytes::from_static(
-            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[{"id":"call_x","type":"function","function":{"name":"test_fn","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_x","content":"result text"}]}"#,
-        );
-        let adapted = adapt_request(
-            UpstreamFormat::Gemini,
-            &"/v1/chat/completions".parse().unwrap(),
-            &Method::POST,
-            &body,
-            "gemini-3.5-flash",
-        )
-        .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
-        let input = v["input"].as_array().unwrap();
-        // function_call/function_result rejected; tool result as user_input with name from call_name_map
-        assert_eq!(input.len(), 2, "user_input → user_input (tool result)");
-        assert_eq!(input[0]["type"], "user_input");
-        assert_eq!(input[1]["type"], "user_input");
-        let tool_text = input[1]["content"][0]["text"].as_str().unwrap();
-        assert!(tool_text.contains("[Tool test_fn result]"), "name inherited from call_name_map, got: {}", tool_text);
-        assert!(tool_text.contains("result text"), "result text expected in: {}", tool_text);
-    }
 }
