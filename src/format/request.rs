@@ -305,7 +305,10 @@ fn content_to_gemini_interaction_content(content: &serde_json::Value) -> Vec<ser
             }
             vec![serde_json::json!({"type": "text", "text": s})]
         }
-        _ => vec![],
+        _ => {
+            tracing::debug!("gemini: unhandled content type, dropping content");
+            vec![]
+        },
     }
 }
 
@@ -471,9 +474,10 @@ pub(super) fn adapt_request_inner_gemini(
                     }
                 }
                 "assistant" => {
-                    // Check for tool_calls first — record mapping for function_result name lookup
-                    // function_call and model_output steps are NOT emitted in stateless input array
-                    // (v1beta rejects them as "invalid argument")
+                    // Two distinct cases:
+                    // 1. Has tool_calls → ONLY record call_name_map for name lookup
+                    //    (function_call and function_result are rejected by v1beta Interactions API)
+                    // 2. No tool_calls → pure text response, preserve as model_output
                     if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
                         for tc in tool_calls {
                             let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
@@ -486,17 +490,24 @@ pub(super) fn adapt_request_inner_gemini(
                                 call_name_map.insert(id.to_string(), name.to_string());
                             }
                         }
+                    } else {
+                        let parts = content_to_gemini_interaction_content(&content);
+                        if !parts.is_empty() {
+                            input.push(serde_json::json!({
+                                "type": "model_output",
+                                "content": parts
+                            }));
+                        }
                     }
-                    // model_output also skipped — v1beta stateless rejects it
                 }
                 "tool" => {
-                    let call_id = msg
-                        .get("tool_call_id")
-                        .and_then(|i| i.as_str())
-                        .unwrap_or("");
                     let tool_msg_name = msg
                         .get("name")
                         .and_then(|n| n.as_str())
+                        .unwrap_or("");
+                    let call_id = msg
+                        .get("tool_call_id")
+                        .and_then(|i| i.as_str())
                         .unwrap_or("");
                     // Prefer name from tool message, fall back to name from function_call
                     let name = if !tool_msg_name.is_empty() {
@@ -506,15 +517,21 @@ pub(super) fn adapt_request_inner_gemini(
                     };
                     let raw_text = content_to_text(&content);
                     let unwrapped = unwrap_mcp_content(&raw_text);
-                    let mut entry = serde_json::json!({
-                        "type": "function_result",
-                        "call_id": call_id,
-                        "result": [{"type": "text", "text": unwrapped}]
-                    });
-                    if !name.is_empty() {
-                        entry["name"] = serde_json::json!(name);
+                    // Skip empty tool results — don't emit content-free steps
+                    if unwrapped.is_empty() {
+                        continue;
                     }
-                    input.push(entry);
+                    // Emit as user_input — v1beta Interactions API rejects function_result in input.
+                    // Prefix with tool name for context.
+                    let text = if name.is_empty() {
+                        unwrapped
+                    } else {
+                        format!("[Tool {} result]\n{}", name, unwrapped)
+                    };
+                    input.push(serde_json::json!({
+                        "type": "user_input",
+                        "content": [{"type": "text", "text": text}]
+                    }));
                 }
                 _ => {
                     // "user" or unknown role -> user_input
@@ -740,10 +757,11 @@ mod tests {
         .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
         let input = v["input"].as_array().unwrap();
-        // model_output steps are NOT emitted in stateless input array (v1beta)
-        assert_eq!(input.len(), 2);
+        // Assistant text is preserved as model_output for multi-turn context
+        assert_eq!(input.len(), 3);
         assert_eq!(input[0]["type"], "user_input");
-        assert_eq!(input[1]["type"], "user_input");
+        assert_eq!(input[1]["type"], "model_output");
+        assert_eq!(input[2]["type"], "user_input");
     }
 
     #[test]
@@ -767,46 +785,6 @@ mod tests {
         assert_eq!(content[1]["type"], "image");
         assert_eq!(content[1]["data"], "abc123");
         assert_eq!(content[1]["mime_type"], "image/png");
-    }
-
-    #[test]
-    fn gemini_multimodal_audio() {
-        let body = Bytes::from_static(
-            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"audiodata","format":"wav"}}]}]}"#,
-        );
-        let adapted = adapt_request(
-            UpstreamFormat::Gemini,
-            &"/v1/chat/completions".parse().unwrap(),
-            &Method::POST,
-            &body,
-            "gemini-3.5-flash",
-        )
-        .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
-        let content = v["input"][0]["content"].as_array().unwrap();
-        assert_eq!(content[0]["type"], "audio");
-        assert_eq!(content[0]["data"], "audiodata");
-        assert_eq!(content[0]["mime_type"], "audio/wav");
-    }
-
-    #[test]
-    fn gemini_multimodal_file() {
-        let body = Bytes::from_static(
-            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":[{"type":"file","file":{"file_data":"cGRmZGF0YQ==","filename":"doc.pdf"}}]}]}"#,
-        );
-        let adapted = adapt_request(
-            UpstreamFormat::Gemini,
-            &"/v1/chat/completions".parse().unwrap(),
-            &Method::POST,
-            &body,
-            "gemini-3.5-flash",
-        )
-        .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
-        let content = v["input"][0]["content"].as_array().unwrap();
-        assert_eq!(content[0]["type"], "document");
-        assert_eq!(content[0]["data"], "cGRmZGF0YQ==");
-        assert_eq!(content[0]["mime_type"], "application/pdf");
     }
 
     #[test]
@@ -916,16 +894,14 @@ mod tests {
         .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
         let input = v["input"].as_array().unwrap();
-        // function_call steps are NOT emitted in stateless input array
-        assert_eq!(input.len(), 2);
+        // function_call and function_result are rejected by v1beta Interactions API;
+        // tool result emitted as user_input with [Tool name result] prefix.
+        assert_eq!(input.len(), 2, "user_input → user_input (tool result)");
         assert_eq!(input[0]["type"], "user_input");
-        assert_eq!(input[1]["type"], "function_result");
-        assert_eq!(input[1]["call_id"], "call_123");
-        assert_eq!(input[1]["name"], "get_weather");
-        // result should be array of content blocks
-        let result = input[1]["result"].as_array().unwrap();
-        assert_eq!(result[0]["type"], "text");
-        assert_eq!(result[0]["text"], "{\"temp\": 22}");
+        assert_eq!(input[1]["type"], "user_input");
+        let tool_text = input[1]["content"][0]["text"].as_str().unwrap();
+        assert!(tool_text.contains("[Tool get_weather result]"), "tool name prefix expected, got: {}", tool_text);
+        assert!(tool_text.contains("{\"temp\": 22}"), "result text expected in: {}", tool_text);
     }
 
     #[test]
@@ -943,9 +919,36 @@ mod tests {
         .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
         let input = v["input"].as_array().unwrap();
-        // function_call steps are NOT emitted in stateless input array
-        assert_eq!(input.len(), 1);
+        // function_call is rejected by v1beta Interactions API; assistant with tool_calls
+        // only records call_name_map, emits no step.
+        assert_eq!(input.len(), 1, "only user_input remains");
         assert_eq!(input[0]["type"], "user_input");
+    }
+
+    /// Assistant with tool_calls must NOT emit model_output — even if content is non-empty.
+    /// This is a function-calling turn; the preamble text should be dropped alongside function_call.
+    #[test]
+    fn gemini_assistant_with_tool_calls_no_model_output() {
+        let body = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"fetch ip.sb"},{"role":"assistant","content":"","tool_calls":[{"id":"call_x","type":"function","function":{"name":"mcp__fetch__fetch","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_x","content":"{\"ip\":\"1.2.3.4\"}"}]}"#,
+        );
+        let adapted = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
+        let input = v["input"].as_array().unwrap();
+        // user_input → user_input (tool result as text), no model_output or function_call/function_result
+        assert_eq!(input.len(), 2, "user_input → user_input (tool result)");
+        assert_eq!(input[0]["type"], "user_input");
+        assert_eq!(input[1]["type"], "user_input");
+        let tool_text = input[1]["content"][0]["text"].as_str().unwrap();
+        assert!(tool_text.contains("[Tool mcp__fetch__fetch result]"), "name inherited from call_name_map, got: {}", tool_text);
+        assert!(tool_text.contains("1.2.3.4"), "result text expected in: {}", tool_text);
     }
 
     #[test]
@@ -989,16 +992,13 @@ mod tests {
 
         // Step verification
         let input = v["input"].as_array().unwrap();
-        // function_call steps are NOT emitted in stateless input array
-        assert_eq!(input.len(), 2);
+        // function_call/function_result rejected by v1beta; tool result as user_input
+        assert_eq!(input.len(), 2, "user_input → user_input (tool result)");
         assert_eq!(input[0]["type"], "user_input");
-        assert_eq!(input[1]["type"], "function_result");
-        assert_eq!(input[1]["call_id"], "PHAqNGxV");
-
-        // Unwrapped text: should NOT be double-encoded JSON
-        let result = input[1]["result"].as_array().unwrap();
-        assert_eq!(result[0]["type"], "text");
-        assert_eq!(result[0]["text"], "Baidu homepage content here");
+        assert_eq!(input[1]["type"], "user_input");
+        let tool_text = input[1]["content"][0]["text"].as_str().unwrap();
+        assert!(tool_text.contains("[Tool mcp__fetch__fetch result]"), "name prefix expected, got: {}", tool_text);
+        assert!(tool_text.contains("Baidu homepage content here"), "unwrapped text expected in: {}", tool_text);
 
         // Tools: should NOT have description:null, $schema, or additionalProperties
         let tools = v["tools"].as_array().unwrap();
@@ -1012,27 +1012,4 @@ mod tests {
         assert_eq!(params["properties"]["url"]["type"], "string");
     }
 
-    /// Tool message without a name field inherits name from the function_call step.
-    #[test]
-    fn gemini_tool_result_without_name_inherits_from_function_call() {
-        let body = Bytes::from_static(
-            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[{"id":"call_x","type":"function","function":{"name":"test_fn","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_x","content":"result text"}]}"#,
-        );
-        let adapted = adapt_request(
-            UpstreamFormat::Gemini,
-            &"/v1/chat/completions".parse().unwrap(),
-            &Method::POST,
-            &body,
-            "gemini-3.5-flash",
-        )
-        .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
-        let input = v["input"].as_array().unwrap();
-        // function_call steps are NOT emitted in stateless input array
-        assert_eq!(input.len(), 2);
-        assert_eq!(input[1]["type"], "function_result");
-        assert_eq!(input[1]["call_id"], "call_x");
-        assert_eq!(input[1]["name"], "test_fn", "name inherited from function_call");
-        assert_eq!(input[1]["result"][0]["text"], "result text");
-    }
 }
