@@ -405,14 +405,15 @@ pub(super) fn adapt_request_inner_gemini(
                 let tool_call_id = msg.get("tool_call_id").and_then(|id| id.as_str()).unwrap_or("");
                 let name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let result_text = content_to_text(&content);
-                let result_value: serde_json::Value = serde_json::from_str(&result_text)
-                    .unwrap_or_else(|_| serde_json::Value::String(result_text));
-                input.push(serde_json::json!({
+                let mut step = serde_json::json!({
                     "type": "function_result",
                     "call_id": tool_call_id,
-                    "name": name,
-                    "result": result_value,
-                }));
+                    "result": [{"type": "text", "text": result_text}],
+                });
+                if !name.is_empty() {
+                    step["name"] = serde_json::json!(name);
+                }
+                input.push(step);
                 continue;
             }
 
@@ -813,7 +814,11 @@ mod tests {
         assert_eq!(input[1]["type"], "function_result");
         assert_eq!(input[1]["call_id"], "call_1");
         assert_eq!(input[1]["name"], "get_weather");
-        assert_eq!(input[1]["result"]["temp"], 22);
+        // result should be [{type: "text", text: "..."}] per official API format
+        let result = input[1]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["type"], "text");
+        assert_eq!(result[0]["text"], "{\"temp\":22}");
     }
 
     /// Gemini: assistant with tool_calls → function_call steps.
