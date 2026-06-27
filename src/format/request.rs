@@ -191,6 +191,71 @@ fn mime_from_filename(filename: &str) -> String {
     }
 }
 
+/// Convert a single OpenAI content part to Gemini Interactions API content items.
+/// Returns a Vec because a single part may produce multiple items (text + binary).
+fn openai_part_to_gemini(part: &serde_json::Value) -> Vec<serde_json::Value> {
+    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+    // Text part
+    if part_type.is_empty() || part_type == "text" {
+        if let Some(text) = part.get("text").and_then(|t| t.as_str())
+            .or_else(|| part.get("content").and_then(|t| t.as_str()))
+        {
+            if !text.is_empty() {
+                return vec![serde_json::json!({"type": "text", "text": text})];
+            }
+        }
+        return vec![];
+    }
+
+    // Binary attachment (image_url / input_audio / file)
+    if let Some(att) = extract_binary_attachment(part, "gemini") {
+        let gemini_type = gemini_inline_type(&att.mime, part_type);
+        return vec![serde_json::json!({
+            "type": gemini_type,
+            "data": att.data,
+            "mime_type": att.mime,
+        })];
+    }
+
+    vec![]
+}
+
+/// Map MIME type (and OpenAI part_type fallback) to Gemini content type name.
+fn gemini_inline_type(mime: &str, part_type: &str) -> &'static str {
+    if mime.starts_with("image/") {
+        "image"
+    } else if mime.starts_with("audio/") {
+        "audio"
+    } else if mime.starts_with("video/") {
+        "video"
+    } else if part_type == "image_url" {
+        "image"
+    } else if part_type == "input_audio" {
+        "audio"
+    } else {
+        "document"
+    }
+}
+
+/// Convert OpenAI content field (string or array of parts) to Gemini content items.
+/// Handles multimodal content: text, images, audio, files → inline data.
+fn content_to_gemini_items(content: &serde_json::Value) -> Vec<serde_json::Value> {
+    match content {
+        serde_json::Value::String(s) => {
+            if s.is_empty() {
+                vec![]
+            } else {
+                vec![serde_json::json!({"type": "text", "text": s})]
+            }
+        }
+        serde_json::Value::Array(parts) => {
+            parts.iter().flat_map(openai_part_to_gemini).collect()
+        }
+        _ => vec![],
+    }
+}
+
 pub(super) fn adapt_request_inner(
     original_pq: &http::uri::PathAndQuery,
     body: &Bytes,
@@ -340,15 +405,16 @@ pub(super) fn adapt_request_inner_gemini(
                 }
                 continue;
             }
-            let text = content_to_text(&content);
-            if text.is_empty() {
+            // Convert content to Gemini items (supports multimodal: text, image, audio, file).
+            let items = content_to_gemini_items(&content);
+            if items.is_empty() {
                 continue;
             }
             // Interactions API uses Step objects for stateless multi-turn input.
             let step_type = if role == "assistant" { "model_output" } else { "user_input" };
             input.push(serde_json::json!({
                 "type": step_type,
-                "content": [{"type": "text", "text": text}],
+                "content": items,
             }));
         }
     }
@@ -495,5 +561,101 @@ mod tests {
         assert_eq!(input[1]["content"][0]["text"], "hi");
         assert_eq!(input[2]["type"], "user_input");
         assert_eq!(input[2]["content"][0]["text"], "again");
+    }
+
+    /// Gemini: image_url with data URI → inline image content.
+    #[test]
+    fn gemini_multimodal_image() {
+        let body = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":[{"type":"text","text":"What is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBOR"}}]}],"stream":false}"#,
+        );
+        let adapted = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
+        let content = v["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        // Text part preserved
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "What is this?");
+        // Image part converted to Gemini inline format
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["mime_type"], "image/png");
+        assert_eq!(content[1]["data"], "iVBOR");
+    }
+
+    /// Gemini: pure image (no text) should NOT be skipped.
+    #[test]
+    fn gemini_multimodal_image_only_not_skipped() {
+        let body = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,/9j/4AAQ"}}]}],"stream":false}"#,
+        );
+        let adapted = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1, "pure image message must not be skipped");
+        assert_eq!(input[0]["type"], "user_input");
+        let content = input[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["mime_type"], "image/jpeg");
+    }
+
+    /// Gemini: input_audio → inline audio content.
+    #[test]
+    fn gemini_multimodal_audio() {
+        let body = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"SUQz","format":"wav"}}]}],"stream":false}"#,
+        );
+        let adapted = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
+        let content = v["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "audio");
+        assert_eq!(content[0]["mime_type"], "audio/wav");
+        assert_eq!(content[0]["data"], "SUQz");
+    }
+
+    /// Gemini: file with file_data → inline document content.
+    #[test]
+    fn gemini_multimodal_file() {
+        let body = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":[{"type":"text","text":"Summarize"},{"type":"file","file":{"file_data":"JVBERi0=","filename":"report.pdf"}}]}],"stream":false}"#,
+        );
+        let adapted = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
+        let content = v["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Summarize");
+        assert_eq!(content[1]["type"], "document");
+        assert_eq!(content[1]["mime_type"], "application/pdf");
+        assert_eq!(content[1]["data"], "JVBERi0=");
     }
 }
