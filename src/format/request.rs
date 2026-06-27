@@ -480,43 +480,24 @@ pub(super) fn adapt_request_inner_gemini(
         out["stream"] = serde_json::Value::Bool(true);
     }
 
-    // Convert OpenAI tools → Gemini function_declarations.
+    // Convert OpenAI tools → Gemini Interactions API flat tool objects.
+    // Each function is a separate tool: {type:"function", name, description, parameters}.
     if let Some(tools) = v.get("tools").and_then(|t| t.as_array()) {
-        let declarations: Vec<serde_json::Value> = tools
+        let gemini_tools: Vec<serde_json::Value> = tools
             .iter()
             .filter_map(|t| t.get("function"))
             .map(|f| {
                 serde_json::json!({
+                    "type": "function",
                     "name": f.get("name"),
                     "description": f.get("description"),
                     "parameters": f.get("parameters").cloned().unwrap_or(serde_json::json!({"type":"object","properties":{}})),
                 })
             })
             .collect();
-        if !declarations.is_empty() {
-            out["tools"] = serde_json::json!([{
-                "type": "function",
-                "function_declarations": declarations,
-            }]);
+        if !gemini_tools.is_empty() {
+            out["tools"] = serde_json::Value::Array(gemini_tools);
         }
-    }
-
-    // Convert OpenAI tool_choice → Gemini tool_config.
-    if let Some(tc) = v.get("tool_choice") {
-        let mode = match tc.as_str() {
-            Some("auto") => "AUTO",
-            Some("required") | Some("any") => "ANY",
-            Some("none") => "NONE",
-            _ if tc.is_object() => "ANY",
-            _ => return Err(format_error(
-                http::StatusCode::BAD_REQUEST,
-                "invalid tool_choice for gemini format",
-                "invalid_tool_choice",
-            )),
-        };
-        out["tool_config"] = serde_json::json!({
-            "function_calling_config": {"mode": mode}
-        });
     }
 
     // generation_config with snake_case field names (Interactions API).
@@ -543,6 +524,21 @@ pub(super) fn adapt_request_inner_gemini(
         if !stops.is_empty() {
             generation.insert("stop_sequences".to_string(), serde_json::Value::Array(stops));
         }
+    }
+    // Convert OpenAI tool_choice → Gemini generation_config.tool_choice (lowercase mode).
+    if let Some(tc) = v.get("tool_choice") {
+        let mode = match tc.as_str() {
+            Some("auto") => "auto",
+            Some("required") | Some("any") => "any",
+            Some("none") => "none",
+            _ if tc.is_object() => "any",
+            _ => return Err(format_error(
+                http::StatusCode::BAD_REQUEST,
+                "invalid tool_choice for gemini format",
+                "invalid_tool_choice",
+            )),
+        };
+        generation.insert("tool_choice".to_string(), serde_json::json!(mode));
     }
     if !generation.is_empty() {
         out["generation_config"] = serde_json::Value::Object(generation);
@@ -746,7 +742,7 @@ mod tests {
         assert_eq!(content[1]["data"], "JVBERi0=");
     }
 
-    /// Gemini: OpenAI tools → Gemini function_declarations.
+    /// Gemini: OpenAI tools → flat Interactions API tool objects.
     #[test]
     fn gemini_tools_conversion() {
         let body = Bytes::from_static(
@@ -764,17 +760,15 @@ mod tests {
         let tools = v["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
-        let decls = tools[0]["function_declarations"].as_array().unwrap();
-        assert_eq!(decls.len(), 1);
-        assert_eq!(decls[0]["name"], "get_weather");
-        assert_eq!(decls[0]["description"], "Get weather");
-        assert_eq!(decls[0]["parameters"]["required"][0], "city");
+        assert_eq!(tools[0]["name"], "get_weather");
+        assert_eq!(tools[0]["description"], "Get weather");
+        assert_eq!(tools[0]["parameters"]["required"][0], "city");
     }
 
-    /// Gemini: tool_choice auto/required/none → tool_config mode.
+    /// Gemini: tool_choice auto/required/none → generation_config.tool_choice (lowercase).
     #[test]
     fn gemini_tool_choice_mapping() {
-        for (choice, expected_mode) in [("auto", "AUTO"), ("required", "ANY"), ("none", "NONE")] {
+        for (choice, expected_mode) in [("auto", "auto"), ("required", "any"), ("none", "none")] {
             let body_str = format!(
                 r#"{{"model":"gemini-3.5-flash","messages":[{{"role":"user","content":"hi"}}],"tool_choice":"{}","stream":false}}"#,
                 choice
@@ -789,7 +783,7 @@ mod tests {
             .unwrap();
             let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
             assert_eq!(
-                v["tool_config"]["function_calling_config"]["mode"],
+                v["generation_config"]["tool_choice"],
                 expected_mode,
                 "tool_choice={} should map to {}",
                 choice,
