@@ -451,20 +451,56 @@ fn gemini_sse_to_openai(v: &serde_json::Value, model: Option<&str>, event_type: 
 }
 
 /// Extract a human-readable error message from an upstream error response.
+/// Handles both plain JSON and SSE format (Gemini streaming errors arrive as SSE).
 fn extract_upstream_error(body: &[u8]) -> String {
-    let v: serde_json::Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return String::from_utf8_lossy(body).into_owned(),
-    };
-    // Anthropic / Gemini / OpenAI all use error.message
-    if let Some(msg) = v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
-        return msg.to_string();
+    // Try plain JSON first (covers non-streaming errors for all formats).
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(msg) = extract_error_message(&v) {
+            return msg;
+        }
     }
-    // Generic fallback: error object as string
+
+    // SSE fallback: scan for data: lines and extract error messages.
+    // Gemini streaming errors arrive as: event: error\ndata: {"error":{...}}\n\n
+    let text = String::from_utf8_lossy(body);
+    let mut found_error = false;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        if let Some(msg) = extract_error_message(&v) {
+            return msg;
+        }
+        if v.get("error").is_some() {
+            found_error = true;
+        }
+    }
+
+    if found_error {
+        return "upstream error (details unavailable)".to_string();
+    }
+
+    // No structured error found in either format — raw text fallback.
+    String::from_utf8_lossy(body).into_owned()
+}
+
+/// Extract error.message (or error as string) from a JSON value.
+fn extract_error_message(v: &serde_json::Value) -> Option<String> {
     v.get("error")
-        .and_then(|e| e.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "unknown upstream error".to_string())
+        .and_then(|e| {
+            e.get("message")
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| e.as_str().map(|s| s.to_string()))
+        })
 }
 
 fn chat_chunk_json(
@@ -652,5 +688,37 @@ mod tests {
         assert_eq!(parsed["usage"]["prompt_tokens"], 0);
         assert_eq!(parsed["usage"]["completion_tokens"], 0);
         assert_eq!(parsed["usage"]["total_tokens"], 0);
+    }
+
+    /// SSE error response (Gemini streaming error) → extract error.message, not the whole body.
+    #[test]
+    fn extract_upstream_error_sse_format() {
+        let sse_body = b"event: error\ndata: {\"error\":{\"message\":\"Invalid API key\",\"code\":401}}\n\n";
+        let msg = extract_upstream_error(sse_body);
+        assert_eq!(msg, "Invalid API key");
+    }
+
+    /// SSE with multiple events — error buried among normal events.
+    #[test]
+    fn extract_upstream_error_sse_among_events() {
+        let sse_body = b"event: interaction.created\ndata: {\"id\":\"int_123\"}\n\nevent: error\ndata: {\"error\":{\"message\":\"Rate limit exceeded\",\"code\":429}}\n\n";
+        let msg = extract_upstream_error(sse_body);
+        assert_eq!(msg, "Rate limit exceeded");
+    }
+
+    /// Plain JSON error body still works (non-streaming path).
+    #[test]
+    fn extract_upstream_error_json_format() {
+        let json_body = br#"{"error":{"message":"Model not found","code":404}}"#;
+        let msg = extract_upstream_error(json_body);
+        assert_eq!(msg, "Model not found");
+    }
+
+    /// SSE with error object but no message field → fallback string.
+    #[test]
+    fn extract_upstream_error_sse_no_message() {
+        let sse_body = b"event: error\ndata: {\"error\":{\"code\":500}}\n\n";
+        let msg = extract_upstream_error(sse_body);
+        assert_eq!(msg, "upstream error (details unavailable)");
     }
 }
