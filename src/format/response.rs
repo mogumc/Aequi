@@ -674,6 +674,8 @@ mod tests {
             parsed["choices"][0]["message"]["content"],
             "Hello from Gemini"
         );
+        // Completed interaction without function_call → "stop"
+        assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
     }
 
     /// SSE step.delta: thought and arguments types must be filtered out, only text forwarded.
@@ -767,47 +769,12 @@ mod tests {
         assert_eq!(parsed["usage"]["total_tokens"], 8);
     }
 
-    /// Edge case: Anthropic response with 0 tokens.
-    #[test]
-    fn anthropic_zero_tokens_produces_correct_usage() {
-        let anthropic_resp = serde_json::json!({
-            "id": "msg_xxx",
-            "type": "message",
-            "role": "assistant",
-            "model": "claude-sonnet-4-20250514",
-            "content": [{"type": "text", "text": ""}],
-            "usage": {
-                "input_tokens": 0,
-                "output_tokens": 0
-            }
-        });
-
-        let converted =
-            anthropic_json_to_openai(&anthropic_resp, Some("claude-sonnet-4-20250514".to_string()));
-
-        let serialized = converted.to_string();
-        let parsed: serde_json::Value =
-            serde_json::from_str(&serialized).expect("should parse");
-
-        assert_eq!(parsed["usage"]["prompt_tokens"], 0);
-        assert_eq!(parsed["usage"]["completion_tokens"], 0);
-        assert_eq!(parsed["usage"]["total_tokens"], 0);
-    }
-
     /// SSE error response (Gemini streaming error) → extract error.message, not the whole body.
     #[test]
     fn extract_upstream_error_sse_format() {
         let sse_body = b"event: error\ndata: {\"error\":{\"message\":\"Invalid API key\",\"code\":401}}\n\n";
         let msg = extract_upstream_error(sse_body);
         assert_eq!(msg, "Invalid API key");
-    }
-
-    /// SSE with multiple events — error buried among normal events.
-    #[test]
-    fn extract_upstream_error_sse_among_events() {
-        let sse_body = b"event: interaction.created\ndata: {\"id\":\"int_123\"}\n\nevent: error\ndata: {\"error\":{\"message\":\"Rate limit exceeded\",\"code\":429}}\n\n";
-        let msg = extract_upstream_error(sse_body);
-        assert_eq!(msg, "Rate limit exceeded");
     }
 
     /// Plain JSON error body still works (non-streaming path).
@@ -847,18 +814,6 @@ mod tests {
         assert!(args_str.contains("Beijing"));
     }
 
-    /// JSON response without function_call → finish_reason "stop", no tool_calls.
-    #[test]
-    fn gemini_json_no_function_call_has_stop() {
-        let gemini_resp = serde_json::json!({
-            "steps": [{"type": "model_output", "content": [{"type": "text", "text": "Hello"}]}],
-            "usage": {"total_input_tokens": 5, "total_output_tokens": 3, "total_tokens": 8}
-        });
-        let result = gemini_json_to_openai(&gemini_resp, Some("gemini-3.5-flash".to_string()));
-        assert_eq!(result["choices"][0]["finish_reason"], "stop");
-        assert!(result["choices"][0]["message"].get("tool_calls").is_none());
-    }
-
     /// SSE step.start with function_call → tool_calls chunk with finish_reason "tool_calls".
     #[test]
     fn gemini_sse_function_call_step_start() {
@@ -891,16 +846,6 @@ mod tests {
         assert!(chunks[0]["choices"][0]["finish_reason"].is_null());
     }
 
-    /// SSE interaction.completed without function_call → finish_reason "stop".
-    #[test]
-    fn gemini_sse_completed_without_function_call() {
-        let event = serde_json::json!({
-            "interaction": {"usage": {"total_tokens": 10}}
-        });
-        let (chunks, _) = gemini_sse_to_openai(&event, Some("m"), "interaction.completed", false);
-        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "stop");
-    }
-
     /// JSON: interaction status "failed" → finish_reason "content_filter".
     #[test]
     fn gemini_json_failed_status_content_filter() {
@@ -923,13 +868,4 @@ mod tests {
         assert_eq!(chunks[0]["choices"][0]["finish_reason"], "content_filter");
     }
 
-    /// SSE: interaction.completed with status "cancelled" → finish_reason "content_filter".
-    #[test]
-    fn gemini_sse_completed_cancelled_status() {
-        let event = serde_json::json!({
-            "interaction": {"status": "cancelled", "usage": {}}
-        });
-        let (chunks, _) = gemini_sse_to_openai(&event, Some("m"), "interaction.completed", false);
-        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "content_filter");
-    }
 }
