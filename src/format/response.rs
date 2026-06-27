@@ -450,7 +450,7 @@ fn gemini_sse_to_openai(v: &serde_json::Value, model: Option<&str>, event_type: 
             let id = step.and_then(|s| s.get("id")).and_then(|id| id.as_str()).unwrap_or("");
             let name = step.and_then(|s| s.get("name")).and_then(|n| n.as_str()).unwrap_or("");
             // Emit tool call with empty arguments — actual arguments arrive
-            // incrementally via step.delta(type="arguments") partial_arguments.
+            // incrementally via step.delta(type="arguments_delta", field="arguments").
             // This matches OpenAI streaming format where function.arguments
             // accumulates across chunks.
             let chunk = chat_chunk_json(
@@ -492,12 +492,12 @@ fn gemini_sse_to_openai(v: &serde_json::Value, model: Option<&str>, event_type: 
                         None,
                     )], false)
                 }
-                "arguments" => {
-                    // Streaming function call argument increment.
-                    // Forward partial_arguments as tool_calls delta so the
-                    // client can accumulate them into the full arguments string.
+                "arguments_delta" => {
+                    // Streaming function call argument increment (per OpenAPI spec).
+                    // Forward the partial arguments string as a tool_calls delta so
+                    // the client can accumulate them into the full arguments string.
                     let partial = delta
-                        .and_then(|d| d.get("partial_arguments"))
+                        .and_then(|d| d.get("arguments"))
                         .and_then(|s| s.as_str())
                         .unwrap_or("");
                     if partial.is_empty() {
@@ -723,11 +723,11 @@ mod tests {
         assert_eq!(result[0]["choices"][0]["delta"]["content"], "fallback");
     }
 
-    /// SSE step.delta with type "arguments" → forward partial_arguments as tool_calls delta.
+    /// SSE step.delta with type "arguments_delta" → forward arguments as tool_calls delta.
     #[test]
     fn gemini_sse_arguments_delta_forwarded() {
         let event = serde_json::json!({
-            "delta": {"type": "arguments", "partial_arguments": "{\"city\":"}
+            "delta": {"type": "arguments_delta", "arguments": "{\"city\":"}
         });
         let (result, is_fc) = gemini_sse_to_openai(&event, Some("m"), "step.delta", false);
         assert!(!is_fc);
@@ -737,9 +737,9 @@ mod tests {
             "{\"city\":"
         );
 
-        // empty partial_arguments → no output
+        // empty arguments → no output
         let empty_event = serde_json::json!({
-            "delta": {"type": "arguments", "partial_arguments": ""}
+            "delta": {"type": "arguments_delta", "arguments": ""}
         });
         let (result, _) = gemini_sse_to_openai(&empty_event, Some("m"), "step.delta", false);
         assert!(result.is_empty());
