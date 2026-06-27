@@ -191,55 +191,56 @@ fn mime_from_filename(filename: &str) -> String {
     }
 }
 
-/// Convert a single OpenAI content part to Gemini Interactions API content items.
-/// Returns a Vec because a single part may produce multiple items (text + binary).
-fn openai_part_to_gemini(part: &serde_json::Value) -> Vec<serde_json::Value> {
+/// Convert a single OpenAI content part to a Gemini Interactions API content item.
+fn openai_part_to_gemini(part: &serde_json::Value) -> Option<serde_json::Value> {
     let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-    // Text part
-    if part_type.is_empty() || part_type == "text" {
-        if let Some(text) = part.get("text").and_then(|t| t.as_str())
-            .or_else(|| part.get("content").and_then(|t| t.as_str()))
-        {
-            if !text.is_empty() {
-                return vec![serde_json::json!({"type": "text", "text": text})];
-            }
+    let text = part
+        .get("text")
+        .and_then(|t| t.as_str())
+        .or_else(|| part.get("content").and_then(|t| t.as_str()));
+    if let Some(s) = text {
+        if part_type.is_empty() || part_type == "text" {
+            return Some(serde_json::json!({"type": "text", "text": s}));
         }
-        return vec![];
     }
 
-    // Binary attachment (image_url / input_audio / file)
     if let Some(att) = extract_binary_attachment(part, "gemini") {
-        let gemini_type = gemini_inline_type(&att.mime, part_type);
-        return vec![serde_json::json!({
+        let gemini_type = if att.mime.starts_with("image/") {
+            "image"
+        } else if att.mime.starts_with("audio/") {
+            "audio"
+        } else if att.mime.starts_with("video/") {
+            "video"
+        } else if part_type == "image_url" {
+            "image"
+        } else if part_type == "input_audio" {
+            "audio"
+        } else {
+            "document"
+        };
+        return Some(serde_json::json!({
             "type": gemini_type,
             "data": att.data,
             "mime_type": att.mime,
-        })];
+        }));
+    }
+    if matches!(part_type, "image_url" | "input_audio" | "file") {
+        return None;
     }
 
-    vec![]
-}
-
-/// Map MIME type (and OpenAI part_type fallback) to Gemini content type name.
-fn gemini_inline_type(mime: &str, part_type: &str) -> &'static str {
-    if mime.starts_with("image/") {
-        "image"
-    } else if mime.starts_with("audio/") {
-        "audio"
-    } else if mime.starts_with("video/") {
-        "video"
-    } else if part_type == "image_url" {
-        "image"
-    } else if part_type == "input_audio" {
-        "audio"
-    } else {
-        "document"
+    if let Some(s) = text {
+        if s.len() > MAX_DECODED_BYTES {
+            tracing::warn!(text_len = s.len(), "gemini: fallback text item dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+            return None;
+        }
+        return Some(serde_json::json!({"type": "text", "text": s}));
     }
+
+    None
 }
 
 /// Convert OpenAI content field (string or array of parts) to Gemini content items.
-/// Handles multimodal content: text, images, audio, files → inline data.
 fn content_to_gemini_items(content: &serde_json::Value) -> Vec<serde_json::Value> {
     match content {
         serde_json::Value::String(s) => {
@@ -250,7 +251,7 @@ fn content_to_gemini_items(content: &serde_json::Value) -> Vec<serde_json::Value
             }
         }
         serde_json::Value::Array(parts) => {
-            parts.iter().flat_map(openai_part_to_gemini).collect()
+            parts.iter().filter_map(openai_part_to_gemini).collect()
         }
         _ => vec![],
     }
@@ -494,6 +495,7 @@ pub(super) fn adapt_request_inner_gemini(
             .collect();
         if !declarations.is_empty() {
             out["tools"] = serde_json::json!([{
+                "type": "function",
                 "function_declarations": declarations,
             }]);
         }
@@ -761,6 +763,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
         let tools = v["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
         let decls = tools[0]["function_declarations"].as_array().unwrap();
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0]["name"], "get_weather");
