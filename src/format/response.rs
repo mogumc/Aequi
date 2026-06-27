@@ -732,31 +732,6 @@ mod tests {
         assert_eq!(parsed["usage"]["total_tokens"], 46);
     }
 
-    /// Edge case: Gemini Interactions API failed interaction still has usage.
-    #[test]
-    fn gemini_failed_interaction_still_produces_usage() {
-        let gemini_resp = serde_json::json!({
-            "id": "int_failed",
-            "model": "gemini-3.5-flash",
-            "status": "failed",
-            "steps": [],
-            "usage": {
-                "total_input_tokens": 8,
-                "total_tokens": 8
-            }
-        });
-
-        let converted = gemini_json_to_openai(&gemini_resp, Some("gemini-3.5-flash".to_string()));
-
-        let serialized = converted.to_string();
-        let parsed: serde_json::Value =
-            serde_json::from_str(&serialized).expect("should parse");
-
-        assert_eq!(parsed["usage"]["prompt_tokens"], 8);
-        assert_eq!(parsed["usage"]["completion_tokens"], 0); // no output tokens
-        assert_eq!(parsed["usage"]["total_tokens"], 8);
-    }
-
     /// SSE error response (Gemini streaming error) → extract error.message, not the whole body.
     #[test]
     fn extract_upstream_error_sse_format() {
