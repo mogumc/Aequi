@@ -209,6 +209,30 @@ fn anthropic_json_to_openai(v: &serde_json::Value, model: Option<String>) -> ser
     chat_completion_json(id, &model, content, input, output)
 }
 
+/// Extract (prompt, completion, thought, total) from a Gemini usage object.
+/// Accepts both OpenAI-style names (prompt_tokens) and Gemini-style names (total_input_tokens).
+fn extract_gemini_usage(usage: &serde_json::Value) -> (u64, u64, u64, u64) {
+    let prompt = usage
+        .get("prompt_tokens")
+        .and_then(|n| n.as_u64())
+        .or_else(|| usage.get("total_input_tokens").and_then(|n| n.as_u64()))
+        .unwrap_or(0);
+    let completion = usage
+        .get("completion_tokens")
+        .and_then(|n| n.as_u64())
+        .or_else(|| usage.get("total_output_tokens").and_then(|n| n.as_u64()))
+        .unwrap_or(0);
+    let thought = usage
+        .get("total_thought_tokens")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+    let total = usage
+        .get("total_tokens")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(prompt + completion + thought);
+    (prompt, completion, thought, total)
+}
+
 fn gemini_json_to_openai(v: &serde_json::Value, model: Option<String>) -> serde_json::Value {
     let model = model.unwrap_or_default();
 
@@ -254,28 +278,10 @@ fn gemini_json_to_openai(v: &serde_json::Value, model: Option<String>) -> serde_
         .unwrap_or_default();
 
     // Extract usage — API returns total_input_tokens / total_output_tokens / total_thought_tokens / total_tokens.
-    // Also accepts prompt_tokens / completion_tokens for forward compatibility.
-    let usage = v.get("usage");
-    let prompt = usage
-        .and_then(|u| {
-            u.get("prompt_tokens")
-                .and_then(|n| n.as_u64())
-                .or_else(|| u.get("total_input_tokens").and_then(|n| n.as_u64()))
-        })
-        .unwrap_or(0);
-    let completion = usage
-        .and_then(|u| {
-            u.get("completion_tokens")
-                .and_then(|n| n.as_u64())
-                .or_else(|| u.get("total_output_tokens").and_then(|n| n.as_u64()))
-        })
-        .unwrap_or(0);
-    let thought = usage
-        .and_then(|u| u.get("total_thought_tokens").and_then(|n| n.as_u64()))
-        .unwrap_or(0);
-    let total = usage
-        .and_then(|u| u.get("total_tokens").and_then(|n| n.as_u64()))
-        .unwrap_or(prompt + completion + thought);
+    let (prompt, completion, thought, total) = v
+        .get("usage")
+        .map(extract_gemini_usage)
+        .unwrap_or((0, 0, 0, 0));
 
     let finish_reason = if !tool_calls.is_empty() {
         "tool_calls"
@@ -512,27 +518,9 @@ fn gemini_sse_to_openai(v: &serde_json::Value, model: Option<&str>, event_type: 
                 None,
             )];
 
-            // Emit usage if present — API returns total_input_tokens / total_output_tokens;
-            // also accepts prompt_tokens / completion_tokens for forward compatibility.
+            // Emit usage if present.
             if let Some(usage) = usage {
-                let prompt = usage
-                    .get("prompt_tokens")
-                    .and_then(|n| n.as_u64())
-                    .or_else(|| usage.get("total_input_tokens").and_then(|n| n.as_u64()))
-                    .unwrap_or(0);
-                let completion = usage
-                    .get("completion_tokens")
-                    .and_then(|n| n.as_u64())
-                    .or_else(|| usage.get("total_output_tokens").and_then(|n| n.as_u64()))
-                    .unwrap_or(0);
-                let thought = usage
-                    .get("total_thought_tokens")
-                    .and_then(|n| n.as_u64())
-                    .unwrap_or(0);
-                let total = usage
-                    .get("total_tokens")
-                    .and_then(|n| n.as_u64())
-                    .unwrap_or(prompt + completion + thought);
+                let (prompt, completion, thought, total) = extract_gemini_usage(usage);
                 out.push(chat_chunk_json(
                     "chatcmpl-gemini",
                     model.unwrap_or(""),
