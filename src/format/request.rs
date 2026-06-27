@@ -144,8 +144,49 @@ fn openai_part_to_anthropic(part: &serde_json::Value) -> Option<serde_json::Valu
     None
 }
 
+/// Convert a single OpenAI content part to a Gemini Interactions API content block.
+/// Returns blocks in the format: {type:"text",text:"..."}, {type:"image",data:"...",mime_type:"..."}, etc.
+fn openai_part_to_gemini_interaction(part: &serde_json::Value) -> Option<serde_json::Value> {
+    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-/// Parse a data URI "data:<mime>;base64,<data>" → (mime, data).
+    // Text content
+    let text = part
+        .get("text")
+        .and_then(|t| t.as_str())
+        .or_else(|| part.get("content").and_then(|t| t.as_str()));
+    if let Some(s) = text {
+        if part_type.is_empty() || part_type == "text" {
+            if s.len() > MAX_DECODED_BYTES {
+                tracing::warn!(text_len = s.len(), "gemini: text content dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+                return None;
+            }
+            return Some(serde_json::json!({"type": "text", "text": s}));
+        }
+    }
+
+    // Binary attachments (image, audio, document)
+    if let Some(att) = extract_binary_attachment(part, "gemini") {
+        let block_type = if part_type == "image_url" {
+            "image"
+        } else if part_type == "input_audio" {
+            "audio"
+        } else {
+            "document"
+        };
+        return Some(serde_json::json!({
+            "type": block_type,
+            "data": att.data,
+            "mime_type": att.mime
+        }));
+    }
+    if matches!(part_type, "image_url" | "input_audio" | "file") {
+        return None;
+    }
+
+    None
+}
+
+/// Parse a data URI "data:<mime>;base64,<data>" -> (mime, data).
 /// Returns None if the decoded data exceeds `max_bytes`.
 fn parse_data_uri(uri: &str, max_bytes: usize) -> Option<(String, String)> {
     let stripped = uri.strip_prefix("data:")?;
@@ -191,71 +232,89 @@ fn mime_from_filename(filename: &str) -> String {
     }
 }
 
-/// Convert a single OpenAI content part to a Gemini Interactions API content item.
-fn openai_part_to_gemini(part: &serde_json::Value) -> Option<serde_json::Value> {
-    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+// ─────────────────────────────────────────────────────────────
+// Gemini Interactions API: helpers
+// ─────────────────────────────────────────────────────────────
 
-    let text = part
-        .get("text")
-        .and_then(|t| t.as_str())
-        .or_else(|| part.get("content").and_then(|t| t.as_str()));
-    if let Some(s) = text {
-        if part_type.is_empty() || part_type == "text" {
-            return Some(serde_json::json!({"type": "text", "text": s}));
-        }
-    }
-
-    if let Some(att) = extract_binary_attachment(part, "gemini") {
-        let gemini_type = if att.mime.starts_with("image/") {
-            "image"
-        } else if att.mime.starts_with("audio/") {
-            "audio"
-        } else if att.mime.starts_with("video/") {
-            "video"
-        } else if part_type == "image_url" {
-            "image"
-        } else if part_type == "input_audio" {
-            "audio"
-        } else {
-            "document"
-        };
-        return Some(serde_json::json!({
-            "type": gemini_type,
-            "data": att.data,
-            "mime_type": att.mime,
-        }));
-    }
-    if matches!(part_type, "image_url" | "input_audio" | "file") {
-        return None;
-    }
-
-    if let Some(s) = text {
-        if s.len() > MAX_DECODED_BYTES {
-            tracing::warn!(text_len = s.len(), "gemini: fallback text item dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
-            return None;
-        }
-        return Some(serde_json::json!({"type": "text", "text": s}));
-    }
-
-    None
-}
-
-/// Convert OpenAI content field (string or array of parts) to Gemini content items.
-fn content_to_gemini_items(content: &serde_json::Value) -> Vec<serde_json::Value> {
-    match content {
-        serde_json::Value::String(s) => {
-            if s.is_empty() {
-                vec![]
-            } else {
-                vec![serde_json::json!({"type": "text", "text": s})]
+/// Strip "$schema" and "additionalProperties" from tool parameters.
+/// Gemini doesn't support these JSON Schema fields.
+fn strip_gemini_unsupported_schema(params: &serde_json::Value) -> serde_json::Value {
+    match params {
+        serde_json::Value::Object(map) => {
+            let mut cleaned = serde_json::Map::new();
+            for (k, v) in map {
+                if matches!(k.as_str(), "$schema" | "additionalProperties") {
+                    continue;
+                }
+                cleaned.insert(k.clone(), strip_gemini_unsupported_schema(v));
             }
+            serde_json::Value::Object(cleaned)
         }
-        serde_json::Value::Array(parts) => {
-            parts.iter().filter_map(openai_part_to_gemini).collect()
-        }
-        _ => vec![],
+        _ => params.clone(),
     }
 }
+
+/// Unwrap double-encoded content from MCP tools.
+/// If text starts with "[" or "{", try parsing as JSON.
+/// If it's an OpenAI content array [{type:"text",text:"..."}], extract the actual text.
+fn unwrap_mcp_content(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with('[') || trimmed.starts_with('{') {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(arr) = parsed.as_array() {
+                let extracted: Vec<String> = arr
+                    .iter()
+                    .filter_map(|item| {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            item.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !extracted.is_empty() {
+                    return extracted.join("\n");
+                }
+            }
+            // If it parsed as JSON but wasn't a content array, return original text
+            return text.to_string();
+        }
+    }
+    text.to_string()
+}
+
+/// Convert OpenAI content (string or array) to Gemini Interactions API content blocks.
+/// Returns vec of {type:"text",text:"..."}, {type:"image",data,mime_type}, etc.
+fn content_to_gemini_interaction_content(content: &serde_json::Value) -> Vec<serde_json::Value> {
+    match content {
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| openai_part_to_gemini_interaction(part))
+            .collect(),
+        serde_json::Value::String(s) => {
+            if s.len() > MAX_DECODED_BYTES {
+                tracing::warn!(text_len = s.len(), "gemini: text content dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+                return vec![];
+            }
+            vec![serde_json::json!({"type": "text", "text": s})]
+        }
+        _ => {
+            let text = content_to_text(content);
+            if text.is_empty() {
+                return vec![];
+            }
+            if text.len() > MAX_DECODED_BYTES {
+                tracing::warn!(text_len = text.len(), "gemini: fallback text content dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+                return vec![];
+            }
+            vec![serde_json::json!({"type": "text", "text": text})]
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Anthropic adapter (unchanged)
+// ─────────────────────────────────────────────────────────────
 
 pub(super) fn adapt_request_inner(
     original_pq: &http::uri::PathAndQuery,
@@ -369,6 +428,10 @@ pub(super) fn adapt_request_inner(
     })
 }
 
+// ─────────────────────────────────────────────────────────────
+// Gemini Interactions API adapter
+// ─────────────────────────────────────────────────────────────
+
 pub(super) fn adapt_request_inner_gemini(
     original_pq: &http::uri::PathAndQuery,
     body: &Bytes,
@@ -392,6 +455,9 @@ pub(super) fn adapt_request_inner_gemini(
 
     let mut system_parts = Vec::new();
     let mut input = Vec::new();
+    // Track call_id → function_name from assistant tool_calls for use in function_result
+    let mut call_name_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
     if let Some(input_messages) = v.get("messages").and_then(|m| m.as_array()) {
         for msg in input_messages {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
@@ -400,100 +466,113 @@ pub(super) fn adapt_request_inner_gemini(
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
 
-            // Tool result → function_result step.
-            if role == "tool" {
-                let tool_call_id = msg.get("tool_call_id").and_then(|id| id.as_str()).unwrap_or("");
-                let name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let result_text = content_to_text(&content);
-                let mut step = serde_json::json!({
-                    "type": "function_result",
-                    "call_id": tool_call_id,
-                    "result": [{"type": "text", "text": result_text}],
-                });
-                if !name.is_empty() {
-                    step["name"] = serde_json::json!(name);
+            match role {
+                "system" => {
+                    let text = content_to_text(&content);
+                    if !text.is_empty() {
+                        system_parts.push(text);
+                    }
                 }
-                input.push(step);
-                continue;
-            }
-
-            if role == "system" {
-                let text = content_to_text(&content);
-                if !text.is_empty() {
-                    system_parts.push(text);
+                "assistant" => {
+                    // Check for tool_calls first — record mapping for function_result name lookup
+                    // function_call and model_output steps are NOT emitted in stateless input array
+                    // (v1beta rejects them as "invalid argument")
+                    if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                        for tc in tool_calls {
+                            let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                            let func = tc.get("function");
+                            let name = func
+                                .and_then(|f| f.get("name"))
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("");
+                            if !id.is_empty() {
+                                call_name_map.insert(id.to_string(), name.to_string());
+                            }
+                        }
+                    }
+                    // model_output also skipped — v1beta stateless rejects it
                 }
-                continue;
-            }
-
-            // For assistant messages, handle both text content and tool_calls.
-            if role == "assistant" {
-                if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
-                    // Emit text content as model_output if present.
-                    let items = content_to_gemini_items(&content);
-                    if !items.is_empty() {
+                "tool" => {
+                    let call_id = msg
+                        .get("tool_call_id")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("");
+                    let tool_msg_name = msg
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("");
+                    // Prefer name from tool message, fall back to name from function_call
+                    let name = if !tool_msg_name.is_empty() {
+                        tool_msg_name
+                    } else {
+                        call_name_map.get(call_id).map(|s| s.as_str()).unwrap_or("")
+                    };
+                    let raw_text = content_to_text(&content);
+                    let unwrapped = unwrap_mcp_content(&raw_text);
+                    let mut entry = serde_json::json!({
+                        "type": "function_result",
+                        "call_id": call_id,
+                        "result": [{"type": "text", "text": unwrapped}]
+                    });
+                    if !name.is_empty() {
+                        entry["name"] = serde_json::json!(name);
+                    }
+                    input.push(entry);
+                }
+                _ => {
+                    // "user" or unknown role -> user_input
+                    let parts = content_to_gemini_interaction_content(&content);
+                    if !parts.is_empty() {
                         input.push(serde_json::json!({
-                            "type": "model_output",
-                            "content": items,
+                            "type": "user_input",
+                            "content": parts
                         }));
                     }
-                    // Emit each tool call as a function_call step.
-                    for tc in tool_calls {
-                        let id = tc.get("id").and_then(|id| id.as_str()).unwrap_or("");
-                        let function = tc.get("function");
-                        let name = function.and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
-                        let args_str = function.and_then(|f| f.get("arguments")).and_then(|a| a.as_str()).unwrap_or("{}");
-                        let args: serde_json::Value = serde_json::from_str(args_str)
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                        input.push(serde_json::json!({
-                            "type": "function_call",
-                            "id": id,
-                            "name": name,
-                            "arguments": args,
-                        }));
-                    }
-                    continue;
                 }
             }
-
-            // Regular user/assistant message — convert content to Gemini items.
-            let items = content_to_gemini_items(&content);
-            if items.is_empty() {
-                continue;
-            }
-            let step_type = if role == "assistant" { "model_output" } else { "user_input" };
-            input.push(serde_json::json!({
-                "type": step_type,
-                "content": items,
-            }));
         }
     }
 
-    // Build Interactions API request body.
+    // Build output body
     let mut out = serde_json::json!({
         "model": model,
         "input": input,
         "store": false,
     });
+    if stream {
+        out["stream"] = serde_json::json!(true);
+    }
+
+    // System instruction as plain string
     if !system_parts.is_empty() {
         out["system_instruction"] = serde_json::Value::String(system_parts.join("\n\n"));
     }
-    if stream {
-        out["stream"] = serde_json::Value::Bool(true);
-    }
 
-    // Convert OpenAI tools → Gemini Interactions API flat tool objects.
-    // Each function is a separate tool: {type:"function", name, description, parameters}.
+    // Tools: flat array of {type:"function", name, description, parameters}
     if let Some(tools) = v.get("tools").and_then(|t| t.as_array()) {
         let gemini_tools: Vec<serde_json::Value> = tools
             .iter()
             .filter_map(|t| t.get("function"))
             .map(|f| {
-                serde_json::json!({
+                let name = f.get("name").cloned().unwrap_or(serde_json::json!(""));
+                let description = f.get("description").cloned();
+                let parameters = f
+                    .get("parameters")
+                    .map(|p| strip_gemini_unsupported_schema(p))
+                    .unwrap_or(serde_json::json!({}));
+
+                let mut tool = serde_json::json!({
                     "type": "function",
-                    "name": f.get("name"),
-                    "description": f.get("description"),
-                    "parameters": f.get("parameters").cloned().unwrap_or(serde_json::json!({"type":"object","properties":{}})),
-                })
+                    "name": name,
+                    "parameters": parameters,
+                });
+                // Only include description if present and non-null
+                if let Some(desc) = description {
+                    if !desc.is_null() {
+                        tool["description"] = desc;
+                    }
+                }
+                tool
             })
             .collect();
         if !gemini_tools.is_empty() {
@@ -501,62 +580,70 @@ pub(super) fn adapt_request_inner_gemini(
         }
     }
 
-    // generation_config with snake_case field names (Interactions API).
-    let mut generation = serde_json::Map::new();
+    // Build generation_config: tool_choice (if present) + snake_case param fields
+    let mut gen_config = serde_json::json!({});
+
+    // tool_choice mapping: OpenAI -> Gemini
+    if let Some(tc) = v.get("tool_choice") {
+        let gemini_tc = match tc {
+            serde_json::Value::String(s) => match s.as_str() {
+                "auto" => Some("auto"),
+                "required" | "any" => Some("any"),
+                "none" => Some("none"),
+                _ => None,
+            },
+            serde_json::Value::Object(_) => Some("any"),
+            _ => None,
+        };
+        if let Some(choice) = gemini_tc {
+            gen_config["tool_choice"] = serde_json::json!(choice);
+        }
+    }
+
     if let Some(n) = v
         .get("max_tokens")
         .or_else(|| v.get("max_completion_tokens"))
         .and_then(|n| n.as_u64())
     {
-        generation.insert("max_output_tokens".to_string(), serde_json::json!(n));
+        gen_config["max_output_tokens"] = serde_json::json!(n);
     }
     if let Some(n) = v.get("temperature").and_then(|n| n.as_f64()) {
-        generation.insert("temperature".to_string(), serde_json::json!(n));
+        gen_config["temperature"] = serde_json::json!(n);
     }
     if let Some(n) = v.get("top_p").and_then(|n| n.as_f64()) {
-        generation.insert("top_p".to_string(), serde_json::json!(n));
+        gen_config["top_p"] = serde_json::json!(n);
     }
     if let Some(stop) = v.get("stop") {
         let stops = match stop {
             serde_json::Value::Array(a) => a.clone(),
             serde_json::Value::String(_) => vec![stop.clone()],
-            _ => Vec::new(),
+            _ => vec![],
         };
         if !stops.is_empty() {
-            generation.insert("stop_sequences".to_string(), serde_json::Value::Array(stops));
+            gen_config["stop_sequences"] = serde_json::Value::Array(stops);
         }
     }
-    // Convert OpenAI tool_choice → Gemini generation_config.tool_choice (lowercase mode).
-    if let Some(tc) = v.get("tool_choice") {
-        let mode = match tc.as_str() {
-            Some("auto") => "auto",
-            Some("required") | Some("any") => "any",
-            Some("none") => "none",
-            _ if tc.is_object() => "any",
-            _ => return Err(format_error(
-                http::StatusCode::BAD_REQUEST,
-                "invalid tool_choice for gemini format",
-                "invalid_tool_choice",
-            )),
-        };
-        generation.insert("tool_choice".to_string(), serde_json::json!(mode));
-    }
-    if !generation.is_empty() {
-        out["generation_config"] = serde_json::Value::Object(generation);
+
+    if gen_config.as_object().map_or(false, |m| !m.is_empty()) {
+        out["generation_config"] = gen_config;
     }
 
+    // Fixed path for Interactions API
     let path_and_query = http::uri::PathAndQuery::from_static("/v1beta/interactions");
 
-    // Api-Revision header to opt into the latest Interactions API schema.
+    // Api-Revision header
     let extra_headers = vec![(
         hyper::header::HeaderName::from_static("api-revision"),
         hyper::header::HeaderValue::from_static("2026-05-20"),
     )];
 
+    let body_bytes = Bytes::from(out.to_string());
+    tracing::debug!(body = %String::from_utf8_lossy(&body_bytes), "gemini upstream request");
+
     Ok(AdaptedRequest {
         method: Method::POST,
         path_and_query,
-        body: Bytes::from(out.to_string()),
+        body: body_bytes,
         auth_style: AuthStyle::GeminiKey,
         extra_headers,
     })
@@ -590,9 +677,9 @@ mod tests {
     }
 
     #[test]
-    fn gemini_request_uses_interactions_api() {
+    fn gemini_request_uses_interactions_path() {
         let body = Bytes::from_static(
-            br#"{"model":"gemini-3.5-flash","messages":[{"role":"system","content":"you are helpful"},{"role":"user","content":"hi"}],"stream":false}"#,
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hi"}],"stream":false}"#,
         );
         let adapted = adapt_request(
             UpstreamFormat::Gemini,
@@ -602,31 +689,39 @@ mod tests {
             "gemini-3.5-flash",
         )
         .unwrap();
-        // Path should be /v1beta/interactions with no key in query string
         assert_eq!(adapted.path_and_query.as_str(), "/v1beta/interactions");
-        // No alt=sse for Interactions API
-        assert!(!adapted.path_and_query.as_str().contains("key="));
         let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
         assert_eq!(v["model"], "gemini-3.5-flash");
-        // Input uses Step objects: {type: "user_input", content: [{type: "text", text: "..."}]}
         assert_eq!(v["input"][0]["type"], "user_input");
-        assert_eq!(v["input"][0]["content"][0]["type"], "text");
-        assert_eq!(v["input"][0]["content"][0]["text"], "hi");
-        assert!(v["input"][0].get("role").is_none(), "Step objects must not have 'role' field");
-        assert!(v["input"][0].get("parts").is_none(), "Interactions API must not use 'parts' field");
-        assert_eq!(v["system_instruction"], "you are helpful");
         assert_eq!(v["store"], false);
-        // Api-Revision header
-        assert!(adapted.extra_headers.iter().any(|(n, v)| n.as_str() == "api-revision" && v == "2026-05-20"));
-        // Auth via GeminiKey
-        assert!(matches!(adapted.auth_style, AuthStyle::GeminiKey));
     }
 
-    /// Multi-turn: assistant messages become "model_output" steps.
+    // ── Gemini request tests ──
+
     #[test]
-    fn gemini_multiturn_uses_step_objects() {
+    fn gemini_system_instruction_extracted() {
         let body = Bytes::from_static(
-            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"role":"user","content":"again"}],"stream":false}"#,
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"hi"}]}"#,
+        );
+        let adapted = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
+        assert_eq!(v["system_instruction"], "You are helpful.");
+        // System message should NOT appear in input
+        assert_eq!(v["input"].as_array().unwrap().len(), 1);
+        assert_eq!(v["input"][0]["type"], "user_input");
+    }
+
+    #[test]
+    fn gemini_multi_turn_conversation() {
+        let body = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"how are you?"}]}"#,
         );
         let adapted = adapt_request(
             UpstreamFormat::Gemini,
@@ -638,20 +733,16 @@ mod tests {
         .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
         let input = v["input"].as_array().unwrap();
-        assert_eq!(input.len(), 3);
+        // model_output steps are NOT emitted in stateless input array (v1beta)
+        assert_eq!(input.len(), 2);
         assert_eq!(input[0]["type"], "user_input");
-        assert_eq!(input[0]["content"][0]["text"], "hello");
-        assert_eq!(input[1]["type"], "model_output");
-        assert_eq!(input[1]["content"][0]["text"], "hi");
-        assert_eq!(input[2]["type"], "user_input");
-        assert_eq!(input[2]["content"][0]["text"], "again");
+        assert_eq!(input[1]["type"], "user_input");
     }
 
-    /// Gemini: image_url with data URI → inline image content.
     #[test]
     fn gemini_multimodal_image() {
         let body = Bytes::from_static(
-            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":[{"type":"text","text":"What is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBOR"}}]}],"stream":false}"#,
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc123"}}]}]}"#,
         );
         let adapted = adapt_request(
             UpstreamFormat::Gemini,
@@ -664,44 +755,17 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
         let content = v["input"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);
-        // Text part preserved
         assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "What is this?");
-        // Image part converted to Gemini inline format
+        assert_eq!(content[0]["text"], "describe");
         assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["data"], "abc123");
         assert_eq!(content[1]["mime_type"], "image/png");
-        assert_eq!(content[1]["data"], "iVBOR");
     }
 
-    /// Gemini: pure image (no text) should NOT be skipped.
-    #[test]
-    fn gemini_multimodal_image_only_not_skipped() {
-        let body = Bytes::from_static(
-            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,/9j/4AAQ"}}]}],"stream":false}"#,
-        );
-        let adapted = adapt_request(
-            UpstreamFormat::Gemini,
-            &"/v1/chat/completions".parse().unwrap(),
-            &Method::POST,
-            &body,
-            "gemini-3.5-flash",
-        )
-        .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
-        let input = v["input"].as_array().unwrap();
-        assert_eq!(input.len(), 1, "pure image message must not be skipped");
-        assert_eq!(input[0]["type"], "user_input");
-        let content = input[0]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["type"], "image");
-        assert_eq!(content[0]["mime_type"], "image/jpeg");
-    }
-
-    /// Gemini: input_audio → inline audio content.
     #[test]
     fn gemini_multimodal_audio() {
         let body = Bytes::from_static(
-            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"SUQz","format":"wav"}}]}],"stream":false}"#,
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"audiodata","format":"wav"}}]}]}"#,
         );
         let adapted = adapt_request(
             UpstreamFormat::Gemini,
@@ -713,17 +777,15 @@ mod tests {
         .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
         let content = v["input"][0]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "audio");
+        assert_eq!(content[0]["data"], "audiodata");
         assert_eq!(content[0]["mime_type"], "audio/wav");
-        assert_eq!(content[0]["data"], "SUQz");
     }
 
-    /// Gemini: file with file_data → inline document content.
     #[test]
     fn gemini_multimodal_file() {
         let body = Bytes::from_static(
-            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":[{"type":"text","text":"Summarize"},{"type":"file","file":{"file_data":"JVBERi0=","filename":"report.pdf"}}]}],"stream":false}"#,
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":[{"type":"file","file":{"file_data":"cGRmZGF0YQ==","filename":"doc.pdf"}}]}]}"#,
         );
         let adapted = adapt_request(
             UpstreamFormat::Gemini,
@@ -735,19 +797,15 @@ mod tests {
         .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
         let content = v["input"][0]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "Summarize");
-        assert_eq!(content[1]["type"], "document");
-        assert_eq!(content[1]["mime_type"], "application/pdf");
-        assert_eq!(content[1]["data"], "JVBERi0=");
+        assert_eq!(content[0]["type"], "document");
+        assert_eq!(content[0]["data"], "cGRmZGF0YQ==");
+        assert_eq!(content[0]["mime_type"], "application/pdf");
     }
 
-    /// Gemini: OpenAI tools → flat Interactions API tool objects.
     #[test]
-    fn gemini_tools_conversion() {
+    fn gemini_tools_converted_flat_format() {
         let body = Bytes::from_static(
-            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"stream":false}"#,
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}"#,
         );
         let adapted = adapt_request(
             UpstreamFormat::Gemini,
@@ -763,41 +821,83 @@ mod tests {
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["name"], "get_weather");
         assert_eq!(tools[0]["description"], "Get weather");
-        assert_eq!(tools[0]["parameters"]["required"][0], "city");
+        assert_eq!(tools[0]["parameters"]["type"], "object");
+        // Should NOT have nested function_declarations
+        assert!(v["tools"][0]["function_declarations"].is_null());
     }
 
-    /// Gemini: tool_choice auto/required/none → generation_config.tool_choice (lowercase).
+    #[test]
+    fn gemini_tools_strip_schema_and_additional_properties() {
+        let body = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"test","parameters":{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"x":{"type":"number"}},"additionalProperties":false}}}]}"#,
+        );
+        let adapted = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
+        let params = &v["tools"][0]["parameters"];
+        assert!(params.get("$schema").is_none());
+        assert!(params.get("additionalProperties").is_none());
+        assert_eq!(params["type"], "object");
+    }
+
     #[test]
     fn gemini_tool_choice_mapping() {
-        for (choice, expected_mode) in [("auto", "auto"), ("required", "any"), ("none", "none")] {
-            let body_str = format!(
-                r#"{{"model":"gemini-3.5-flash","messages":[{{"role":"user","content":"hi"}}],"tool_choice":"{}","stream":false}}"#,
-                choice
-            );
-            let adapted = adapt_request(
-                UpstreamFormat::Gemini,
-                &"/v1/chat/completions".parse().unwrap(),
-                &Method::POST,
-                &Bytes::from(body_str),
-                "gemini-3.5-flash",
-            )
-            .unwrap();
-            let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
-            assert_eq!(
-                v["generation_config"]["tool_choice"],
-                expected_mode,
-                "tool_choice={} should map to {}",
-                choice,
-                expected_mode
-            );
-        }
+        // Test "auto"
+        let body = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hi"}],"tool_choice":"auto"}"#,
+        );
+        let adapted = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
+        assert_eq!(v["generation_config"]["tool_choice"], "auto");
+
+        // Test "required" -> "any"
+        let body2 = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hi"}],"tool_choice":"required"}"#,
+        );
+        let adapted2 = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body2,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&adapted2.body).unwrap();
+        assert_eq!(v2["generation_config"]["tool_choice"], "any");
+
+        // Test "none"
+        let body3 = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hi"}],"tool_choice":"none"}"#,
+        );
+        let adapted3 = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body3,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        let v3: serde_json::Value = serde_json::from_slice(&adapted3.body).unwrap();
+        assert_eq!(v3["generation_config"]["tool_choice"], "none");
     }
 
-    /// Gemini: tool role message → function_result step.
     #[test]
-    fn gemini_tool_message_to_function_result() {
+    fn gemini_tool_message_becomes_function_result() {
         let body = Bytes::from_static(
-            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"weather?"},{"role":"tool","tool_call_id":"call_1","name":"get_weather","content":"{\"temp\":22}"}],"stream":false}"#,
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[{"id":"call_123","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},{"role":"tool","tool_call_id":"call_123","name":"get_weather","content":"{\"temp\": 22}"}]}"#,
         );
         let adapted = adapt_request(
             UpstreamFormat::Gemini,
@@ -809,23 +909,22 @@ mod tests {
         .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
         let input = v["input"].as_array().unwrap();
+        // function_call steps are NOT emitted in stateless input array
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["type"], "user_input");
         assert_eq!(input[1]["type"], "function_result");
-        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["call_id"], "call_123");
         assert_eq!(input[1]["name"], "get_weather");
-        // result should be [{type: "text", text: "..."}] per official API format
+        // result should be array of content blocks
         let result = input[1]["result"].as_array().unwrap();
-        assert_eq!(result.len(), 1);
         assert_eq!(result[0]["type"], "text");
-        assert_eq!(result[0]["text"], "{\"temp\":22}");
+        assert_eq!(result[0]["text"], "{\"temp\": 22}");
     }
 
-    /// Gemini: assistant with tool_calls → function_call steps.
     #[test]
-    fn gemini_assistant_tool_calls_to_function_call() {
+    fn gemini_assistant_tool_calls_become_function_calls() {
         let body = Bytes::from_static(
-            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"weather?"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Beijing\"}"}}]}],"stream":false}"#,
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"weather?"},{"role":"assistant","tool_calls":[{"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"London\"}"}}]}]}"#,
         );
         let adapted = adapt_request(
             UpstreamFormat::Gemini,
@@ -837,11 +936,96 @@ mod tests {
         .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
         let input = v["input"].as_array().unwrap();
+        // function_call steps are NOT emitted in stateless input array
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "user_input");
+    }
+
+    #[test]
+    fn gemini_extra_headers_and_auth() {
+        let body = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let adapted = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        // Check extra headers contain Api-Revision
+        assert_eq!(adapted.extra_headers.len(), 1);
+        assert_eq!(adapted.extra_headers[0].0.as_str(), "api-revision");
+        assert_eq!(adapted.extra_headers[0].1.to_str().unwrap(), "2026-05-20");
+        // Check auth style
+        assert!(matches!(adapted.auth_style, AuthStyle::GeminiKey));
+    }
+
+    /// Real-world MCP scenario: double-encoded function_result text,
+    /// tool with description:null, $schema, additionalProperties:false.
+    #[test]
+    fn gemini_mcp_double_encoded_function_result() {
+        // The tool result content is a JSON-stringified OpenAI content array (MCP double-encoding)
+        let body = Bytes::from_static(
+            br#"{"model":"gemini-3.1-flash-lite","messages":[{"role":"user","content":"fetch baidu"},{"role":"assistant","tool_calls":[{"id":"PHAqNGxV","type":"function","function":{"name":"mcp__fetch__fetch","arguments":"{\"url\":\"https://www.baidu.com\"}"}}]},{"role":"tool","tool_call_id":"PHAqNGxV","name":"mcp__fetch__fetch","content":"[{\"type\":\"text\",\"text\":\"Baidu homepage content here\"}]"}],"tools":[{"type":"function","function":{"name":"mcp__fetch__fetch","description":null,"parameters":{"type":"object","properties":{"url":{"type":"string"},"max_length":{"type":"number","default":5000},"raw":{"type":"boolean","default":false}},"required":["url"],"additionalProperties":false,"$schema":"http://json-schema.org/draft-07/schema#"}}}]}"#,
+        );
+        let adapted = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body,
+            "gemini-3.1-flash-lite",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
+
+        // Step verification
+        let input = v["input"].as_array().unwrap();
+        // function_call steps are NOT emitted in stateless input array
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["type"], "user_input");
-        assert_eq!(input[1]["type"], "function_call");
-        assert_eq!(input[1]["id"], "call_1");
-        assert_eq!(input[1]["name"], "get_weather");
-        assert_eq!(input[1]["arguments"]["city"], "Beijing");
+        assert_eq!(input[1]["type"], "function_result");
+        assert_eq!(input[1]["call_id"], "PHAqNGxV");
+
+        // Unwrapped text: should NOT be double-encoded JSON
+        let result = input[1]["result"].as_array().unwrap();
+        assert_eq!(result[0]["type"], "text");
+        assert_eq!(result[0]["text"], "Baidu homepage content here");
+
+        // Tools: should NOT have description:null, $schema, or additionalProperties
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "mcp__fetch__fetch");
+        assert!(tools[0].get("description").is_none(), "description:null must be stripped");
+        let params = &tools[0]["parameters"];
+        assert!(params.get("$schema").is_none(), "$schema must be stripped");
+        assert!(params.get("additionalProperties").is_none(), "additionalProperties must be stripped");
+        assert_eq!(params["properties"]["url"]["type"], "string");
+    }
+
+    /// Tool message without a name field inherits name from the function_call step.
+    #[test]
+    fn gemini_tool_result_without_name_inherits_from_function_call() {
+        let body = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[{"id":"call_x","type":"function","function":{"name":"test_fn","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_x","content":"result text"}]}"#,
+        );
+        let adapted = adapt_request(
+            UpstreamFormat::Gemini,
+            &"/v1/chat/completions".parse().unwrap(),
+            &Method::POST,
+            &body,
+            "gemini-3.5-flash",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
+        let input = v["input"].as_array().unwrap();
+        // function_call steps are NOT emitted in stateless input array
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[1]["type"], "function_result");
+        assert_eq!(input[1]["call_id"], "call_x");
+        assert_eq!(input[1]["name"], "test_fn", "name inherited from function_call");
+        assert_eq!(input[1]["result"][0]["text"], "result text");
     }
 }
