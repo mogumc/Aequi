@@ -164,9 +164,16 @@ fn openai_part_to_gemini_interaction(part: &serde_json::Value) -> Option<serde_j
         }
     }
 
-    // Binary attachments (image, audio, document)
+    // Binary attachments (image, audio, video, document)
+    // Prefer mime-based type detection (reflects actual content), fall back to part_type.
     if let Some(att) = extract_binary_attachment(part, "gemini") {
-        let block_type = if part_type == "image_url" {
+        let block_type = if att.mime.starts_with("image/") {
+            "image"
+        } else if att.mime.starts_with("audio/") {
+            "audio"
+        } else if att.mime.starts_with("video/") {
+            "video"
+        } else if part_type == "image_url" {
             "image"
         } else if part_type == "input_audio" {
             "audio"
@@ -298,17 +305,7 @@ fn content_to_gemini_interaction_content(content: &serde_json::Value) -> Vec<ser
             }
             vec![serde_json::json!({"type": "text", "text": s})]
         }
-        _ => {
-            let text = content_to_text(content);
-            if text.is_empty() {
-                return vec![];
-            }
-            if text.len() > MAX_DECODED_BYTES {
-                tracing::warn!(text_len = text.len(), "gemini: fallback text content dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
-                return vec![];
-            }
-            vec![serde_json::json!({"type": "text", "text": text})]
-        }
+        _ => vec![],
     }
 }
 
@@ -587,17 +584,27 @@ pub(super) fn adapt_request_inner_gemini(
     if let Some(tc) = v.get("tool_choice") {
         let gemini_tc = match tc {
             serde_json::Value::String(s) => match s.as_str() {
-                "auto" => Some("auto"),
-                "required" | "any" => Some("any"),
-                "none" => Some("none"),
-                _ => None,
+                "auto" => "auto",
+                "required" | "any" => "any",
+                "none" => "none",
+                invalid => {
+                    return Err(format_error(
+                        http::StatusCode::BAD_REQUEST,
+                        &format!("invalid tool_choice '{}' for gemini format", invalid),
+                        "invalid_tool_choice",
+                    ))
+                }
             },
-            serde_json::Value::Object(_) => Some("any"),
-            _ => None,
+            serde_json::Value::Object(_) => "any",
+            _ => {
+                return Err(format_error(
+                    http::StatusCode::BAD_REQUEST,
+                    "invalid tool_choice type for gemini format",
+                    "invalid_tool_choice",
+                ))
+            }
         };
-        if let Some(choice) = gemini_tc {
-            gen_config["tool_choice"] = serde_json::json!(choice);
-        }
+        gen_config["tool_choice"] = serde_json::json!(gemini_tc);
     }
 
     if let Some(n) = v
