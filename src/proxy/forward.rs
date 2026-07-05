@@ -90,6 +90,9 @@ async fn execute_attempt(
     let attempt_start = Instant::now();
 
     let model = log_ctx.model.as_deref().unwrap_or_default();
+    // Use the original client-requested model name for upstream selection during retries,
+    // so that model_map rewriting doesn't cause matching the wrong upstream.
+    let selection_model = log_ctx.original_model.as_deref().unwrap_or(model);
     let adapted = match format::adapt_request(
         upstream.format,
         original_pq,
@@ -184,8 +187,7 @@ async fn execute_attempt(
             state.on_upstream_status(sel, status, retry_after_ms);
 
             if should_retry_status(state, status) {
-                let model = log_ctx.model.as_deref().unwrap_or_default();
-                if let Some(new_sel) = try_retry_or_give_up(state, model, sel, billing_key, &status.to_string()) {
+                if let Some(new_sel) = try_retry_or_give_up(state, selection_model, sel, billing_key, &status.to_string()) {
                     drop(up_resp);
                     return AttemptResult::Retry(new_sel);
                 }
@@ -222,8 +224,7 @@ async fn execute_attempt(
                 "upstream request failed"
             );
 
-            let model = log_ctx.model.as_deref().unwrap_or_default();
-            if let Some(new_sel) = try_retry_or_give_up(state, model, sel, billing_key, "network_error") {
+            if let Some(new_sel) = try_retry_or_give_up(state, selection_model, sel, billing_key, "network_error") {
                 return AttemptResult::Retry(new_sel);
             }
 
@@ -242,8 +243,7 @@ async fn execute_attempt(
             sel.key
                 .record_latency_ms(attempt_start.elapsed().as_millis() as u64);
 
-            let model = log_ctx.model.as_deref().unwrap_or_default();
-            if let Some(new_sel) = try_retry_or_give_up(state, model, sel, billing_key, "timeout") {
+            if let Some(new_sel) = try_retry_or_give_up(state, selection_model, sel, billing_key, "timeout") {
                 return AttemptResult::Retry(new_sel);
             }
 
@@ -415,6 +415,8 @@ pub(super) async fn forward(
     let mut body_bytes = body_bytes;
     let billing_model = model.clone();
     if let Some(mapped) = sel.upstream.model_map.get(&model) {
+        // Preserve the original model name for upstream selection during retries.
+        log_ctx.original_model = Some(model.clone());
         let mapped = mapped.clone();
         if let Some(ref mut json) = req_json {
             json["model"] = serde_json::Value::String(mapped.clone());
@@ -576,7 +578,7 @@ fn next_cooldown_delay(state: &RouterState, model: &str) -> Option<std::time::Du
     let snap = state.snapshot.load_full();
     let mut next_until: Option<u64> = None;
     for upstream in snap.upstreams.iter() {
-        if !upstream.models.load().contains(model) {
+        if !upstream.models.load().contains(model) && !upstream.model_map.contains_key(model) {
             continue;
         }
         let keys = upstream.active_keys.load_full();

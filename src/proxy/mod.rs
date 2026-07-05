@@ -54,6 +54,9 @@ pub(crate) struct RequestLogContext {
     pub(crate) method: String,
     pub(crate) path: String,
     pub(crate) model: Option<String>,
+    /// The original client-requested model name, preserved before model_map rewriting.
+    /// Used for upstream selection during retries to avoid matching the wrong upstream.
+    pub(crate) original_model: Option<String>,
     pub(crate) upstream_id: Option<String>,
     pub(crate) billing_model: Option<String>,
     pub(crate) billing_key: Option<String>,
@@ -83,6 +86,7 @@ impl RequestLogContext {
             method,
             path,
             model,
+            original_model: None,
             upstream_id,
             billing_model: None,
             billing_key: None,
