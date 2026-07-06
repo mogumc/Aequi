@@ -412,11 +412,12 @@ pub(super) async fn forward(
 
     // Apply model mapping: incoming name → upstream internal name.
     // Save original name for cost calculation (map key is user-facing model).
+    // Always preserve original_model so retries can re-derive the correct model
+    // name for each upstream (each upstream has its own independent model_map).
     let mut body_bytes = body_bytes;
     let billing_model = model.clone();
+    log_ctx.original_model = Some(model.clone());
     if let Some(mapped) = sel.upstream.model_map.get(&model) {
-        // Preserve the original model name for upstream selection during retries.
-        log_ctx.original_model = Some(model.clone());
         let mapped = mapped.clone();
         if let Some(ref mut json) = req_json {
             json["model"] = serde_json::Value::String(mapped.clone());
@@ -505,6 +506,26 @@ pub(super) async fn forward(
                         "max retries exceeded",
                         "max_retries",
                     );
+                }
+                // Re-apply model_map for the new upstream on retry.
+                // Each upstream's model_map is independent; the mapped model name
+                // must not leak from a previous upstream to the next.
+                if let Some(original) = &log_ctx_c.original_model {
+                    let new_mapped = new_sel.upstream.model_map.get(original).cloned();
+                    let new_model = new_mapped.as_deref().unwrap_or(original.as_str());
+                    let current_model = log_ctx_c.model.as_deref().unwrap_or("");
+                    if new_model != current_model {
+                        if let Ok(mut json) =
+                            serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                        {
+                            json["model"] =
+                                serde_json::Value::String(new_model.to_string());
+                            if let Ok(new_bytes) = serde_json::to_vec(&json) {
+                                body_bytes = bytes::Bytes::from(new_bytes);
+                            }
+                        }
+                        log_ctx_c.model = Some(new_model.to_string());
+                    }
                 }
                 sel = new_sel;
                 continue;
