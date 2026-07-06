@@ -149,7 +149,12 @@ impl RequestsLog {
 
     pub fn recent(&self, limit: usize) -> Vec<RequestLogEntry> {
         let Ok(entries) = self.entries.lock() else { return vec![] };
-        entries.iter().rev().take(limit).cloned().collect()
+        let mut items: Vec<RequestLogEntry> = entries.iter().cloned().collect();
+        // Sort by timestamp descending — id is opaque and resets across
+        // restarts, so real time is the only reliable recency signal.
+        items.sort_unstable_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+        items.truncate(limit);
+        items
     }
 
     pub fn metrics_snapshot(&self, window: MetricsWindow) -> Vec<MetricsBucket> {

@@ -332,8 +332,18 @@ impl RouterState {
                 }
             }
 
+            // Ignore insertion order from files — sort by timestamp so
+            // the deque is truly chronological. id is not monotonic
+            // across restarts (process-static counter resets to 1), so
+            // it cannot serve as a recency signal.
+            all_entries.sort_unstable_by_key(|e| e.ts_ms);
             let loaded = all_entries.len().min(5000);
-            requests.load_history(all_entries.into_iter().rev().take(5000).rev());
+            // Keep the most recent 5000 in chronological order; push_entry
+            // appends to the back, so recent() naturally returns the latest.
+            if all_entries.len() > 5000 {
+                all_entries = all_entries.split_off(all_entries.len() - 5000);
+            }
+            requests.load_history(all_entries);
             tracing::info!(dir = %requests_log_dir.display(), loaded, "loaded historical request logs");
         }
 
