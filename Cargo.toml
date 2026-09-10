@@ -1,0 +1,68 @@
+[package]
+name = "aequi"
+version = "0.5.0-dev"
+edition = "2021"
+rust-version = "1.75"
+description = "OpenAI-format API transparent proxy: multi-upstream multi-key load balancing, failover, billing, admin"
+license = "MIT"
+
+[dependencies]
+# -- async runtime & HTTP (D3: axum + tower + hyper 1.x, 供 P4 网关使用) --
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util", "fs"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+http-body-util = "0.1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "set-header", "util"] }
+
+# -- storage (D2: SQLite, sqlx 显式 SQL) --
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+
+# -- serialization --
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.9"
+
+# -- identity & crypto --
+uuid = { version = "1", features = ["v7", "serde"] }
+blake3 = "1"
+
+# -- observability --
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# -- misc --
+arc-swap = "1"
+smallvec = { version = "1", features = ["const_generics"] }
+rand = "0.9"
+parking_lot = "0.12"
+bytes = "1"
+flate2 = "1"
+percent-encoding = "2"
+thiserror = "2"
+base64 = "0.22"
+
+# optional: embed 前端产物（D1，构建期注入 src/static/dist）
+rust-embed = { version = "8", optional = true }
+
+[features]
+default = ["embed"]
+embed = ["dep:rust-embed"]
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# 未实现模块暂 allow，P3/P4 落地后移除
+new_without_default = "allow"
+too_many_arguments = "allow"
