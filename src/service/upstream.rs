@@ -19,7 +19,7 @@ use crate::model::{
     UpstreamKeyCreate, UpstreamKeyView,
 };
 use crate::proxy;
-use crate::proxy::adapter::{adapter_for, ProbeOutcome};
+use crate::proxy::adapter::{ProbeOutcome, adapter_for};
 use crate::utils::{random, time};
 
 /// 连续失败达到该次数后自动停用密钥。
@@ -49,7 +49,10 @@ impl UpstreamState {
     /// 权重大的被选得频繁，但不会连续压同一个；同分时按传入顺序取先者，
     /// 这就是「权重 + 顺序」的全部含义。
     pub fn pick(&self, candidates: &[(String, u32)]) -> Option<String> {
-        let total: i64 = candidates.iter().map(|(_, weight)| i64::from(*weight)).sum();
+        let total: i64 = candidates
+            .iter()
+            .map(|(_, weight)| i64::from(*weight))
+            .sum();
         if total == 0 {
             return None;
         }
@@ -146,8 +149,7 @@ fn validate_block_id(id: &str) -> Result<()> {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'));
     if !ok {
         return Err(Error::BadRequest(
-            "块的 id 只能用小写字母、数字、点、下划线或连字符——它会作为模型名前缀使用"
-                .to_string(),
+            "块的 id 只能用小写字母、数字、点、下划线或连字符——它会作为模型名前缀使用".to_string(),
         ));
     }
 
@@ -446,7 +448,10 @@ pub async fn add_keys(
     }
 
     if entries.is_empty() {
-        return Ok(AddKeysOutcome { keys: Vec::new(), skipped });
+        return Ok(AddKeysOutcome {
+            keys: Vec::new(),
+            skipped,
+        });
     }
 
     let mut tx = pool.begin().await?;
@@ -461,7 +466,10 @@ pub async fn add_keys(
         views.push(view_key(&key));
     }
 
-    Ok(AddKeysOutcome { keys: views, skipped })
+    Ok(AddKeysOutcome {
+        keys: views,
+        skipped,
+    })
 }
 
 /// 删除一批密钥。
@@ -477,27 +485,17 @@ pub async fn delete_keys(
 }
 
 /// 暂停一批密钥（手动）。
-pub async fn pause_keys(
-    pool: &SqlitePool,
-    block_id: &str,
-    ids: &[String],
-) -> Result<()> {
+pub async fn pause_keys(pool: &SqlitePool, block_id: &str, ids: &[String]) -> Result<()> {
     for id in ids {
-        db::block::set_key_status(pool, block_id, id, KeyStatus::Paused, time::now_secs())
-            .await?;
+        db::block::set_key_status(pool, block_id, id, KeyStatus::Paused, time::now_secs()).await?;
     }
     Ok(())
 }
 
 /// 恢复一批密钥：清掉停用与失败计数，重新参与调度。
-pub async fn resume_keys(
-    pool: &SqlitePool,
-    block_id: &str,
-    ids: &[String],
-) -> Result<()> {
+pub async fn resume_keys(pool: &SqlitePool, block_id: &str, ids: &[String]) -> Result<()> {
     for id in ids {
-        db::block::set_key_status(pool, block_id, id, KeyStatus::Active, time::now_secs())
-            .await?;
+        db::block::set_key_status(pool, block_id, id, KeyStatus::Active, time::now_secs()).await?;
     }
     Ok(())
 }
@@ -630,11 +628,7 @@ pub async fn resolve_with_header(
 /// 时，这里不会把 b 也算进来，短名请求自然也不会被轮询到 b。
 ///
 /// 白名单为空表示不限制，返回全部可用的块。
-pub async fn allowed_blocks(
-    pool: &SqlitePool,
-    model: &str,
-    key: &ApiKey,
-) -> Result<Vec<String>> {
+pub async fn allowed_blocks(pool: &SqlitePool, model: &str, key: &ApiKey) -> Result<Vec<String>> {
     let blocks = db::block::list_blocks(pool).await?;
 
     Ok(blocks
@@ -671,9 +665,9 @@ pub async fn select_block(
 
     if candidates.is_empty() {
         return Err(match only {
-            Some(id) if !allowed.iter().any(|item| item == id) => Error::Forbidden(format!(
-                "该密钥无权使用模型 {model}（块 {id}）"
-            )),
+            Some(id) if !allowed.iter().any(|item| item == id) => {
+                Error::Forbidden(format!("该密钥无权使用模型 {model}（块 {id}）"))
+            }
             Some(id) => Error::NotFound(format!("块 {id} 不提供模型 {model}")),
             None => Error::NotFound(format!("没有可处理模型 {model} 的上游")),
         });

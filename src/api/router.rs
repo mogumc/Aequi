@@ -23,10 +23,11 @@ use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::response::Redirect;
 use axum::routing::{delete, get, post};
-use axum::{middleware, Json, Router};
+use axum::{Json, Router, middleware};
 use serde::Serialize;
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::AppState;
 use crate::api::{
     auth, blocks, device, key_auth, key_portal, keys, logs, middleware as auth_middleware, otp,
     proxy_api, settings, stats,
@@ -35,7 +36,6 @@ use crate::db;
 use crate::error::Result;
 use crate::service::provider::ProviderInfo;
 use crate::web;
-use crate::AppState;
 
 /// 构建完整路由。
 pub fn router(state: Arc<AppState>) -> Router {
@@ -65,9 +65,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/blocks", get(blocks::list).post(blocks::create))
         .route(
             "/blocks/{id}",
-            get(blocks::detail).patch(blocks::update).delete(blocks::delete),
+            get(blocks::detail)
+                .patch(blocks::update)
+                .delete(blocks::delete),
         )
-        .route("/blocks/{id}/keys", get(blocks::list_keys).post(blocks::add_keys))
+        .route(
+            "/blocks/{id}/keys",
+            get(blocks::list_keys).post(blocks::add_keys),
+        )
         .route("/blocks/{id}/keys/remove", post(blocks::remove_keys))
         .route("/blocks/{id}/keys/pause", post(blocks::pause_keys))
         .route("/blocks/{id}/keys/resume", post(blocks::resume_keys))
@@ -94,10 +99,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let gateway = Router::new()
         .route("/models", get(proxy_api::list_models))
         .route("/chat/completions", post(proxy_api::chat_completions))
-        .route(
-            "/images/generations",
-            post(proxy_api::images_generations),
-        )
+        .route("/images/generations", post(proxy_api::images_generations))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             key_auth::require_key,

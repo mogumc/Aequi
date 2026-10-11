@@ -14,7 +14,7 @@ mod settings;
 
 pub use bootstrap::Bootstrap;
 pub use settings::{
-    Settings, SettingsPatch, KEY_CORS_ORIGINS, KEY_LISTEN, KEY_TOKEN_TTL_HOURS, KEY_TRUST_PROXY,
+    KEY_CORS_ORIGINS, KEY_LISTEN, KEY_TOKEN_TTL_HOURS, KEY_TRUST_PROXY, Settings, SettingsPatch,
 };
 
 /// 覆盖数据库文件路径的环境变量。
@@ -32,9 +32,5 @@ pub const DEFAULT_DATABASE_FILE: &str = "aequi.db";
 pub fn non_empty_env(key: &str) -> Option<String> {
     let value = std::env::var(key).ok()?;
     let value = value.trim().to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }

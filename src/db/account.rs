@@ -143,12 +143,14 @@ pub async fn set_totp(
     secret: Option<&str>,
     now: i64,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE accounts SET totp_enabled = ?, totp_secret = ?, updated_at = ? WHERE id = ?")
-        .bind(i64::from(enabled))
-        .bind(secret)
-        .bind(now)
-        .bind(id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE accounts SET totp_enabled = ?, totp_secret = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(i64::from(enabled))
+    .bind(secret)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
     Ok(())
 }

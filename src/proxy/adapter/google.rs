@@ -10,7 +10,7 @@
 //! 都不能出现在输入里，所以多轮工具对话要把「assistant 的调用」折叠掉、
 //! 把「工具结果」伪装成一段 `user_input` 文本补回去。
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::error::{Error, Result};
 use crate::model::ApiFormat;
@@ -65,19 +65,45 @@ impl Adapter for GoogleAdapter {
 
         let mut events = Vec::new();
 
-        match value.get("event_type").and_then(Value::as_str).unwrap_or("") {
-            // function_call 的开始：先发出调用身份（id 与名字），
-            // 参数随后以 arguments_delta 分片到达。
+        match value
+            .get("event_type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+        {
+            // function_call 的开始。身份字段可能在 step 顶层，也可能收在
+            // step.function_call 子对象里——官方示例两种形状都出现过，都处理。
+            // 参数可能随 start 一次性到达（对象），也可能随后分片。
             "step.start" => {
                 if let Some(step) = value.get("step") {
-                    if step.get("type").and_then(Value::as_str) == Some("function_call") {
+                    let is_call = step.get("type").and_then(Value::as_str) == Some("function_call");
+                    let call = step
+                        .get("function_call")
+                        .filter(|_| !is_call)
+                        .unwrap_or(step);
+                    if is_call || call.get("name").is_some() {
+                        let id = call
+                            .get("id")
+                            .or_else(|| step.get("id"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        let name = call
+                            .get("name")
+                            .or_else(|| step.get("name"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        let fragment = match call.get("arguments").or_else(|| step.get("arguments"))
+                        {
+                            Some(Value::String(text)) => text.clone(),
+                            Some(other) => serde_json::to_string(other).unwrap_or_default(),
+                            None => String::new(),
+                        };
                         events.push(StreamEvent::Delta {
                             text: String::new(),
                             tool_calls: vec![ToolCallDelta {
                                 index: 0,
-                                id: step.get("id").and_then(Value::as_str).map(str::to_string),
-                                name: step.get("name").and_then(Value::as_str).map(str::to_string),
-                                arguments_fragment: Some(String::new()),
+                                id,
+                                name,
+                                arguments_fragment: Some(fragment),
                             }],
                         });
                     }
@@ -85,45 +111,86 @@ impl Adapter for GoogleAdapter {
             }
             "step.delta" => {
                 if let Some(delta) = value.get("delta") {
-                    match delta.get("type").and_then(Value::as_str).unwrap_or("") {
-                        "text" => {
-                            let text = delta.get("text").and_then(Value::as_str).unwrap_or("");
-                            if !text.is_empty() {
-                                events.push(StreamEvent::Delta {
-                                    text: text.to_string(),
-                                    tool_calls: vec![],
-                                });
-                            }
+                    let delta_type = delta.get("type").and_then(Value::as_str).unwrap_or("");
+                    // 文本：直接在 delta.text，或嵌在 delta.content.text（thought 摘要的形状）。
+                    if delta_type == "text" || delta_type == "thought_summary" {
+                        let text = delta
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .or_else(|| delta.pointer("/content/text").and_then(Value::as_str))
+                            .unwrap_or("");
+                        if !text.is_empty() && delta_type == "text" {
+                            events.push(StreamEvent::Delta {
+                                text: text.to_string(),
+                                tool_calls: vec![],
+                            });
                         }
-                        "arguments_delta" => {
-                            let args = delta.get("arguments").and_then(Value::as_str).unwrap_or("");
+                        return Ok(events);
+                    }
+                    // 工具调用参数：官方形状多变——arguments_delta 的字符串分片、
+                    // 一次性对象、或收在 content 子对象里。字符串按分片转发，
+                    // 对象整体序列化后一次性转发。
+                    let arguments = delta
+                        .get("arguments")
+                        .or_else(|| delta.pointer("/content/arguments"));
+                    if delta_type.contains("argument") || delta_type == "function_call" {
+                        if let Some(arguments) = arguments {
+                            let fragment = match arguments {
+                                Value::String(text) => text.clone(),
+                                other => serde_json::to_string(other).unwrap_or_default(),
+                            };
                             events.push(StreamEvent::Delta {
                                 text: String::new(),
                                 tool_calls: vec![ToolCallDelta {
                                     index: 0,
                                     id: None,
                                     name: None,
-                                    arguments_fragment: Some(args.to_string()),
+                                    arguments_fragment: Some(fragment),
                                 }],
                             });
                         }
-                        // thought / image 等增量与对话输出无关，跳过。
-                        _ => {}
                     }
                 }
             }
             "step.stop" => {}
             "interaction.completed" => {
                 let interaction = value.get("interaction");
-                let has_calls = interaction
+                let steps = interaction
                     .and_then(|i| i.get("steps"))
-                    .and_then(Value::as_array)
-                    .map(|steps| {
-                        steps
-                            .iter()
-                            .any(|s| s.get("type").and_then(Value::as_str) == Some("function_call"))
+                    .and_then(Value::as_array);
+
+                // 从最终 steps 提取工具调用的权威全集，交给编排层兜底补发——
+                // 分片增量可能因形状差异未被识别，收尾快照是唯一可靠来源。
+                let snapshot: Vec<ToolCall> = steps
+                    .into_iter()
+                    .flatten()
+                    .filter(|step| {
+                        step.get("type").and_then(Value::as_str) == Some("function_call")
                     })
-                    .unwrap_or(false);
+                    .map(|step| ToolCall {
+                        id: step
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        name: step
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        arguments: serde_json::to_string(
+                            &step.get("arguments").cloned().unwrap_or(json!({})),
+                        )
+                        .unwrap_or_default(),
+                    })
+                    .collect();
+                let has_calls = !snapshot.is_empty();
+                if has_calls {
+                    events.push(StreamEvent::Snapshot {
+                        tool_calls: snapshot,
+                    });
+                }
+
                 let status = interaction
                     .and_then(|i| i.get("status"))
                     .and_then(Value::as_str)
@@ -160,7 +227,7 @@ impl Adapter for GoogleAdapter {
                     (output + thought) as i64,
                 )));
             }
-            // interaction.created 与其它未知事件不含对话内容。
+            // interaction.created / status_update 与其它未知事件不含对话内容。
             _ => {}
         }
 
@@ -204,8 +271,16 @@ impl Adapter for GoogleAdapter {
                 }
                 "function_call" => {
                     tool_calls.push(ToolCall {
-                        id: step.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
-                        name: step.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                        id: step
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        name: step
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
                         arguments: serde_json::to_string(
                             &step.get("arguments").cloned().unwrap_or(json!({})),
                         )
@@ -324,14 +399,11 @@ fn build_body(request: &ChatRequest, model: &str, stream: bool) -> Value {
                     .name
                     .clone()
                     .or_else(|| {
-                        message
-                            .tool_call_id
-                            .as_ref()
-                            .map(|id| {
-                                // 名字缺失时用调用 id 占位：call_id 才是官方的
-                                // 关联键，占位只影响可读性不影响配对。
-                                format!("call_{id}")
-                            })
+                        message.tool_call_id.as_ref().map(|id| {
+                            // 名字缺失时用调用 id 占位：call_id 才是官方的
+                            // 关联键，占位只影响可读性不影响配对。
+                            format!("call_{id}")
+                        })
                     })
                     .unwrap_or_default();
                 // MCP 客户端常把结果双重编码成 JSON 字符串，先解开一层。
@@ -579,7 +651,10 @@ mod tests {
         assert_eq!(input[2]["result"][0]["text"], "晴，25 度");
         // 系统级字段
         assert_eq!(body["store"], false);
-        assert!(body.get("stream").is_none(), "非流式 body 不该有 stream 字段");
+        assert!(
+            body.get("stream").is_none(),
+            "非流式 body 不该有 stream 字段"
+        );
     }
 
     #[test]
@@ -604,7 +679,10 @@ mod tests {
         assert_eq!(tool["name"], "get_weather");
         assert!(tool["parameters"].get("additionalProperties").is_none());
         assert!(tool["parameters"].get("$schema").is_none());
-        assert!(tool["parameters"]["properties"]["city"].is_object(), "合法字段要保留");
+        assert!(
+            tool["parameters"]["properties"]["city"].is_object(),
+            "合法字段要保留"
+        );
     }
 
     #[test]
@@ -613,7 +691,9 @@ mod tests {
 
         // 文本增量
         let events = adapter
-            .parse_stream_event(r#"{"event_type":"step.delta","delta":{"type":"text","text":"你好"}}"#)
+            .parse_stream_event(
+                r#"{"event_type":"step.delta","delta":{"type":"text","text":"你好"}}"#,
+            )
             .unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], StreamEvent::Delta { text, .. } if text == "你好"));
@@ -636,19 +716,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(events.len(), 2);
-        assert!(matches!(&events[0], StreamEvent::Finish { finish_reason: FinishReason::Stop }));
+        assert!(matches!(
+            &events[0],
+            StreamEvent::Finish {
+                finish_reason: FinishReason::Stop
+            }
+        ));
         assert!(
             matches!(&events[1], StreamEvent::Usage(u) if u.prompt_tokens == 10 && u.completion_tokens == 12),
             "thought tokens 要并入 completion 参与计费"
         );
 
-        // function_call 存在时结束原因是 tool_calls
+        // function_call 存在时：先补发权威快照，再给 ToolCalls 结束原因
         let events = adapter
             .parse_stream_event(
-                r#"{"event_type":"interaction.completed","interaction":{"status":"completed","steps":[{"type":"function_call","id":"c1","name":"f","arguments":{}}]}}"#,
+                r#"{"event_type":"interaction.completed","interaction":{"status":"completed","steps":[{"type":"function_call","id":"c1","name":"f","arguments":{"city":"北京"}}]}}"#,
             )
             .unwrap();
-        assert!(matches!(&events[0], StreamEvent::Finish { finish_reason: FinishReason::ToolCalls }));
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[0],
+            StreamEvent::Snapshot { tool_calls } if tool_calls.len() == 1 && tool_calls[0].name == "f"
+        ));
+        assert!(matches!(
+            &events[1],
+            StreamEvent::Finish {
+                finish_reason: FinishReason::ToolCalls
+            }
+        ));
 
         // 非正常状态 → content_filter
         let events = adapter
@@ -656,7 +751,12 @@ mod tests {
                 r#"{"event_type":"interaction.completed","interaction":{"status":"blocked","steps":[]}}"#,
             )
             .unwrap();
-        assert!(matches!(&events[0], StreamEvent::Finish { finish_reason: FinishReason::ContentFilter }));
+        assert!(matches!(
+            &events[0],
+            StreamEvent::Finish {
+                finish_reason: FinishReason::ContentFilter
+            }
+        ));
     }
 
     #[test]
@@ -679,7 +779,10 @@ mod tests {
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].name, "get_weather");
         assert_eq!(response.usage.prompt_tokens, 8);
-        assert_eq!(response.usage.completion_tokens, 4, "thought 并入 completion");
+        assert_eq!(
+            response.usage.completion_tokens, 4,
+            "thought 并入 completion"
+        );
     }
 
     #[test]

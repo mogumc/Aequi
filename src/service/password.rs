@@ -3,8 +3,8 @@
 //! Argon2 是计算密集型的，直接放进异步上下文会占住 worker 线程，
 //! 因此对外只提供 `spawn_blocking` 包装后的异步版本。
 
-use argon2::password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier};
 use argon2::Argon2;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 
 use crate::error::{Error, Result};
 

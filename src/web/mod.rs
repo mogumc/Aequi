@@ -15,11 +15,11 @@
 //! （例如 `/web/login`）由前端路由解析——服务端找不到对应文件时回落到
 //! `index.html`，而不是返回 404。
 
+use axum::Router;
 use axum::extract::Path;
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 use rust_embed::RustEmbed;
 
 /// 面板的挂载前缀。

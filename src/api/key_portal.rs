@@ -5,15 +5,15 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Extension, Query, State};
 use axum::Json;
+use axum::extract::{Extension, Query, State};
 
+use crate::AppState;
 use crate::api::key_auth::KeyContext;
 use crate::api::{UsageListResponse, UsageQuery};
 use crate::error::Result;
 use crate::model::KeySelfView;
 use crate::service::keys;
-use crate::AppState;
 
 /// `GET /api/key/me`
 pub async fn me(Extension(context): Extension<KeyContext>) -> Json<KeySelfView> {

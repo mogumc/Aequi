@@ -4,14 +4,14 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use serde::Serialize;
 
+use crate::AppState;
 use crate::config::{Settings, SettingsPatch};
 use crate::error::Result;
 use crate::service::settings as settings_service;
-use crate::AppState;
 
 /// 设置响应。设置项平铺，另附是否需要重启。
 #[derive(Debug, Serialize)]

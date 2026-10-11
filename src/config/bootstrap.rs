@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{non_empty_env, DATA_DATABASE_PATH_ENV, DATABASE_PATH_ENV, DEFAULT_DATABASE_FILE};
+use super::{DATA_DATABASE_PATH_ENV, DATABASE_PATH_ENV, DEFAULT_DATABASE_FILE, non_empty_env};
 
 /// 启动引导参数。
 #[derive(Debug, Clone)]

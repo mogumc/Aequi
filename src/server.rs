@@ -6,8 +6,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use tokio::net::TcpListener;
 
-use crate::api;
 use crate::AppState;
+use crate::api;
 
 /// 启动 HTTP 服务，直到收到退出信号。
 ///

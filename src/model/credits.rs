@@ -120,7 +120,10 @@ mod tests {
 
     #[test]
     fn one_credit_equals_ten_thousand_tokens() {
-        assert_eq!(cost_scaled(TOKENS_PER_CREDIT, DEFAULT_MULTIPLIER_BP), CREDIT_SCALE);
+        assert_eq!(
+            cost_scaled(TOKENS_PER_CREDIT, DEFAULT_MULTIPLIER_BP),
+            CREDIT_SCALE
+        );
         assert_eq!(format_credits(cost_scaled(10_000, 10_000)), "1.0000");
     }
 

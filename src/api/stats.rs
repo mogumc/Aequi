@@ -2,14 +2,14 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
 use axum::Json;
+use axum::extract::{Query, State};
 use serde::Deserialize;
 
+use crate::AppState;
 use crate::error::Result;
 use crate::model::StatsView;
 use crate::service::stats;
-use crate::AppState;
 
 /// 统计查询参数。
 #[derive(Debug, Deserialize)]

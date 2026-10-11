@@ -3,7 +3,7 @@
 //! 对外承诺的协议只有一种：进来看 OpenAI，出去也吐 OpenAI。
 //! 上游用哪家格式是内部实现细节，用户不需要知道。
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::error::{Error, Result};
 

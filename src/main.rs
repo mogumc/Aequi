@@ -11,9 +11,9 @@
 use std::sync::Arc;
 
 use aequi::cli::{self, Command};
-use aequi::config::{Bootstrap, ADMIN_PASSWORD_ENV};
+use aequi::config::{ADMIN_PASSWORD_ENV, Bootstrap};
 use aequi::service::auth::InitialCredentials;
-use aequi::{db, server, service, utils, AppState};
+use aequi::{AppState, db, server, service, utils};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

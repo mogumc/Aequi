@@ -137,7 +137,11 @@ pub fn adapter_for(format: ApiFormat) -> &'static dyn Adapter {
 ///
 /// 各家对空数组、空字符串、null 的容忍度不一样，一律不送最省事——
 /// 「按需插入」比「送过去再被拒」便宜得多。
-pub(crate) fn insert_if_present(body: &mut serde_json::Map<String, Value>, key: &str, value: Value) {
+pub(crate) fn insert_if_present(
+    body: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Value,
+) {
     if is_empty(&value) {
         return;
     }
@@ -172,8 +176,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    use crate::service::upstream::UpstreamState;
     use crate::proxy::scheme::{ChatRequest, ContentPart, FinishReason, Message, Role};
+    use crate::service::upstream::UpstreamState;
 
     /// 一个带 system、user、可选参数的标准请求。
     fn sample_request() -> ChatRequest {
@@ -225,7 +229,10 @@ mod tests {
     fn openai_single_text_content_stays_a_string() {
         let outgoing = adapter_for(ApiFormat::Openai).build_chat(&sample_request(), "gpt");
         let content = &outgoing.body.as_ref().unwrap()["messages"][1]["content"];
-        assert!(content.is_string(), "纯文本消息应为字符串形式以获得最好兼容性");
+        assert!(
+            content.is_string(),
+            "纯文本消息应为字符串形式以获得最好兼容性"
+        );
     }
 
     #[test]

@@ -3,12 +3,12 @@
 //! 用户端的出入口也是这个格式，但方向相反：入口把 OpenAI 请求解析成标准模型，
 //! 出口把标准响应封装回 OpenAI 结构（那部分在 [`crate::proxy::openai_in`]）。
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::error::{Error, Result};
 use crate::model::ApiFormat;
 
-use super::{insert_if_present, Adapter, AuthStyle, ProbeOutcome, UpstreamRequest};
+use super::{Adapter, AuthStyle, ProbeOutcome, UpstreamRequest, insert_if_present};
 use crate::proxy::scheme::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Role, StreamEvent, ToolCall,
     ToolCallDelta, ToolDefinition, Usage,
@@ -82,12 +82,15 @@ impl Adapter for OpenAiAdapter {
             return Ok(vec![StreamEvent::End]);
         }
 
-        let value: Value = serde_json::from_str(payload).map_err(|error| {
-            Error::UpstreamUnavailable(format!("上游流载荷解析失败: {error}"))
-        })?;
+        let value: Value = serde_json::from_str(payload)
+            .map_err(|error| Error::UpstreamUnavailable(format!("上游流载荷解析失败: {error}")))?;
 
         // 只含 usage 的收尾 chunk（include_usage 模式）。
-        if value.get("choices").and_then(Value::as_array).is_none_or(|c| c.is_empty()) {
+        if value
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_none_or(|c| c.is_empty())
+        {
             let usage = parse_usage(value.get("usage"));
             if usage.total_tokens > 0 {
                 return Ok(vec![StreamEvent::Usage(usage)]);
@@ -112,12 +115,12 @@ impl Adapter for OpenAiAdapter {
                     .filter_map(|call| {
                         let function = call.get("function")?;
                         Some(ToolCallDelta {
-                            index: call
-                                .get("index")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0) as usize,
+                            index: call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize,
                             id: call.get("id").and_then(Value::as_str).map(str::to_string),
-                            name: function.get("name").and_then(Value::as_str).map(str::to_string),
+                            name: function
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
                             arguments_fragment: function
                                 .get("arguments")
                                 .and_then(Value::as_str)

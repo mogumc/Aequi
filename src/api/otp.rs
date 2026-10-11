@@ -2,15 +2,15 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Extension, State};
 use axum::Json;
+use axum::extract::{Extension, State};
 use serde::Deserialize;
 
-use crate::api::middleware::AuthContext;
+use crate::AppState;
 use crate::api::MessageResponse;
+use crate::api::middleware::AuthContext;
 use crate::error::Result;
 use crate::service::otp::{self, OtpSetup, OtpStatus};
-use crate::AppState;
 
 /// 需要验证码的请求体。
 #[derive(Debug, Deserialize)]

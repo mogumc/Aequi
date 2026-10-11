@@ -10,11 +10,11 @@ use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
 
+use crate::AppState;
 use crate::api::middleware::bearer_token;
 use crate::error::{Error, Result};
 use crate::model::ApiKey;
 use crate::service::keys;
-use crate::AppState;
 
 /// 一次密钥请求的上下文。
 #[derive(Debug, Clone)]

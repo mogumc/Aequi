@@ -5,15 +5,15 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
 use axum::Json;
+use axum::extract::{Query, State};
 use serde::{Deserialize, Serialize};
 
+use crate::AppState;
 use crate::db;
 use crate::db::proxy_log::LogFilter;
 use crate::error::Result;
 use crate::model::ProxyLogView;
-use crate::AppState;
 
 /// 日志查询参数。除 `limit` 外都可省略，省略即该维度不筛选。
 #[derive(Debug, Default, Deserialize)]

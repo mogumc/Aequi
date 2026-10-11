@@ -6,20 +6,20 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Extension, State};
-use axum::http::{header, HeaderMap};
+use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::Value;
 
+use crate::AppState;
 use crate::api::key_auth::KeyContext;
 use crate::api::middleware::resolve_client_ip;
 use crate::error::Result;
 use crate::proxy;
 use crate::service::upstream;
 use crate::utils::time;
-use crate::AppState;
 
 /// `GET /v1/models`
 ///
@@ -46,9 +46,7 @@ pub async fn list_models(
         })
         .collect();
 
-    Ok(Json(
-        serde_json::json!({ "object": "list", "data": data }),
-    ))
+    Ok(Json(serde_json::json!({ "object": "list", "data": data })))
 }
 
 /// 请求头里指定的块（`X-Aequi-Block`）。空值当作没给。

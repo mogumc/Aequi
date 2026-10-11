@@ -5,7 +5,7 @@ use sqlx::SqlitePool;
 use crate::db;
 use crate::db::usage::NewUsage;
 use crate::error::{Error, Result};
-use crate::model::{credits, ApiKey};
+use crate::model::{ApiKey, credits};
 use crate::proxy::scheme::Usage;
 use crate::utils::time;
 

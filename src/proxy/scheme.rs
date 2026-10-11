@@ -21,9 +21,13 @@ pub enum Role {
 /// 内容用「块的列表」而不是一个字符串，多模态才有位置可放。
 #[derive(Debug, Clone)]
 pub enum ContentPart {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     /// 图片。`url` 可以是 http(s) 地址，也可以是 `data:` 形式的 base64。
-    Image { url: String },
+    Image {
+        url: String,
+    },
 }
 
 impl ContentPart {
@@ -205,9 +209,13 @@ pub enum StreamEvent {
         tool_calls: Vec<ToolCallDelta>,
     },
     /// 内容结束，结束原因就位。
-    Finish {
-        finish_reason: FinishReason,
-    },
+    Finish { finish_reason: FinishReason },
+    /// 工具调用的权威全集（来自上游的收尾事件，如 Interactions 的
+    /// interaction.completed）。
+    ///
+    /// 分片增量可能因上游实现差异而未被识别；编排层只在**之前没有收到过
+    /// 任何分片**时才使用这个全集补发，因此不会与增量重复。
+    Snapshot { tool_calls: Vec<ToolCall> },
     /// 用量上报（通常在流末尾出现一次）。
     Usage(Usage),
     /// 上游声明流结束（OpenAI 的 `data: [DONE]`；其它家流自然结束时不发）。

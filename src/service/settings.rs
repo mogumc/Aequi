@@ -63,7 +63,9 @@ pub async fn update(
     }
     if let Some(days) = patch.log_retention_days {
         if !(1..=365).contains(&days) {
-            return Err(Error::BadRequest("日志保留天数必须在 1 到 365 之间".to_string()));
+            return Err(Error::BadRequest(
+                "日志保留天数必须在 1 到 365 之间".to_string(),
+            ));
         }
         next.log_retention_days = days;
     }

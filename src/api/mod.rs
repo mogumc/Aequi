@@ -10,9 +10,9 @@ pub mod logs;
 pub mod middleware;
 pub mod otp;
 pub mod proxy_api;
+mod router;
 pub mod settings;
 pub mod stats;
-mod router;
 
 use serde::{Deserialize, Serialize};
 

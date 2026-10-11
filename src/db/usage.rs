@@ -166,7 +166,10 @@ pub async fn list_by_key(
 
 /// 汇总某密钥的累计用量。
 pub async fn summary(pool: &SqlitePool, key_id: &str) -> Result<UsageSummary, sqlx::Error> {
-    let row = sqlx::query(SQL_SUMMARY).bind(key_id).fetch_one(pool).await?;
+    let row = sqlx::query(SQL_SUMMARY)
+        .bind(key_id)
+        .fetch_one(pool)
+        .await?;
 
     Ok(crate::model::UsageSummary::from_scaled(
         row.get("requests"),

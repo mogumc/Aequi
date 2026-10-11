@@ -165,7 +165,10 @@ impl UpstreamKey {
     /// 暂停与停用都不参与调度；处于退避期内的同样跳过。
     pub fn is_selectable(&self, now: i64) -> bool {
         self.status == KeyStatus::Active
-            && self.cooldown_until.map(|until| until <= now).unwrap_or(true)
+            && self
+                .cooldown_until
+                .map(|until| until <= now)
+                .unwrap_or(true)
     }
 }
 

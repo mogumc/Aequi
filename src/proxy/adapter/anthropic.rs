@@ -3,14 +3,14 @@
 //! 与 OpenAI 的结构差异集中在三处：system 不在 messages 里而要单独提取；
 //! 工具结果要包成 user 消息里的 `tool_result` 块；`max_tokens` 是必填的。
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::error::{Error, Result};
 use crate::model::ApiFormat;
 
 use super::openai::text_at;
 use super::{
-    insert_if_present, parse_arguments, Adapter, AuthStyle, ProbeOutcome, UpstreamRequest,
+    Adapter, AuthStyle, ProbeOutcome, UpstreamRequest, insert_if_present, parse_arguments,
 };
 use crate::proxy::scheme::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Role, StreamEvent, ToolCall,
@@ -101,9 +101,8 @@ impl Adapter for AnthropicAdapter {
     /// 工具调用的 index 直接沿用 Anthropic 的内容块序号——客户端按 index
     /// 聚合分片，序号在同一流内一致即可，不必从 0 连续。
     fn parse_stream_event(&self, payload: &str) -> Result<Vec<StreamEvent>> {
-        let value: Value = serde_json::from_str(payload).map_err(|error| {
-            Error::UpstreamUnavailable(format!("上游流载荷解析失败: {error}"))
-        })?;
+        let value: Value = serde_json::from_str(payload)
+            .map_err(|error| Error::UpstreamUnavailable(format!("上游流载荷解析失败: {error}")))?;
 
         match value.get("type").and_then(Value::as_str) {
             Some("content_block_start") => {

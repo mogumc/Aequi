@@ -20,15 +20,17 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures_util::{Stream as FutureStream, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::AppState;
 use crate::error::{Error, Result};
-use crate::model::{credits, ApiKey, NewProxyLog, UpstreamBlock};
-use crate::proxy::adapter::{adapter_for, AuthStyle, UpstreamRequest};
-use crate::proxy::scheme::{ChatRequest, ChatResponse, FinishReason, StreamEvent, Usage};
+use crate::model::{ApiKey, NewProxyLog, UpstreamBlock, credits};
+use crate::proxy::adapter::{AuthStyle, UpstreamRequest, adapter_for};
+use crate::proxy::scheme::{
+    ChatRequest, ChatResponse, FinishReason, StreamEvent, ToolCallDelta, Usage,
+};
 use crate::service::{billing, upstream};
 use crate::utils::{random, time};
-use crate::AppState;
 
 pub mod adapter;
 pub mod estimate;
@@ -241,7 +243,8 @@ pub async fn chat_completion_stream(
 
     let mut request = openai_in::parse_request(&body)?;
     // 解析目标：归一化模型名（剥掉块前缀），并记下是否锁定了某个块。
-    let target = upstream::resolve_with_header(pool, &request.model, header_block.as_deref()).await?;
+    let target =
+        upstream::resolve_with_header(pool, &request.model, header_block.as_deref()).await?;
     request.model = target.model;
 
     if !key.unlimited && key.credits_scaled <= 0 {
@@ -258,10 +261,11 @@ pub async fn chat_completion_stream(
     let mut last_failure = None;
 
     for _ in 0..MAX_ATTEMPTS {
-        let block = match upstream::select_block(pool, &state.upstream, &key, &request.model, only).await {
-            Ok(block) => block,
-            Err(error) => return Err(error),
-        };
+        let block =
+            match upstream::select_block(pool, &state.upstream, &key, &request.model, only).await {
+                Ok(block) => block,
+                Err(error) => return Err(error),
+            };
         let upstream_key = match upstream::select_key(pool, &state.upstream, &block).await {
             Ok(key) => key,
             Err(error) => return Err(error),
@@ -273,8 +277,14 @@ pub async fn chat_completion_stream(
 
         let context = Some((block.id.clone(), upstream_key.id.clone()));
 
-        match send_stream(&client, &block, &outgoing, adapter.auth_style(), &upstream_key.secret)
-            .await
+        match send_stream(
+            &client,
+            &block,
+            &outgoing,
+            adapter.auth_style(),
+            &upstream_key.secret,
+        )
+        .await
         {
             Ok(response) if response.status().is_success() => {
                 multiplier_bp = block.multiplier_bp(&request.model);
@@ -284,13 +294,19 @@ pub async fn chat_completion_stream(
             }
             Ok(response) => {
                 let status = response.status().as_u16();
-                let detail = response.text().await.ok().and_then(|text| {
-                    serde_json::from_str::<Value>(&text)
-                        .ok()
-                        .and_then(|value| {
-                            value.pointer("/error/message").and_then(Value::as_str).map(str::to_string)
+                let detail = response
+                    .text()
+                    .await
+                    .ok()
+                    .and_then(|text| {
+                        serde_json::from_str::<Value>(&text).ok().and_then(|value| {
+                            value
+                                .pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
                         })
-                }).unwrap_or_default();
+                    })
+                    .unwrap_or_default();
 
                 if status == 429 {
                     upstream::report_rate_limited(pool, &upstream_key).await;
@@ -350,9 +366,8 @@ pub async fn chat_completion_stream(
     }
 
     let Some(response) = upstream else {
-        let failure = last_failure.unwrap_or_else(|| {
-            Failure::bare(Error::UpstreamUnavailable("上游不可用".to_string()))
-        });
+        let failure = last_failure
+            .unwrap_or_else(|| Failure::bare(Error::UpstreamUnavailable("上游不可用".to_string())));
         write_log(
             pool,
             base_log(&key, &ip, user_agent.as_deref(), started)
@@ -394,6 +409,8 @@ pub async fn chat_completion_stream(
         let mut finished = false;
         // 上游是否真的产出过内容（文本或工具调用）。
         let mut produced = false;
+        // 是否收到过工具调用的分片增量——决定收尾快照是否需要补发。
+        let mut tools_seen = false;
         // 最后一条原始载荷：一条内容都没有时，它是排障的唯一线索
         // （最常见的原因是块格式与上游不匹配，解析器什么都提不出来）。
         let mut last_payload: Option<String> = None;
@@ -488,6 +505,9 @@ pub async fn chat_completion_stream(
                         if !text.is_empty() || !tool_calls.is_empty() {
                             produced = true;
                         }
+                        if !tool_calls.is_empty() {
+                            tools_seen = true;
+                        }
                         text_acc.push_str(&text);
                         yield frame(openai_in::render_stream_delta(
                             &id, created, &model, &text, &tool_calls,
@@ -498,6 +518,28 @@ pub async fn chat_completion_stream(
                             finished = true;
                             yield frame(openai_in::render_stream_finish(
                                 &id, created, &model, finish_reason,
+                            ));
+                        }
+                    }
+                    StreamEvent::Snapshot { tool_calls } => {
+                        // 收尾快照是上游给的权威全集；只有增量从未到达时才补发，
+                        // 避免与已收到的分片叠加。快照到达本身说明上游确实
+                        // 发起过调用——这也计入产出。
+                        if !tool_calls.is_empty() && !tools_seen {
+                            produced = true;
+                            tools_seen = true;
+                            let deltas = tool_calls
+                                .iter()
+                                .enumerate()
+                                .map(|(index, call)| ToolCallDelta {
+                                    index,
+                                    id: Some(call.id.clone()),
+                                    name: Some(call.name.clone()),
+                                    arguments_fragment: Some(call.arguments.clone()),
+                                })
+                                .collect::<Vec<_>>();
+                            yield frame(openai_in::render_stream_delta(
+                                &id, created, &model, "", &deltas,
                             ));
                         }
                     }
@@ -636,10 +678,11 @@ async fn dispatch(
 
     for _ in 0..MAX_ATTEMPTS {
         // 每一轮都重新挑：上一把密钥进入退避后，这里会自然落到下一把。
-        let block = match upstream::select_block(pool, &state.upstream, &key, &request.model, only).await {
-            Ok(block) => block,
-            Err(error) => return Err(Failure::bare(error)),
-        };
+        let block =
+            match upstream::select_block(pool, &state.upstream, &key, &request.model, only).await {
+                Ok(block) => block,
+                Err(error) => return Err(Failure::bare(error)),
+            };
         let upstream_key = match upstream::select_key(pool, &state.upstream, &block).await {
             Ok(key) => key,
             Err(error) => {
@@ -660,8 +703,14 @@ async fn dispatch(
             }
         };
 
-        let sent =
-            send(&client, &block, &outgoing, adapter.auth_style(), &upstream_key.secret).await;
+        let sent = send(
+            &client,
+            &block,
+            &outgoing,
+            adapter.auth_style(),
+            &upstream_key.secret,
+        )
+        .await;
 
         let context = Some((block.id.clone(), upstream_key.id.clone()));
 
@@ -918,11 +967,7 @@ impl<'a> LogDraft<'a> {
     }
 
     /// 失败：带块与上游密钥的上下文。
-    fn failed_with_context(
-        self,
-        error: &Error,
-        context: Option<(String, String)>,
-    ) -> NewProxyLog {
+    fn failed_with_context(self, error: &Error, context: Option<(String, String)>) -> NewProxyLog {
         let (block_id, upstream_key_id) = context
             .map(|(block, key)| (Some(block), Some(key)))
             .unwrap_or((self.block_id.clone(), self.upstream_key_id.clone()));

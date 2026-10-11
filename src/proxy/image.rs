@@ -8,16 +8,16 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::AppState;
 use crate::error::{Error, Result};
 use crate::model::ApiKey;
 use crate::proxy::adapter::{AuthStyle, UpstreamRequest};
 use crate::proxy::scheme::Usage;
-use crate::proxy::{base_log, estimate, write_log, Failure, MAX_ATTEMPTS};
+use crate::proxy::{Failure, MAX_ATTEMPTS, base_log, estimate, write_log};
 use crate::service::{billing, upstream};
 use crate::utils::time;
-use crate::AppState;
 
 /// 生图接口的路径，与入口同名。
 const IMAGES_PATH: &str = "/v1/images/generations";
@@ -51,7 +51,11 @@ pub async fn images_generations(
     let started = Instant::now();
     let pool = &state.store.data;
 
-    let model = match body.get("model").and_then(Value::as_str).filter(|m| !m.is_empty()) {
+    let model = match body
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|m| !m.is_empty())
+    {
         Some(model) => model.to_string(),
         None => {
             let error = Error::BadRequest("请求里缺少 model".to_string());
@@ -183,8 +187,14 @@ async fn dispatch(
 
         let context = Some((block.id.clone(), upstream_key.id.clone()));
 
-        match crate::proxy::send(&client, &block, &request, AuthStyle::Bearer, &upstream_key.secret)
-            .await
+        match crate::proxy::send(
+            &client,
+            &block,
+            &request,
+            AuthStyle::Bearer,
+            &upstream_key.secret,
+        )
+        .await
         {
             Ok((status, response_body)) => {
                 if status == 429 {
@@ -233,8 +243,7 @@ async fn dispatch(
                 let data = match response_body.get("data").and_then(Value::as_array) {
                     Some(data) => data,
                     None => {
-                        let error =
-                            Error::UpstreamUnavailable("上游响应里没有 data".to_string());
+                        let error = Error::UpstreamUnavailable("上游响应里没有 data".to_string());
                         let user_message = error.to_string();
                         upstream::report_failure(pool, &upstream_key, &user_message).await;
                         last_failure = Some(Failure::with_context(error, user_message, context));
@@ -247,24 +256,25 @@ async fn dispatch(
                 // gpt-image-1 等新一代接口自带 usage；DALL-E 系列按张估算。
                 let usage = parse_usage(&response_body).unwrap_or_else(|| {
                     Usage::estimated(
-                        estimate::estimate_text(body.get("prompt").and_then(Value::as_str).unwrap_or("")),
+                        estimate::estimate_text(
+                            body.get("prompt").and_then(Value::as_str).unwrap_or(""),
+                        ),
                         IMAGE_TOKENS_PER_PICTURE * data.len().max(1) as i64,
                     )
                 });
 
-                let charge =
-                    match billing::charge(
-                            pool,
-                            key,
-                            &block.id,
-                            model,
-                            usage,
-                            block.multiplier_bp(model),
-                            false,
-                        )
-                        .await
-                    {
-                        Ok(charge) => charge,
+                let charge = match billing::charge(
+                    pool,
+                    key,
+                    &block.id,
+                    model,
+                    usage,
+                    block.multiplier_bp(model),
+                    false,
+                )
+                .await
+                {
+                    Ok(charge) => charge,
                     Err(error) => {
                         let user_message = error.to_string();
                         return Err(Failure::with_context(error, user_message, context));

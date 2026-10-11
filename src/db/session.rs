@@ -138,11 +138,7 @@ pub async fn touch(pool: &SqlitePool, id: &str, now: i64) -> Result<bool, sqlx::
 /// 删除指定会话，不留退役记录。
 ///
 /// 返回是否确实删掉了一行。重复删除返回 `false`，由调用方决定算不算失败。
-pub async fn delete<'e, E>(
-    executor: E,
-    id: &str,
-    account_id: i64,
-) -> Result<bool, sqlx::Error>
+pub async fn delete<'e, E>(executor: E, id: &str, account_id: i64) -> Result<bool, sqlx::Error>
 where
     E: Executor<'e, Database = Sqlite>,
 {

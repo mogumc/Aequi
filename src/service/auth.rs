@@ -2,7 +2,7 @@
 
 use sqlx::SqlitePool;
 
-use crate::config::{non_empty_env, Settings, ADMIN_PASSWORD_ENV, ADMIN_USERNAME_ENV};
+use crate::config::{ADMIN_PASSWORD_ENV, ADMIN_USERNAME_ENV, Settings, non_empty_env};
 use crate::db;
 use crate::error::{Error, Result};
 use crate::model::{Account, NewSession, Session};

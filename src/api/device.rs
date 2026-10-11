@@ -2,16 +2,16 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Extension, Path, State};
 use axum::Json;
+use axum::extract::{Extension, Path, State};
 use serde::Serialize;
 
-use crate::api::middleware::AuthContext;
+use crate::AppState;
 use crate::api::MessageResponse;
+use crate::api::middleware::AuthContext;
 use crate::error::Result;
 use crate::model::SessionView;
 use crate::service::device;
-use crate::AppState;
 
 /// 设备列表响应。
 #[derive(Debug, Serialize)]
@@ -55,6 +55,7 @@ pub async fn revoke_others(
     State(state): State<Arc<AppState>>,
     Extension(context): Extension<AuthContext>,
 ) -> Result<Json<RevokeOthersResponse>> {
-    let revoked = device::revoke_others(state.pool(), context.account.id, &context.session.id).await?;
+    let revoked =
+        device::revoke_others(state.pool(), context.account.id, &context.session.id).await?;
     Ok(Json(RevokeOthersResponse { revoked }))
 }

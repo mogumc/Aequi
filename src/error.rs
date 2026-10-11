@@ -3,9 +3,9 @@
 //! 对外统一为 `{"error": {"type": "...", "message": "..."}}`，
 //! 前端只需处理一种错误结构。
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 
 /// 业务错误。
 #[derive(Debug, thiserror::Error)]

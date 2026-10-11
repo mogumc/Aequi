@@ -2,10 +2,11 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
 use axum::Json;
+use axum::extract::{Path, State};
 use serde::Serialize;
 
+use crate::AppState;
 use crate::api::MessageResponse;
 use crate::error::Result;
 use crate::model::{
@@ -13,7 +14,6 @@ use crate::model::{
     UpstreamKeyView,
 };
 use crate::service::upstream;
-use crate::AppState;
 
 /// 块列表响应。
 #[derive(Debug, Serialize)]
@@ -54,7 +54,9 @@ pub async fn create(
     Json(payload): Json<BlockCreate>,
 ) -> Result<Json<BlockView>> {
     let block = upstream::create_block(&state.store.data, payload).await?;
-    Ok(Json(upstream::block_view(&state.store.data, &block.id).await?))
+    Ok(Json(
+        upstream::block_view(&state.store.data, &block.id).await?,
+    ))
 }
 
 /// `GET /api/blocks/{id}`
@@ -113,8 +115,11 @@ pub async fn remove_keys(
     Path(id): Path<String>,
     Json(payload): Json<KeyIdsRequest>,
 ) -> Result<Json<MessageResponse>> {
-    let removed = upstream::delete_keys(&state.store.data, &state.upstream, &id, &payload.ids).await?;
-    Ok(Json(MessageResponse::ok(format!("已删除 {removed} 把密钥"))))
+    let removed =
+        upstream::delete_keys(&state.store.data, &state.upstream, &id, &payload.ids).await?;
+    Ok(Json(MessageResponse::ok(format!(
+        "已删除 {removed} 把密钥"
+    ))))
 }
 
 /// `POST /api/blocks/{id}/keys/pause`
@@ -143,9 +148,7 @@ pub async fn test_key(
     Path((id, key_id)): Path<(String, String)>,
 ) -> Result<Json<MessageResponse>> {
     match upstream::test_key(&state.store.data, &state.upstream, &id, &key_id).await? {
-        crate::proxy::adapter::ProbeOutcome::Valid => {
-            Ok(Json(MessageResponse::ok("密钥可用")))
-        }
+        crate::proxy::adapter::ProbeOutcome::Valid => Ok(Json(MessageResponse::ok("密钥可用"))),
         crate::proxy::adapter::ProbeOutcome::Invalid(detail) => {
             Ok(Json(MessageResponse::ok(format!("密钥无效：{detail}"))))
         }

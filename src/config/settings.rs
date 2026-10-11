@@ -87,7 +87,9 @@ impl Settings {
         if let Some(raw) = entries.get(KEY_TRUST_PROXY) {
             match raw.parse::<bool>() {
                 Ok(flag) => self.trust_proxy = flag,
-                Err(_) => tracing::warn!(value = %raw, "设置项 {} 非法，沿用当前值", KEY_TRUST_PROXY),
+                Err(_) => {
+                    tracing::warn!(value = %raw, "设置项 {} 非法，沿用当前值", KEY_TRUST_PROXY)
+                }
             }
         }
 

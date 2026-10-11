@@ -6,9 +6,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::AppState;
 use crate::db;
 use crate::utils::time;
-use crate::AppState;
 
 /// 清理任务的执行间隔。
 ///

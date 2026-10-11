@@ -45,11 +45,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 const SQL_UPDATE_META: &str = "\
 UPDATE api_keys SET name = ?, enabled = ?, allowed_models = ?, updated_at = ? WHERE id = ?";
 
-const SQL_SET_CREDITS: &str =
-    "UPDATE api_keys SET credits_scaled = ?, updated_at = ? WHERE id = ?";
+const SQL_SET_CREDITS: &str = "UPDATE api_keys SET credits_scaled = ?, updated_at = ? WHERE id = ?";
 
-const SQL_SET_UNLIMITED: &str =
-    "UPDATE api_keys SET unlimited = ?, updated_at = ? WHERE id = ?";
+const SQL_SET_UNLIMITED: &str = "UPDATE api_keys SET unlimited = ?, updated_at = ? WHERE id = ?";
 
 /// 原子扣费：`credits_scaled >= ?` 保证不会透支，余额不足时一条都不会命中。
 ///
@@ -125,7 +123,10 @@ pub async fn find_by_id(pool: &SqlitePool, id: &str) -> Result<Option<ApiKey>, s
 }
 
 /// 按密钥散列查找（鉴权用）。
-pub async fn find_by_secret(pool: &SqlitePool, secret: &str) -> Result<Option<ApiKey>, sqlx::Error> {
+pub async fn find_by_secret(
+    pool: &SqlitePool,
+    secret: &str,
+) -> Result<Option<ApiKey>, sqlx::Error> {
     let row = sqlx::query(SQL_FIND_BY_SECRET)
         .bind(secret)
         .fetch_optional(pool)

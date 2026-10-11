@@ -64,16 +64,14 @@ where
             }
 
             match self.inner.poll_next_unpin(cx) {
-                Poll::Ready(Some(Ok(bytes))) => {
-                    match std::str::from_utf8(&bytes) {
-                        Ok(text) => self.buffer.push_str(text),
-                        Err(_) => {
-                            return Poll::Ready(Some(Err(crate::error::Error::UpstreamUnavailable(
-                                "上游流包含非 UTF-8 数据".to_string(),
-                            ))));
-                        }
+                Poll::Ready(Some(Ok(bytes))) => match std::str::from_utf8(&bytes) {
+                    Ok(text) => self.buffer.push_str(text),
+                    Err(_) => {
+                        return Poll::Ready(Some(Err(crate::error::Error::UpstreamUnavailable(
+                            "上游流包含非 UTF-8 数据".to_string(),
+                        ))));
                     }
-                }
+                },
                 Poll::Ready(Some(Err(error))) => {
                     return Poll::Ready(Some(Err(crate::error::Error::UpstreamUnavailable(
                         format!("上游流中断: {error}"),
@@ -132,11 +130,7 @@ mod tests {
     #[test]
     fn handles_chunks_split_mid_line() {
         // 一个 SSE 帧被任意切开的情形。
-        let payloads = collect(vec![
-            "data: {\"a\":",
-            "1}\n",
-            "\ndata: {\"b\":2}\n\n",
-        ]);
+        let payloads = collect(vec!["data: {\"a\":", "1}\n", "\ndata: {\"b\":2}\n\n"]);
 
         assert_eq!(payloads, vec!["{\"a\":1}", "{\"b\":2}"]);
     }

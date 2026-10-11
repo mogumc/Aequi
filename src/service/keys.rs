@@ -9,7 +9,7 @@ use crate::db;
 use crate::db::keys::NewApiKey;
 use crate::error::{Error, Result};
 use crate::model::{
-    credits, ApiKey, KeyCreate, KeyCreditsUpdate, KeyUpdate, UsageRecord, UsageSummary,
+    ApiKey, KeyCreate, KeyCreditsUpdate, KeyUpdate, UsageRecord, UsageSummary, credits,
 };
 use crate::utils::{random, time};
 

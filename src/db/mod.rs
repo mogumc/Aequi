@@ -31,8 +31,8 @@ pub mod usage;
 use std::path::Path;
 
 use anyhow::Context;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 /// 三个域的连接池。
 #[derive(Clone)]
@@ -301,8 +301,6 @@ CREATE TABLE IF NOT EXISTS proxy_logs (
 /// 按时间清理与按时间倒序列都要走到这一列。
 const PROXY_LOGS_TIME_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_proxy_logs_time ON proxy_logs(created_at)";
-
-
 
 const USAGE_KEY_TIME_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_usage_key_time ON usage_records(key_id, created_at DESC)";
