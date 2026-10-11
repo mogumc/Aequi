@@ -181,6 +181,7 @@ async fn charge_total(
         key,
         model,
         aequi::proxy::scheme::Usage::new(0, total_tokens),
+        false,
     )
     .await
 }
