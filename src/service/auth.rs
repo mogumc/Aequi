@@ -276,10 +276,17 @@ pub async fn change_password(
     }
 
     let hash = password::hash(new_password.to_string()).await?;
-    db::account::update_password(pool, account.id, &hash, time::now_secs()).await?;
+    let now = time::now_secs();
 
-    let revoked =
-        db::session::revoke_others(pool, account.id, current_session_id, time::now_secs()).await?;
+    // 换口令与踢设备必须一起生效。只改密码却没踢掉旧会话，恰恰是
+    // 「怀疑泄露才来改密码」这个场景最不能接受的半成品状态；
+    // 两次写操作之间任何一次失败都会留下这种状态，所以放进同一个事务。
+    let mut tx = pool.begin().await?;
+
+    db::account::update_password(&mut *tx, account.id, &hash, now).await?;
+    let revoked = db::session::revoke_others(&mut *tx, account.id, current_session_id, now).await?;
+
+    tx.commit().await?;
 
     tracing::info!(account = %account.username, revoked, "密码已更新，其它设备已退出");
     Ok(revoked)

@@ -11,7 +11,7 @@
 //! - [`touch`] 与 [`revoke`] 都带有效性条件，已失效的会话不会被改动。
 
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Executor, Row, Sqlite, SqlitePool};
 
 use crate::model::{NewSession, Session};
 
@@ -156,15 +156,19 @@ pub async fn revoke(
     Ok(result.rows_affected() > 0)
 }
 
-/// 撤销除当前会话外的全部会话，返回被撤销的数量。
+/// 撤销除指定会话外的全部会话，用于「退出其他设备」。
 ///
 /// 同样是单条带条件的 UPDATE，并发调用安全。
-pub async fn revoke_others(
-    pool: &SqlitePool,
+/// 接受任意 Executor，便于和其它写操作组成一个事务。
+pub async fn revoke_others<'e, E>(
+    executor: E,
     account_id: i64,
     keep_id: &str,
     now: i64,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let result = sqlx::query(
         "UPDATE sessions SET revoked_at = ? \
          WHERE account_id = ? AND id <> ? AND revoked_at IS NULL",
@@ -172,7 +176,7 @@ pub async fn revoke_others(
     .bind(now)
     .bind(account_id)
     .bind(keep_id)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(result.rows_affected())
 }

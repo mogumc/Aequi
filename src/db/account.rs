@@ -1,7 +1,7 @@
 //! `accounts` 表的读写。
 
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Executor, Row, Sqlite, SqlitePool};
 
 use crate::model::Account;
 
@@ -91,17 +91,23 @@ pub async fn insert(
 }
 
 /// 更新密码哈希。
-pub async fn update_password(
-    pool: &SqlitePool,
+///
+/// 接受任意 Executor，便于和「撤销其它会话」放进同一个事务：
+/// 改密码跟踢设备必须一起生效，否则用户以为踢干净了其实没有。
+pub async fn update_password<'e, E>(
+    executor: E,
     id: i64,
     password_hash: &str,
     now: i64,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     sqlx::query("UPDATE accounts SET password_hash = ?, updated_at = ? WHERE id = ?")
         .bind(password_hash)
         .bind(now)
         .bind(id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(())
 }
