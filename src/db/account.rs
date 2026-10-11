@@ -15,6 +15,11 @@ const SQL_FIND_BY_ID: &str = "\
 SELECT id, username, password_hash, totp_enabled, totp_secret, created_at, updated_at \
 FROM accounts WHERE id = ?";
 
+/// 取第一个账号。系统只维护一个账号。
+const SQL_FIND_FIRST: &str = "\
+SELECT id, username, password_hash, totp_enabled, totp_secret, created_at, updated_at \
+FROM accounts ORDER BY id LIMIT 1";
+
 /// 创建账号并回读整行。
 const SQL_INSERT: &str = "\
 INSERT INTO accounts (username, password_hash, totp_enabled, created_at, updated_at) \
@@ -59,6 +64,12 @@ pub async fn find_by_id(pool: &SqlitePool, id: i64) -> Result<Option<Account>, s
         .bind(id)
         .fetch_optional(pool)
         .await?;
+    Ok(row.as_ref().map(map_row))
+}
+
+/// 取第一个账号。系统只维护一个账号，用于 CLI 这类拿不到账号 ID 的场景。
+pub async fn first(pool: &SqlitePool) -> Result<Option<Account>, sqlx::Error> {
+    let row = sqlx::query(SQL_FIND_FIRST).fetch_optional(pool).await?;
     Ok(row.as_ref().map(map_row))
 }
 

@@ -1,5 +1,7 @@
 //! 二进制入口。
 //!
+//! 不带参数时启动服务；带子命令时执行一次性操作（详见 [`aequi::cli`]）。
+//!
 //! 启动顺序：读引导参数 → 初始化日志 → 建库建表 → 载入设置 → 初始化账号
 //! → 启动后台维护任务 → 启动服务。
 //!
@@ -8,12 +10,30 @@
 
 use std::sync::Arc;
 
+use aequi::cli::{self, Command};
 use aequi::config::{Bootstrap, ADMIN_PASSWORD_ENV};
 use aequi::service::auth::InitialCredentials;
 use aequi::{db, server, service, utils, AppState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    match Command::parse(&args)? {
+        Command::Help => {
+            cli::print_help();
+            Ok(())
+        }
+        Command::ResetPassword => {
+            utils::logging::init();
+            cli::reset_password(&Bootstrap::from_env()).await
+        }
+        Command::Serve => serve().await,
+    }
+}
+
+/// 启动 HTTP 服务。
+async fn serve() -> anyhow::Result<()> {
     // 引导参数必须在连库之前确定：首次判定依赖数据库文件是否存在。
     let bootstrap = Bootstrap::from_env();
     let is_first_run = bootstrap.is_first_run();

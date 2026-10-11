@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::middleware::AuthContext;
 use crate::api::MessageResponse;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::model::AccountView;
 use crate::service::auth::{self, LoginRequest};
 use crate::service::provider::ProviderInfo;
@@ -90,6 +90,47 @@ pub async fn me(Extension(context): Extension<AuthContext>) -> Json<AccountView>
 /// 目前恒为空数组，前端可据此判断是否展示第三方登录入口。
 pub async fn providers(State(state): State<Arc<AppState>>) -> Json<Vec<ProviderInfo>> {
     Json(state.providers.list())
+}
+
+/// 修改密码的请求体。
+#[derive(Debug, Deserialize)]
+pub struct PasswordPayload {
+    pub current_password: String,
+    pub new_password: String,
+    /// 新密码的第二次输入。
+    pub confirm_password: String,
+}
+
+/// 修改密码的响应。
+#[derive(Debug, Serialize)]
+pub struct PasswordChangedResponse {
+    /// 被一并撤销的其它设备数量。
+    pub revoked_devices: u64,
+}
+
+/// `POST /api/auth/password`
+///
+/// 需要提供当前密码；改完后其它设备会被要求重新登录，本机保持登录。
+pub async fn change_password(
+    State(state): State<Arc<AppState>>,
+    Extension(context): Extension<AuthContext>,
+    Json(payload): Json<PasswordPayload>,
+) -> Result<Json<PasswordChangedResponse>> {
+    // 前端已经比对过一次，这里再比一次——正确性不能只押在客户端上。
+    if payload.new_password != payload.confirm_password {
+        return Err(Error::BadRequest("两次输入的新密码不一致".to_string()));
+    }
+
+    let revoked_devices = auth::change_password(
+        state.pool(),
+        &context.account,
+        &payload.current_password,
+        &payload.new_password,
+        &context.session.id,
+    )
+    .await?;
+
+    Ok(Json(PasswordChangedResponse { revoked_devices }))
 }
 
 /// 解析客户端地址。

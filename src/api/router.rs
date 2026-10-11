@@ -45,6 +45,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let admin = Router::new()
         .route("/auth/me", get(auth::me))
         .route("/auth/logout", post(auth::logout))
+        .route("/auth/password", post(auth::change_password))
         .route("/devices", get(device::list).delete(device::revoke_others))
         .route("/devices/{id}", delete(device::revoke))
         .route("/otp", get(otp::status))

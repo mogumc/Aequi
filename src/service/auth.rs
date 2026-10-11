@@ -229,3 +229,66 @@ pub async fn logout(pool: &SqlitePool, session_id: &str, account_id: i64) -> Res
     db::session::revoke(pool, session_id, account_id, time::now_secs()).await?;
     Ok(())
 }
+
+/// 取当前账号。系统只维护一个账号，供 CLI 这类没有会话上下文的入口使用。
+pub async fn sole_account(pool: &SqlitePool) -> Result<Account> {
+    db::account::first(pool)
+        .await?
+        .ok_or_else(|| Error::NotFound("账号尚未初始化，请先启动一次服务".to_string()))
+}
+
+/// 直接设定新密码，不校验旧密码。
+///
+/// 供命令行重置使用：能在这台机器上执行命令的人本就掌握着整个服务，
+/// 再要一次旧密码没有意义——那恰恰是忘记的东西。
+pub async fn reset_password(pool: &SqlitePool, account_id: i64, new_password: &str) -> Result<()> {
+    ensure_password_usable(new_password)?;
+
+    let hash = password::hash(new_password.to_string()).await?;
+    db::account::update_password(pool, account_id, &hash, time::now_secs()).await?;
+
+    tracing::info!(account_id, "已通过命令行重置密码");
+    Ok(())
+}
+
+/// 修改密码，返回被撤销的其它设备数。
+///
+/// 需要先验证当前密码，并撤销除本机以外的会话——多数人改密码正是因为怀疑泄露，
+/// 只换口令却把旧会话留着，等于没改。
+pub async fn change_password(
+    pool: &SqlitePool,
+    account: &Account,
+    current_password: &str,
+    new_password: &str,
+    current_session_id: &str,
+) -> Result<u64> {
+    let matched =
+        password::verify(current_password.to_string(), account.password_hash.clone()).await?;
+
+    if !matched {
+        return Err(Error::InvalidCredentials);
+    }
+
+    ensure_password_usable(new_password)?;
+
+    if new_password == current_password {
+        return Err(Error::BadRequest("新密码不能与当前密码相同".to_string()));
+    }
+
+    let hash = password::hash(new_password.to_string()).await?;
+    db::account::update_password(pool, account.id, &hash, time::now_secs()).await?;
+
+    let revoked =
+        db::session::revoke_others(pool, account.id, current_session_id, time::now_secs()).await?;
+
+    tracing::info!(account = %account.username, revoked, "密码已更新，其它设备已退出");
+    Ok(revoked)
+}
+
+/// 新密码的最低要求：不为难用户，但也不接受空密码。
+fn ensure_password_usable(password: &str) -> Result<()> {
+    if password.is_empty() {
+        return Err(Error::BadRequest("密码不能为空".to_string()));
+    }
+    Ok(())
+}
