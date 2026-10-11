@@ -8,19 +8,19 @@ use crate::model::{UsageRecord, UsageSummary};
 /// 成功请求：与扣费同事务写入。
 const SQL_INSERT: &str = "\
 INSERT INTO usage_records \
-(key_id, model, raw_tokens, prompt_tokens, completion_tokens, cache_tokens, estimated, \
+(key_id, model, raw_tokens, prompt_tokens, completion_tokens, cache_tokens, estimated, stream, \
  multiplier_bp, final_tokens, credits_scaled, status, created_at) \
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', ?)";
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', ?)";
 
 /// 失败请求：tokens 与扣费为零，只留一句脱敏错误。
 const SQL_INSERT_ERROR: &str = "\
 INSERT INTO usage_records \
-(key_id, model, status, error, created_at) \
-VALUES (?, ?, 'error', ?, ?)";
+(key_id, model, status, error, stream, created_at) \
+VALUES (?, ?, 'error', ?, ?, ?)";
 
 const SQL_LIST_BY_KEY: &str = "\
 SELECT * FROM (\
-    SELECT id, key_id, model, raw_tokens, prompt_tokens, completion_tokens, cache_tokens, estimated, \
+    SELECT id, key_id, model, raw_tokens, prompt_tokens, completion_tokens, cache_tokens, estimated, stream, \
            multiplier_bp, final_tokens, credits_scaled, status, error, created_at \
     FROM usage_records WHERE key_id = ?\
 ) ORDER BY created_at DESC, id DESC LIMIT ?";
@@ -46,6 +46,7 @@ pub struct NewUsage<'a> {
     pub completion_tokens: i64,
     pub cache_tokens: i64,
     pub estimated: bool,
+    pub stream: bool,
     pub multiplier_bp: i64,
     pub final_tokens: i64,
     pub credits_scaled: i64,
@@ -62,6 +63,7 @@ fn map_row(row: &SqliteRow) -> UsageRecord {
         completion_tokens: row.get("completion_tokens"),
         cache_tokens: row.get("cache_tokens"),
         estimated: row.get::<i64, _>("estimated") != 0,
+        stream: row.get::<i64, _>("stream") != 0,
         multiplier_bp: row.get("multiplier_bp"),
         final_tokens: row.get("final_tokens"),
         credits_scaled: row.get("credits_scaled"),
@@ -87,6 +89,7 @@ pub async fn insert(
         .bind(usage.completion_tokens)
         .bind(usage.cache_tokens)
         .bind(i64::from(usage.estimated))
+        .bind(i64::from(usage.stream))
         .bind(usage.multiplier_bp)
         .bind(usage.final_tokens)
         .bind(usage.credits_scaled)
@@ -105,12 +108,14 @@ pub async fn insert_error(
     key_id: &str,
     model: &str,
     error: &str,
+    stream: bool,
     created_at: i64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(SQL_INSERT_ERROR)
         .bind(key_id)
         .bind(model)
         .bind(error)
+        .bind(i64::from(stream))
         .bind(created_at)
         .execute(pool)
         .await?;

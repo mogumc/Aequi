@@ -32,6 +32,8 @@ pub struct ProxyLog {
     pub completion_tokens: i64,
     pub cache_tokens: i64,
     pub estimated: bool,
+    /// 是否为流式请求。
+    pub stream: bool,
     pub credits_scaled: i64,
 }
 
@@ -53,6 +55,7 @@ pub struct ProxyLogView {
     pub completion_tokens: i64,
     pub cache_tokens: i64,
     pub estimated: bool,
+    pub stream: bool,
     /// 消耗积分，四位小数字符串。
     pub credits: String,
 }
@@ -75,6 +78,7 @@ impl From<&ProxyLog> for ProxyLogView {
             completion_tokens: log.completion_tokens,
             cache_tokens: log.cache_tokens,
             estimated: log.estimated,
+            stream: log.stream,
             credits: credits::format_credits(log.credits_scaled),
         }
     }
@@ -96,6 +100,7 @@ pub struct NewProxyLog {
     pub completion_tokens: i64,
     pub cache_tokens: i64,
     pub estimated: bool,
+    pub stream: bool,
     pub credits_scaled: i64,
     pub created_at: i64,
 }

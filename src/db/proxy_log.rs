@@ -11,12 +11,12 @@ use crate::model::{NewProxyLog, ProxyLog};
 const SQL_INSERT: &str = "\
 INSERT INTO proxy_logs \
 (created_at, access_key_id, block_id, upstream_key_id, model, ip, user_agent, \
- status, error_detail, duration_ms, prompt_tokens, completion_tokens, cache_tokens, estimated, credits_scaled) \
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+ status, error_detail, duration_ms, prompt_tokens, completion_tokens, cache_tokens, estimated, stream, credits_scaled) \
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 const SQL_LIST: &str = "\
 SELECT id, created_at, access_key_id, block_id, upstream_key_id, model, ip, user_agent, \
-       status, error_detail, duration_ms, prompt_tokens, completion_tokens, cache_tokens, estimated, credits_scaled \
+       status, error_detail, duration_ms, prompt_tokens, completion_tokens, cache_tokens, estimated, stream, credits_scaled \
 FROM proxy_logs ORDER BY created_at DESC, id DESC LIMIT ?";
 
 const SQL_PURGE: &str = "DELETE FROM proxy_logs WHERE created_at <= ?";
@@ -41,6 +41,7 @@ fn map_row(row: &SqliteRow) -> ProxyLog {
         completion_tokens: row.get("completion_tokens"),
         cache_tokens: row.get("cache_tokens"),
         estimated: row.get::<i64, _>("estimated") != 0,
+        stream: row.get::<i64, _>("stream") != 0,
         credits_scaled: row.get("credits_scaled"),
     }
 }
@@ -64,6 +65,7 @@ pub async fn insert(pool: &SqlitePool, log: &NewProxyLog) -> Result<(), sqlx::Er
         .bind(log.completion_tokens)
         .bind(log.cache_tokens)
         .bind(i64::from(log.estimated))
+        .bind(i64::from(log.stream))
         .bind(log.credits_scaled)
         .execute(pool)
         .await?;

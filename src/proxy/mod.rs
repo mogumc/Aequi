@@ -186,6 +186,7 @@ pub async fn chat_completion(
                 &key.id,
                 &request.model,
                 &failure.user_message,
+                false,
                 time::now_secs(),
             )
             .await
@@ -320,6 +321,7 @@ pub async fn chat_completion_stream(
             pool,
             base_log(&key, &ip, user_agent.as_deref(), started)
                 .model(request.model.clone())
+                .streaming()
                 .failed_with_context(&failure.error, failure.context),
         )
         .await;
@@ -328,6 +330,7 @@ pub async fn chat_completion_stream(
             &key.id,
             &request.model,
             &failure.user_message,
+            true,
             time::now_secs(),
         )
         .await
@@ -373,7 +376,29 @@ pub async fn chat_completion_stream(
             let payload = match item {
                 Ok(payload) => payload,
                 Err(error) => {
-                    yield Err(std::io::Error::other(error.to_string()));
+                    // 上游流中断：与其它中途错误一致，以内联错误帧收尾并落日志。
+                    let message = error.to_string();
+                    write_log(
+                        pool,
+                        base_log(&key, &ip, user_agent.as_deref(), started)
+                            .model(request.model.clone())
+                            .streaming()
+                            .failed(&Error::UpstreamUnavailable(message.clone())),
+                    )
+                    .await;
+                    if let Err(log_error) = crate::db::usage::insert_error(
+                        pool,
+                        &key.id,
+                        &request.model,
+                        &message,
+                        true,
+                        time::now_secs(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %log_error, "写入失败用量记录失败");
+                    }
+                    yield Ok(error_frame(&message));
                     return;
                 }
             };
@@ -381,6 +406,26 @@ pub async fn chat_completion_stream(
             let events = match adapter.parse_stream_event(&payload) {
                 Ok(events) => events,
                 Err(error) => {
+                    write_log(
+                        pool,
+                        base_log(&key, &ip, user_agent.as_deref(), started)
+                            .model(request.model.clone())
+                            .streaming()
+                            .failed(&error),
+                    )
+                    .await;
+                    if let Err(log_error) = crate::db::usage::insert_error(
+                        pool,
+                        &key.id,
+                        &request.model,
+                        &error.to_string(),
+                        true,
+                        time::now_secs(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %log_error, "写入失败用量记录失败");
+                    }
                     yield Ok(error_frame(&error.to_string()));
                     return;
                 }
@@ -423,7 +468,7 @@ pub async fn chat_completion_stream(
             usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
         }
 
-        match billing::charge(pool, &key, &request.model, usage).await {
+        match billing::charge(pool, &key, &request.model, usage, true).await {
             Ok(charge) => {
                 write_log(
                     pool,
@@ -431,6 +476,7 @@ pub async fn chat_completion_stream(
                         .model(request.model.clone())
                         .block(&block_id)
                         .upstream_key(&upstream_key_id)
+                        .streaming()
                         .succeeded(charge.usage, charge.credits_scaled)
                         .to_success_log(),
                 )
@@ -457,9 +503,22 @@ pub async fn chat_completion_stream(
                     pool,
                     base_log(&key, &ip, user_agent.as_deref(), started)
                         .model(request.model.clone())
+                        .streaming()
                         .failed_with_context(&error, Some((block_id, upstream_key_id))),
                 )
                 .await;
+                if let Err(log_error) = crate::db::usage::insert_error(
+                    pool,
+                    &key.id,
+                    &request.model,
+                    &error.to_string(),
+                    true,
+                    time::now_secs(),
+                )
+                .await
+                {
+                    tracing::warn!(error = %log_error, "写入失败用量记录失败");
+                }
                 yield Ok(error_frame(&error.to_string()));
             }
         }
@@ -579,7 +638,7 @@ async fn dispatch(
                     response.usage
                 };
 
-                let charge = match billing::charge(pool, key, &request.model, usage).await {
+                let charge = match billing::charge(pool, key, &request.model, usage, false).await {
                     Ok(charge) => charge,
                     Err(error) => {
                         let user_message = error.to_string();
@@ -699,6 +758,7 @@ fn base_log<'a>(
         upstream_key_id: None,
         usage: crate::proxy::scheme::Usage::default(),
         credits_scaled: 0,
+        stream: false,
     }
 }
 
@@ -713,9 +773,16 @@ struct LogDraft<'a> {
     upstream_key_id: Option<String>,
     usage: crate::proxy::scheme::Usage,
     credits_scaled: i64,
+    stream: bool,
 }
 
 impl<'a> LogDraft<'a> {
+    /// 标记为流式请求。
+    fn streaming(mut self) -> Self {
+        self.stream = true;
+        self
+    }
+
     fn model(mut self, model: String) -> Self {
         self.model = model;
         self
@@ -766,6 +833,7 @@ impl<'a> LogDraft<'a> {
             completion_tokens: self.usage.completion_tokens,
             cache_tokens: self.usage.cache_tokens,
             estimated: self.usage.estimated,
+            stream: self.stream,
             credits_scaled: self.credits_scaled,
             created_at: time::now_secs(),
         }
@@ -787,6 +855,7 @@ impl<'a> LogDraft<'a> {
             completion_tokens: self.usage.completion_tokens,
             cache_tokens: self.usage.cache_tokens,
             estimated: self.usage.estimated,
+            stream: self.stream,
             credits_scaled: self.credits_scaled,
             created_at: time::now_secs(),
         }

@@ -107,6 +107,7 @@ pub async fn images_generations(
                 &key.id,
                 &model,
                 &failure.user_message,
+                false,
                 time::now_secs(),
             )
             .await
@@ -243,7 +244,7 @@ async fn dispatch(
                     )
                 });
 
-                let charge = match billing::charge(pool, key, model, usage).await {
+                let charge = match billing::charge(pool, key, model, usage, false).await {
                     Ok(charge) => charge,
                     Err(error) => {
                         let user_message = error.to_string();

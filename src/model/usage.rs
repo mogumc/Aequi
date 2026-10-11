@@ -25,6 +25,8 @@ pub struct UsageRecord {
     pub cache_tokens: i64,
     /// token 数是否为本地估算。
     pub estimated: bool,
+    /// 是否为流式请求。
+    pub stream: bool,
     /// 记账当时的倍率快照（万分比）。
     pub multiplier_bp: i64,
     /// 按倍率折算后的 token 数。
@@ -50,6 +52,7 @@ pub struct UsageView {
     pub completion_tokens: i64,
     pub cache_tokens: i64,
     pub estimated: bool,
+    pub stream: bool,
     pub raw_tokens: i64,
     /// 倍率，四位小数字符串。
     pub multiplier: String,
@@ -70,6 +73,7 @@ impl From<&UsageRecord> for UsageView {
             completion_tokens: record.completion_tokens,
             cache_tokens: record.cache_tokens,
             estimated: record.estimated,
+            stream: record.stream,
             raw_tokens: record.raw_tokens,
             multiplier: credits::format_multiplier(record.multiplier_bp),
             final_tokens: record.final_tokens,

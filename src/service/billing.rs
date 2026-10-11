@@ -67,6 +67,7 @@ pub async fn charge(
     key: &ApiKey,
     model: &str,
     usage: Usage,
+    stream: bool,
 ) -> Result<ChargeOutcome> {
     ensure_usable(key, model)?;
 
@@ -99,6 +100,7 @@ pub async fn charge(
             completion_tokens: usage.completion_tokens,
             cache_tokens: usage.cache_tokens,
             estimated: usage.estimated,
+            stream,
             multiplier_bp,
             final_tokens,
             credits_scaled,

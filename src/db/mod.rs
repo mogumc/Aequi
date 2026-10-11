@@ -265,6 +265,7 @@ CREATE TABLE IF NOT EXISTS usage_records (
     completion_tokens INTEGER NOT NULL DEFAULT 0,
     cache_tokens      INTEGER NOT NULL DEFAULT 0,
     estimated         INTEGER NOT NULL DEFAULT 0,
+    stream            INTEGER NOT NULL DEFAULT 0,
     multiplier_bp     INTEGER NOT NULL DEFAULT 10000,
     final_tokens      INTEGER NOT NULL DEFAULT 0,
     credits_scaled    INTEGER NOT NULL DEFAULT 0,
@@ -292,6 +293,7 @@ CREATE TABLE IF NOT EXISTS proxy_logs (
     completion_tokens INTEGER NOT NULL DEFAULT 0,
     cache_tokens      INTEGER NOT NULL DEFAULT 0,
     estimated         INTEGER NOT NULL DEFAULT 0,
+    stream            INTEGER NOT NULL DEFAULT 0,
     credits_scaled    INTEGER NOT NULL DEFAULT 0
 )
 "#;
