@@ -1018,6 +1018,106 @@ async fn cli_reset_generates_a_fresh_random_password() {
     assert_ne!(password, again, "两次重置不应得到同一个密码");
 }
 
+#[tokio::test]
+async fn username_change_requires_password_and_takes_effect() {
+    let app = TestApp::new().await;
+    app.seed_account().await;
+    let token = app.login().await;
+
+    // 当前密码错误 → 拒绝
+    let response = app
+        .router()
+        .oneshot(authorized(
+            json_request(
+                Method::POST,
+                "/api/auth/username",
+                json!({ "current_password": "not-the-password", "username": "renamed" }),
+            ),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // 空用户名 → 拒绝
+    let response = app
+        .router()
+        .oneshot(authorized(
+            json_request(
+                Method::POST,
+                "/api/auth/username",
+                json!({ "current_password": DEMO_PASSWORD, "username": "   " }),
+            ),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // 与当前相同 → 拒绝
+    let response = app
+        .router()
+        .oneshot(authorized(
+            json_request(
+                Method::POST,
+                "/api/auth/username",
+                json!({ "current_password": DEMO_PASSWORD, "username": DEMO_USERNAME }),
+            ),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // 正常修改：首尾空白应被去掉
+    let body = json_body(
+        app.router()
+            .oneshot(authorized(
+                json_request(
+                    Method::POST,
+                    "/api/auth/username",
+                    json!({ "current_password": DEMO_PASSWORD, "username": "  renamed-user  " }),
+                ),
+                &token,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["username"], "renamed-user");
+
+    // 旧用户名登录失败，新用户名 + 原密码可用
+    let response = app
+        .router()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/auth/login",
+            json!({ "username": DEMO_USERNAME, "password": DEMO_PASSWORD }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .router()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/auth/login",
+            json!({ "username": "renamed-user", "password": DEMO_PASSWORD }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 改名不踢设备，当前会话照常可用
+    let response = app
+        .router()
+        .oneshot(authorized(get("/api/auth/me"), &token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 /// 用与验证器 App 相同的方式算出当前验证码。
 fn current_code(secret_base32: &str) -> String {
     use totp_rs::{Algorithm, Builder, Secret};

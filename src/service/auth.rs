@@ -300,3 +300,55 @@ fn ensure_password_usable(password: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// 用户名的长度上限。
+const MAX_USERNAME_LEN: usize = 64;
+
+/// 修改用户名，返回更新后的账号。
+///
+/// 同样要求当前密码：光有会话不等于就是账号主人，而改名会把原主人挡在门外，
+/// 属于能被用来锁账号的操作。
+pub async fn change_username(
+    pool: &SqlitePool,
+    account: &Account,
+    current_password: &str,
+    new_username: &str,
+) -> Result<Account> {
+    let matched =
+        password::verify(current_password.to_string(), account.password_hash.clone()).await?;
+
+    if !matched {
+        return Err(Error::InvalidCredentials);
+    }
+
+    let new_username = validate_username(new_username)?;
+
+    if new_username == account.username {
+        return Err(Error::BadRequest("新用户名与当前用户名相同".to_string()));
+    }
+
+    db::account::update_username(pool, account.id, new_username, time::now_secs()).await?;
+
+    tracing::info!(old = %account.username, new = new_username, "用户名已更新");
+
+    db::account::find_by_id(pool, account.id)
+        .await?
+        .ok_or_else(|| Error::Internal(anyhow::anyhow!("账号在更新后消失")))
+}
+
+/// 用户名的基本校验：非空、去掉首尾空白、长度可控。
+fn validate_username(username: &str) -> Result<&str> {
+    let username = username.trim();
+
+    if username.is_empty() {
+        return Err(Error::BadRequest("用户名不能为空".to_string()));
+    }
+
+    if username.chars().count() > MAX_USERNAME_LEN {
+        return Err(Error::BadRequest(format!(
+            "用户名不能超过 {MAX_USERNAME_LEN} 个字符"
+        )));
+    }
+
+    Ok(username)
+}

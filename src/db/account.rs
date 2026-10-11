@@ -90,6 +90,27 @@ pub async fn insert(
     Ok(map_row(&row))
 }
 
+/// 更新用户名。
+///
+/// 形状与 [`update_password`] 保持一致，需要时可以和别的写操作组成事务。
+pub async fn update_username<'e, E>(
+    executor: E,
+    id: i64,
+    username: &str,
+    now: i64,
+) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query("UPDATE accounts SET username = ?, updated_at = ? WHERE id = ?")
+        .bind(username)
+        .bind(now)
+        .bind(id)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
 /// 更新密码哈希。
 ///
 /// 接受任意 Executor，便于和「撤销其它会话」放进同一个事务：

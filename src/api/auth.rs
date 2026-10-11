@@ -133,6 +133,32 @@ pub async fn change_password(
     Ok(Json(PasswordChangedResponse { revoked_devices }))
 }
 
+/// 修改用户名的请求体。
+#[derive(Debug, Deserialize)]
+pub struct UsernamePayload {
+    pub current_password: String,
+    pub username: String,
+}
+
+/// `POST /api/auth/username`
+///
+/// 需要提供当前密码。返回更新后的账号视图，前端直接替换，省一次往返。
+pub async fn change_username(
+    State(state): State<Arc<AppState>>,
+    Extension(context): Extension<AuthContext>,
+    Json(payload): Json<UsernamePayload>,
+) -> Result<Json<AccountView>> {
+    let account = auth::change_username(
+        state.pool(),
+        &context.account,
+        &payload.current_password,
+        &payload.username,
+    )
+    .await?;
+
+    Ok(Json(AccountView::from(&account)))
+}
+
 /// 解析客户端地址。
 ///
 /// 只有开启了 `server.trust_proxy` 才采信转发头。直连场景下 `X-Forwarded-For`
