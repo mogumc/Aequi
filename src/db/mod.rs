@@ -64,44 +64,47 @@ impl Store {
 
     /// 建表。幂等，每次启动都可安全执行。
     pub async fn migrate(&self) -> anyhow::Result<()> {
-        self.migrate_control().await?;
-        self.migrate_data().await?;
+        migrate_control(&self.control).await?;
+        migrate_data(&self.data).await?;
         Ok(())
     }
+}
 
-    /// 控制面表结构。
-    async fn migrate_control(&self) -> anyhow::Result<()> {
-        for (name, ddl) in [
-            ("accounts", ACCOUNTS_DDL),
-            ("sessions", SESSIONS_DDL),
-            ("settings", SETTINGS_DDL),
-            ("idx_sessions_account", SESSIONS_ACCOUNT_INDEX),
-        ] {
-            sqlx::query(ddl)
-                .execute(&self.control)
-                .await
-                .with_context(|| format!("执行控制面建表语句失败: {name}"))?;
-        }
-
-        Ok(())
+/// 建控制面表结构。
+///
+/// 拆成独立函数，是为了让只关心控制面的调用方（例如命令行重置密码）
+/// 能只建这一个库，不必为了拿账号数据顺带把数据面也碰一遍。
+pub async fn migrate_control(pool: &SqlitePool) -> anyhow::Result<()> {
+    for (name, ddl) in [
+        ("accounts", ACCOUNTS_DDL),
+        ("sessions", SESSIONS_DDL),
+        ("settings", SETTINGS_DDL),
+        ("idx_sessions_account", SESSIONS_ACCOUNT_INDEX),
+    ] {
+        sqlx::query(ddl)
+            .execute(pool)
+            .await
+            .with_context(|| format!("执行控制面建表语句失败: {name}"))?;
     }
 
-    /// 数据面表结构。
-    async fn migrate_data(&self) -> anyhow::Result<()> {
-        for (name, ddl) in [
-            ("api_keys", API_KEYS_DDL),
-            ("usage_records", USAGE_RECORDS_DDL),
-            ("models", MODELS_DDL),
-            ("idx_usage_key_time", USAGE_KEY_TIME_INDEX),
-        ] {
-            sqlx::query(ddl)
-                .execute(&self.data)
-                .await
-                .with_context(|| format!("执行数据面建表语句失败: {name}"))?;
-        }
+    Ok(())
+}
 
-        Ok(())
+/// 建数据面表结构。
+pub async fn migrate_data(pool: &SqlitePool) -> anyhow::Result<()> {
+    for (name, ddl) in [
+        ("api_keys", API_KEYS_DDL),
+        ("usage_records", USAGE_RECORDS_DDL),
+        ("models", MODELS_DDL),
+        ("idx_usage_key_time", USAGE_KEY_TIME_INDEX),
+    ] {
+        sqlx::query(ddl)
+            .execute(pool)
+            .await
+            .with_context(|| format!("执行数据面建表语句失败: {name}"))?;
     }
+
+    Ok(())
 }
 
 /// 打开（必要时创建）一个 SQLite 连接池。

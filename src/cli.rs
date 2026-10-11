@@ -60,15 +60,16 @@ pub async fn reset_password(bootstrap: &Bootstrap) -> anyhow::Result<()> {
         anyhow::bail!("数据库尚未创建，请先启动一次服务完成初始化");
     }
 
-    let store = db::Store::connect(&bootstrap.database, &bootstrap.data_database).await?;
-    store.migrate().await?;
+    // 只打开控制面库。重置密码用不到数据面，顺带把那边也建一遍是多余的副作用。
+    let pool = db::open_pool(&bootstrap.database).await?;
+    db::migrate_control(&pool).await?;
 
-    let account = service::auth::sole_account(&store.control).await?;
+    let account = service::auth::sole_account(&pool).await?;
 
     println!("将重置账号 {} 的密码。", account.username);
     let new_password = prompt_new_password()?;
 
-    service::auth::reset_password(&store.control, account.id, &new_password).await?;
+    service::auth::reset_password(&pool, account.id, &new_password).await?;
 
     println!("密码已更新，请用新密码登录。");
     Ok(())
