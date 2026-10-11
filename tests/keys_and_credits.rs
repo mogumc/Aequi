@@ -17,7 +17,7 @@ use tower::ServiceExt;
 use aequi::config::Settings;
 use aequi::db;
 use aequi::model::{credits, KeyCreate};
-use aequi::service::{billing, keys as key_service, password};
+use aequi::service::{billing, keys as key_service, models as model_service, password};
 use aequi::utils::random;
 use aequi::{api, AppState, Error};
 
@@ -679,4 +679,80 @@ async fn switching_off_unlimited_restores_the_balance_check() {
         .await
         .expect_err("切回有限额度后余额为 0，应拒绝");
     assert!(matches!(error, aequi::Error::InsufficientCredits));
+}
+
+#[tokio::test]
+async fn model_multiplier_config_drives_billing() {
+    let app = TestApp::new().await;
+    let key = app.make_key("10", Vec::new()).await;
+
+    // 没配置：按默认 1.0 计费。
+    let outcome = charge_total(app.data(), &key, "demo-model", 10_000)
+        .await
+        .unwrap();
+    assert_eq!(outcome.credits_scaled, credits::CREDIT_SCALE);
+
+    // 配 2.0 倍率：同样 10000 token 花两倍。
+    model_service::create(
+        app.data(),
+        aequi::model::ModelCreate {
+            name: "demo-model".to_string(),
+            multiplier: Some("2.0".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let outcome = charge_total(app.data(), &key, "demo-model", 10_000)
+        .await
+        .unwrap();
+    assert_eq!(outcome.credits_scaled, 2 * credits::CREDIT_SCALE);
+
+    // 停用配置：回落默认倍率。
+    model_service::update(
+        app.data(),
+        "demo-model",
+        aequi::model::ModelUpdate {
+            multiplier: None,
+            enabled: Some(false),
+        },
+    )
+    .await
+    .unwrap();
+
+    let outcome = charge_total(app.data(), &key, "demo-model", 10_000)
+        .await
+        .unwrap();
+    assert_eq!(outcome.credits_scaled, credits::CREDIT_SCALE);
+
+    // 重名创建被拒。
+    let error = model_service::create(
+        app.data(),
+        aequi::model::ModelCreate {
+            name: "demo-model".to_string(),
+            multiplier: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, aequi::Error::BadRequest(_)));
+
+    // 倍率必须是非负数。
+    let error = model_service::create(
+        app.data(),
+        aequi::model::ModelCreate {
+            name: "negative-model".to_string(),
+            multiplier: Some("-1".to_string()),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, aequi::Error::BadRequest(_)));
+
+    // 删除后同样回落默认。
+    model_service::delete(app.data(), "demo-model").await.unwrap();
+    let outcome = charge_total(app.data(), &key, "demo-model", 10_000)
+        .await
+        .unwrap();
+    assert_eq!(outcome.credits_scaled, credits::CREDIT_SCALE);
 }

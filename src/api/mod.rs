@@ -8,6 +8,7 @@ pub mod key_portal;
 pub mod keys;
 pub mod logs;
 pub mod middleware;
+pub mod models;
 pub mod otp;
 pub mod proxy_api;
 pub mod settings;

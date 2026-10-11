@@ -86,6 +86,16 @@ pub fn format_multiplier(bp: i64) -> String {
     format!("{whole}.{fraction:04}")
 }
 
+/// 解析倍率字符串（四位小数以内）为万分比整数。
+///
+/// 直接复用积分的解析：1 积分的刻度是 10000，万分比的刻度也是 10000，
+/// 两者量纲一致——这不是巧合，是同一套四位小数约定。
+/// 倍率不允许为负，非法输入返回 `None`。
+pub fn parse_multiplier(text: &str) -> Option<i64> {
+    let scaled = parse_credits(text)?;
+    (scaled >= 0).then_some(scaled)
+}
+
 /// 按倍率折算后的 token 量。
 pub fn final_tokens(raw_tokens: i64, multiplier_bp: i64) -> i64 {
     clamp(i128::from(raw_tokens) * i128::from(multiplier_bp) / i128::from(MULTIPLIER_SCALE))
