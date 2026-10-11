@@ -18,6 +18,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod model;
+pub mod proxy;
 pub mod server;
 pub mod service;
 pub mod utils;

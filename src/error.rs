@@ -31,6 +31,12 @@ pub enum Error {
     #[error("积分不足")]
     InsufficientCredits,
 
+    /// 上游返回了无法使用的结果（结构不对、5xx 等）。
+    ///
+    /// 502 比内部错误更贴切：错不在本服务，是上游的问题。
+    #[error("上游响应异常: {0}")]
+    UpstreamUnavailable(String),
+
     #[error("{0}")]
     NotFound(String),
 
@@ -56,6 +62,8 @@ impl Error {
             Error::Forbidden(_) => StatusCode::FORBIDDEN,
             // 402 比 403 更贴切：不是没权限，是余额不够。
             Error::InsufficientCredits => StatusCode::PAYMENT_REQUIRED,
+            // 上游的问题用 502 表达，别让用户以为是我们坏了。
+            Error::UpstreamUnavailable(_) => StatusCode::BAD_GATEWAY,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Database(_) | Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -71,6 +79,7 @@ impl Error {
             Error::InvalidTotp => "invalid_totp",
             Error::Forbidden(_) => "forbidden",
             Error::InsufficientCredits => "insufficient_credits",
+            Error::UpstreamUnavailable(_) => "upstream_unavailable",
             Error::NotFound(_) => "not_found",
             Error::Database(_) => "database_error",
             Error::Internal(_) => "internal_error",
