@@ -6,8 +6,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{ConnectInfo, Extension, State};
 use axum::http::{header, HeaderMap};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::Value;
 
@@ -18,13 +20,15 @@ use crate::proxy;
 use crate::AppState;
 
 /// `POST /v1/chat/completions`
+///
+/// `stream: true` 走 SSE（text/event-stream），其余返回普通 JSON。
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Extension(context): Extension<KeyContext>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Result<Json<Value>> {
+) -> Result<Response> {
     let settings = state.settings();
     let ip = resolve_client_ip(&headers, addr, settings.trust_proxy);
     let user_agent = headers
@@ -32,16 +36,26 @@ pub async fn chat_completions(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
 
-    let response = proxy::chat_completion(
-        &state,
-        &context.key,
-        &body,
-        &ip,
-        user_agent.as_deref(),
-    )
-    .await?;
+    if body.get("stream").and_then(Value::as_bool) == Some(true) {
+        let byte_stream = proxy::chat_completion_stream(
+            state.clone(),
+            context.key.clone(),
+            body,
+            ip,
+            user_agent,
+        )
+        .await?;
 
-    Ok(Json(response))
+        return Ok(Response::builder()
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .body(Body::from_stream(byte_stream))
+            .expect("SSE 响应的固定头不会构建失败"));
+    }
+
+    let response = proxy::chat_completion(&state, &context.key, &body, &ip, user_agent.as_deref())
+        .await?;
+    Ok(Json(response).into_response())
 }
 
 /// `POST /v1/images/generations`

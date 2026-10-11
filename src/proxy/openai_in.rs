@@ -8,19 +8,12 @@ use serde_json::{json, Map, Value};
 use crate::error::{Error, Result};
 
 use super::scheme::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Role, ToolCall, ToolDefinition,
+    ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Role, ToolCall, ToolCallDelta,
+    ToolDefinition, Usage,
 };
 
 /// 解析用户发来的对话请求。
 pub fn parse_request(body: &Value) -> Result<ChatRequest> {
-    // 流式（SSE）尚未支持：显式拒绝比静默返回非流式更诚实——
-    // 期待 SSE 的客户端拿到 JSON 只会解析失败，还以为是网络问题。
-    if body.get("stream").and_then(Value::as_bool) == Some(true) {
-        return Err(Error::BadRequest(
-            "暂不支持流式响应（stream=true），请去掉该字段".to_string(),
-        ));
-    }
-
     let model = body
         .get("model")
         .and_then(Value::as_str)
@@ -226,6 +219,102 @@ fn finish_reason_name(reason: FinishReason) -> &'static str {
     }
 }
 
+// ---------- 流式输出（SSE） ----------
+
+/// SSE 输出的公共骨架：`object` 固定为 `chat.completion.chunk`。
+fn render_stream_base(id: &str, created: i64, model: &str) -> serde_json::Map<String, Value> {
+    let mut object = serde_json::Map::new();
+    object.insert("id".to_string(), json!(id));
+    object.insert("object".to_string(), json!("chat.completion.chunk"));
+    object.insert("created".to_string(), json!(created));
+    object.insert("model".to_string(), json!(model));
+    object
+}
+
+/// 首个 chunk：只带角色，客户端靠它确认流已开始。
+pub fn render_stream_role(id: &str, created: i64, model: &str) -> Value {
+    let mut object = render_stream_base(id, created, model);
+    object.insert(
+        "choices".to_string(),
+        json!([{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }]),
+    );
+    Value::Object(object)
+}
+
+/// 内容增量 chunk：一段文本和/或工具调用分片。
+pub fn render_stream_delta(
+    id: &str,
+    created: i64,
+    model: &str,
+    text: &str,
+    tool_calls: &[ToolCallDelta],
+) -> Value {
+    let mut delta = serde_json::Map::new();
+    if !text.is_empty() {
+        delta.insert("content".to_string(), json!(text));
+    }
+    if !tool_calls.is_empty() {
+        delta.insert(
+            "tool_calls".to_string(),
+            Value::Array(
+                tool_calls
+                    .iter()
+                    .map(|call| {
+                        let mut function = serde_json::Map::new();
+                        if let Some(name) = &call.name {
+                            function.insert("name".to_string(), json!(name));
+                        }
+                        if let Some(fragment) = &call.arguments_fragment {
+                            function.insert("arguments".to_string(), json!(fragment));
+                        }
+
+                        let mut call_object = serde_json::Map::new();
+                        call_object.insert("index".to_string(), json!(call.index));
+                        if let Some(id) = &call.id {
+                            call_object.insert("id".to_string(), json!(id));
+                            call_object.insert("type".to_string(), json!("function"));
+                        }
+                        call_object.insert("function".to_string(), Value::Object(function));
+                        Value::Object(call_object)
+                    })
+                    .collect(),
+            ),
+        );
+    }
+
+    let mut object = render_stream_base(id, created, model);
+    object.insert(
+        "choices".to_string(),
+        json!([{ "index": 0, "delta": Value::Object(delta), "finish_reason": null }]),
+    );
+    Value::Object(object)
+}
+
+/// 结束 chunk：finish_reason 就位。
+pub fn render_stream_finish(id: &str, created: i64, model: &str, reason: FinishReason) -> Value {
+    let mut object = render_stream_base(id, created, model);
+    object.insert(
+        "choices".to_string(),
+        json!([{ "index": 0, "delta": {}, "finish_reason": finish_reason_name(reason) }]),
+    );
+    Value::Object(object)
+}
+
+/// 用量 chunk：OpenAI 的 include_usage 约定，choices 为空数组。
+pub fn render_stream_usage(id: &str, created: i64, model: &str, usage: Usage) -> Value {
+    let mut object = render_stream_base(id, created, model);
+    object.insert("choices".to_string(), json!([]));
+    object.insert(
+        "usage".to_string(),
+        json!({
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+        }),
+    );
+    Value::Object(object)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,26 +333,19 @@ mod tests {
     }
 
     #[test]
-    fn stream_true_is_rejected_explicitly() {
-        let body = json!({
+    fn stream_false_or_absent_is_fine() {
+        let absent = json!({
             "model": "gpt-x",
-            "stream": true,
             "messages": [{ "role": "user", "content": "hi" }]
         });
+        assert!(parse_request(&absent).is_ok());
 
-        let error = parse_request(&body).unwrap_err();
-        assert!(matches!(error, Error::BadRequest(_)), "stream=true 应得到明确的 400 而不是静默忽略");
-    }
-
-    #[test]
-    fn stream_false_is_fine() {
-        let body = json!({
+        let explicit_false = json!({
             "model": "gpt-x",
             "stream": false,
             "messages": [{ "role": "user", "content": "hi" }]
         });
-
-        assert!(parse_request(&body).is_ok());
+        assert!(parse_request(&explicit_false).is_ok());
     }
 
     #[test]

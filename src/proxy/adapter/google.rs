@@ -14,8 +14,8 @@ use super::{
     insert_if_present, parse_arguments, Adapter, AuthStyle, ProbeOutcome, UpstreamRequest,
 };
 use crate::proxy::scheme::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Role, ToolCall, ToolDefinition,
-    Usage,
+    ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Role, StreamEvent, ToolCall,
+    ToolCallDelta, ToolDefinition, Usage,
 };
 
 /// 列模型接口，探测密钥用。
@@ -78,6 +78,93 @@ impl Adapter for GoogleAdapter {
             path: format!("/v1beta/models/{model}:generateContent"),
             body: Some(Value::Object(body)),
         }
+    }
+
+    fn build_chat_stream(&self, request: &ChatRequest, model: &str) -> UpstreamRequest {
+        let mut upstream = self.build_chat(request, model);
+        if let Some(body) = &mut upstream.body {
+            if let Some(object) = body.as_object_mut() {
+                object.insert("stream".to_string(), Value::Bool(true));
+            }
+        }
+        // alt=sse 让 streamGenerateContent 以 SSE 而不是 JSON 数组流返回。
+        upstream.path = format!("{}?alt=sse", upstream.path);
+        upstream
+    }
+
+    /// Google 的流 chunk：candidates[].content.parts 里的文本与完整
+    /// functionCall，收尾 chunk 带 finishReason 与 usageMetadata。
+    ///
+    /// 限制：functionCall 不分片且不带序号，index 恒为 0——同一流内
+    /// 多个工具调用会被客户端聚合到同一槽位，真实场景里极少发生。
+    fn parse_stream_event(&self, payload: &str) -> Result<Vec<StreamEvent>> {
+        let value: Value = serde_json::from_str(payload).map_err(|error| {
+            Error::UpstreamUnavailable(format!("上游流载荷解析失败: {error}"))
+        })?;
+
+        let candidate = value.get("candidates").and_then(|c| c.get(0));
+        let mut events = Vec::new();
+
+        if let Some(parts) = candidate.and_then(|c| c.pointer("/content/parts")).and_then(Value::as_array) {
+            let mut text = String::new();
+            let mut tool_calls = Vec::new();
+
+            for part in parts {
+                if let Some(fragment) = part.get("text").and_then(Value::as_str) {
+                    text.push_str(fragment);
+                }
+                if let Some(call) = part.get("functionCall") {
+                    let name = text_at(call, "name");
+                    tool_calls.push(ToolCallDelta {
+                        index: 0,
+                        id: Some(format!("call_{name}")),
+                        name: Some(name),
+                        arguments_fragment: call
+                            .get("args")
+                            .map(Value::to_string),
+                    });
+                }
+            }
+
+            if !text.is_empty() || !tool_calls.is_empty() {
+                events.push(StreamEvent::Delta { text, tool_calls });
+            }
+        }
+
+        if let Some(reason) = candidate
+            .and_then(|c| c.get("finishReason"))
+            .and_then(Value::as_str)
+        {
+            events.push(StreamEvent::Finish {
+                finish_reason: finish_reason(Some(reason)),
+            });
+        }
+
+        if let Some(usage) = value.get("usageMetadata") {
+            let prompt_tokens = usage.get("promptTokenCount").and_then(Value::as_i64).unwrap_or(0);
+            let completion_tokens = usage
+                .get("candidatesTokenCount")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let cache_tokens = usage
+                .get("cachedContentTokenCount")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            if prompt_tokens > 0 || completion_tokens > 0 {
+                events.push(StreamEvent::Usage(Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens: usage
+                        .get("totalTokenCount")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(prompt_tokens + completion_tokens),
+                    cache_tokens,
+                    estimated: false,
+                }));
+            }
+        }
+
+        Ok(events)
     }
 
     fn parse_chat(&self, body: &Value) -> Result<ChatResponse> {

@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::error::Result;
 use crate::model::ApiFormat;
 
-use super::scheme::{ChatRequest, ChatResponse};
+use super::scheme::{ChatRequest, ChatResponse, StreamEvent};
 
 /// 发给上游的请求。
 ///
@@ -76,6 +76,26 @@ pub trait Adapter: Send + Sync {
 
     /// 生成对话请求。
     fn build_chat(&self, request: &ChatRequest, model: &str) -> UpstreamRequest;
+
+    /// 生成流式对话请求。
+    ///
+    /// 默认在非流式请求体上加 `stream: true`；各家有额外开关时自行覆写。
+    fn build_chat_stream(&self, request: &ChatRequest, model: &str) -> UpstreamRequest {
+        let mut upstream = self.build_chat(request, model);
+        if let Some(body) = &mut upstream.body {
+            if let Some(object) = body.as_object_mut() {
+                object.insert("stream".to_string(), Value::Bool(true));
+            }
+        }
+        upstream
+    }
+
+    /// 把一条上游 SSE 载荷翻译成标准流事件。
+    ///
+    /// 一条载荷可能产出多个事件（如 Anthropic 的 message_delta 同时带来
+    /// 结束原因与累计用量）；与流无关的载荷产出空 vec。
+    /// 翻译必须无状态——聚合、计费与收尾都在编排层。
+    fn parse_stream_event(&self, payload: &str) -> Result<Vec<StreamEvent>>;
 
     /// 解析对话响应。
     fn parse_chat(&self, body: &Value) -> Result<ChatResponse>;

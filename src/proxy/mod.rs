@@ -19,12 +19,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use serde_json::Value;
+use futures_util::{Stream as FutureStream, StreamExt};
+use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::model::{ApiKey, NewProxyLog, UpstreamBlock};
 use crate::proxy::adapter::{adapter_for, AuthStyle, UpstreamRequest};
-use crate::proxy::scheme::{ChatRequest, ChatResponse};
+use crate::proxy::scheme::{ChatRequest, ChatResponse, FinishReason, StreamEvent, Usage};
 use crate::service::{billing, upstream};
 use crate::utils::{random, time};
 use crate::AppState;
@@ -34,6 +35,7 @@ pub mod estimate;
 pub mod image;
 pub mod openai_in;
 pub mod scheme;
+pub mod sse;
 
 /// 一次请求最多换几把密钥重试。
 ///
@@ -204,6 +206,268 @@ struct DispatchOutcome {
     upstream_key_id: String,
 }
 
+/// 用量聚合：各字段取较大值。
+///
+/// 上游可能分多次报用量（如 Anthropic 的输入在流开头、输出在流末尾），
+/// 后到的累计值只会更大。
+fn merge_usage(into: &mut Usage, from: Usage) {
+    into.prompt_tokens = into.prompt_tokens.max(from.prompt_tokens);
+    into.completion_tokens = into.completion_tokens.max(from.completion_tokens);
+    into.cache_tokens = into.cache_tokens.max(from.cache_tokens);
+    into.total_tokens = into.total_tokens.max(from.total_tokens);
+}
+
+/// 编排一次流式对话，返回 SSE 字节流（`data: <json>\n\n` 帧）。
+///
+/// 上游错误在**流建立之前**才重试——此刻还没向客户端输出任何字节；
+/// 流一旦开始，中途错误以内联 error 帧发出（SSE 无法中途改状态码），
+/// 计费与日志在流收尾时落账。
+pub async fn chat_completion_stream(
+    state: Arc<AppState>,
+    key: ApiKey,
+    body: Value,
+    ip: String,
+    user_agent: Option<String>,
+) -> Result<impl FutureStream<Item = std::result::Result<Vec<u8>, std::io::Error>> + 'static> {
+    let started = Instant::now();
+    let pool = &state.store.data;
+
+    let request = openai_in::parse_request(&body)?;
+    if key.credits_scaled <= 0 {
+        return Err(Error::InsufficientCredits);
+    }
+
+    // 建流前的重试窗口。
+    let mut upstream = None;
+    let mut chosen: Option<(String, String, crate::model::ApiFormat)> = None;
+    let mut last_failure = None;
+
+    for _ in 0..MAX_ATTEMPTS {
+        let block = match upstream::select_block(pool, &state.upstream, &request.model).await {
+            Ok(block) => block,
+            Err(error) => return Err(error),
+        };
+        let upstream_key = match upstream::select_key(pool, &state.upstream, &block).await {
+            Ok(key) => key,
+            Err(error) => return Err(error),
+        };
+
+        let adapter = adapter_for(block.api_format);
+        let outgoing = adapter.build_chat_stream(&request, &block.target_model(&request.model));
+        let client = state.upstream.client(&block)?;
+
+        let context = Some((block.id.clone(), upstream_key.id.clone()));
+
+        match send_stream(&client, &block, &outgoing, adapter.auth_style(), &upstream_key.secret)
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                upstream = Some(response);
+                chosen = Some((block.id, upstream_key.id, block.api_format));
+                break;
+            }
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let detail = response.text().await.ok().and_then(|text| {
+                    serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|value| {
+                            value.pointer("/error/message").and_then(Value::as_str).map(str::to_string)
+                        })
+                }).unwrap_or_default();
+
+                if status == 429 {
+                    upstream::report_rate_limited(pool, &upstream_key).await;
+                    last_failure = Some(Failure::with_context(
+                        Error::UpstreamUnavailable("上游限流".to_string()),
+                        "上游限流".to_string(),
+                        context,
+                    ));
+                    continue;
+                }
+                if status == 401 || status == 403 || status >= 500 {
+                    upstream::report_failure(
+                        pool,
+                        &upstream_key,
+                        &format!("上游返回 {status} {detail}"),
+                    )
+                    .await;
+                    last_failure = Some(Failure::with_context(
+                        Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
+                        format!("上游返回 {status}"),
+                        context,
+                    ));
+                    continue;
+                }
+
+                return Err(Error::UpstreamUnavailable(format!(
+                    "上游返回 {status} {detail}"
+                )));
+            }
+            Err(error) => {
+                let user_message = error.to_string();
+                upstream::report_failure(pool, &upstream_key, &user_message).await;
+                last_failure = Some(Failure::with_context(error, user_message, context));
+            }
+        }
+    }
+
+    let Some(response) = upstream else {
+        let failure = last_failure.unwrap_or_else(|| {
+            Failure::bare(Error::UpstreamUnavailable("上游不可用".to_string()))
+        });
+        write_log(
+            pool,
+            base_log(&key, &ip, user_agent.as_deref(), started)
+                .model(request.model.clone())
+                .failed_with_context(&failure.error, failure.context),
+        )
+        .await;
+        if let Err(error) = crate::db::usage::insert_error(
+            pool,
+            &key.id,
+            &request.model,
+            &failure.user_message,
+            time::now_secs(),
+        )
+        .await
+        {
+            tracing::warn!(error = %error, "写入失败用量记录失败");
+        }
+        return Err(failure.error);
+    };
+
+    let Some((block_id, upstream_key_id, format)) = chosen else {
+        return Err(Error::UpstreamUnavailable("上游不可用".to_string()));
+    };
+
+    // 流的生命周期长于本函数，所有引用全部转为所有权。
+    let adapter = adapter_for(format);
+    let id = format!("chatcmpl-{}", random::string(24));
+    let created = time::now_secs();
+
+    let payload_stream = sse::sse_data_stream(response.bytes_stream());
+
+    let output = async_stream::stream! {
+        let pool = &state.store.data;
+        let mut text_acc = String::new();
+        let mut usage_acc = Usage::default();
+        let mut finished = false;
+        let mut sse = std::pin::pin!(payload_stream);
+
+        // 每条输出都是一行 `data: <json>` 加空行。
+        let frame = |value: Value| {
+            Ok::<Vec<u8>, std::io::Error>(format!("data: {value}\n\n").into_bytes())
+        };
+        let error_frame = |message: &str| {
+            format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({ "error": { "message": message, "type": "upstream_unavailable" } })
+            )
+            .into_bytes()
+        };
+
+        yield frame(openai_in::render_stream_role(&id, created, &request.model));
+
+        while let Some(item) = sse.next().await {
+            let payload = match item {
+                Ok(payload) => payload,
+                Err(error) => {
+                    yield Err(std::io::Error::other(error.to_string()));
+                    return;
+                }
+            };
+
+            let events = match adapter.parse_stream_event(&payload) {
+                Ok(events) => events,
+                Err(error) => {
+                    yield Ok(error_frame(&error.to_string()));
+                    return;
+                }
+            };
+
+            for event in events {
+                match event {
+                    StreamEvent::Delta { text, tool_calls } => {
+                        text_acc.push_str(&text);
+                        yield frame(openai_in::render_stream_delta(
+                            &id, created, &request.model, &text, &tool_calls,
+                        ));
+                    }
+                    StreamEvent::Finish { finish_reason } => {
+                        if !finished {
+                            finished = true;
+                            yield frame(openai_in::render_stream_finish(
+                                &id, created, &request.model, finish_reason,
+                            ));
+                        }
+                    }
+                    StreamEvent::Usage(usage) => merge_usage(&mut usage_acc, usage),
+                    StreamEvent::End => {}
+                }
+            }
+        }
+
+        // 上游没发结束原因就补一个 Stop，避免客户端把流挂起。
+        if !finished {
+            yield frame(openai_in::render_stream_finish(
+                &id, created, &request.model, FinishReason::Stop,
+            ));
+        }
+
+        // 计费：上游报的用量聚合；没报就按聚合出来的文本估算。
+        let mut usage = usage_acc;
+        if usage.total_tokens == 0 {
+            usage = estimate::estimate_usage(&request, &text_acc);
+        } else {
+            usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+        }
+
+        match billing::charge(pool, &key, &request.model, usage).await {
+            Ok(charge) => {
+                write_log(
+                    pool,
+                    base_log(&key, &ip, user_agent.as_deref(), started)
+                        .model(request.model.clone())
+                        .block(&block_id)
+                        .upstream_key(&upstream_key_id)
+                        .succeeded(charge.usage, charge.credits_scaled)
+                        .to_success_log(),
+                )
+                .await;
+
+                tracing::info!(
+                    model = %request.model,
+                    block = %block_id,
+                    tokens = charge.usage.total_tokens,
+                    estimated = charge.usage.estimated,
+                    credits = %charge.credits_scaled,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    stream = true,
+                    "对话请求完成"
+                );
+
+                yield frame(openai_in::render_stream_usage(
+                    &id, created, &request.model, charge.usage,
+                ));
+                yield Ok(b"data: [DONE]\n\n".to_vec());
+            }
+            Err(error) => {
+                write_log(
+                    pool,
+                    base_log(&key, &ip, user_agent.as_deref(), started)
+                        .model(request.model.clone())
+                        .failed_with_context(&error, Some((block_id, upstream_key_id))),
+                )
+                .await;
+                yield Ok(error_frame(&error.to_string()));
+            }
+        }
+    };
+
+    Ok(output)
+}
+
 /// 挑块、挑密钥、发送、解析、计费。
 ///
 /// 失败返回 [`Failure`]：管理员错误与密钥侧的脱敏描述分开展示。
@@ -353,6 +617,34 @@ async fn dispatch(
         .unwrap_or_else(|| Failure::bare(Error::UpstreamUnavailable("上游不可用".to_string()))))
 }
 
+/// 组装发往上游的请求（路径、认证头、各家额外头）。
+fn prepare_request(
+    client: &reqwest::Client,
+    block: &UpstreamBlock,
+    request: &UpstreamRequest,
+    style: AuthStyle,
+    key: &str,
+) -> reqwest::RequestBuilder {
+    let url = format!("{}{}", block.base_url.trim_end_matches('/'), request.path);
+
+    let builder = match &request.body {
+        Some(body) => client.post(&url).json(body),
+        None => client.get(&url),
+    };
+
+    let builder = match style {
+        AuthStyle::Bearer => builder.bearer_auth(key),
+        AuthStyle::XApiKey => builder.header("x-api-key", key),
+        AuthStyle::GoogleApiKey => builder.header("x-goog-api-key", key),
+    };
+
+    let mut builder = builder;
+    for (name, value) in adapter_for(block.api_format).extra_headers() {
+        builder = builder.header(name, value);
+    }
+    builder
+}
+
 /// 把请求发给上游，返回状态码与响应体。
 ///
 /// 网络错误与超时都归为 Err；HTTP 状态码原样返回，由调用方分类处理——
@@ -364,24 +656,7 @@ pub async fn send(
     style: AuthStyle,
     key: &str,
 ) -> Result<(u16, Value)> {
-    let url = format!("{}{}", block.base_url.trim_end_matches('/'), request.path);
-
-    let mut builder = match &request.body {
-        Some(body) => client.post(&url).json(body),
-        None => client.get(&url),
-    };
-
-    builder = match style {
-        AuthStyle::Bearer => builder.bearer_auth(key),
-        AuthStyle::XApiKey => builder.header("x-api-key", key),
-        AuthStyle::GoogleApiKey => builder.header("x-goog-api-key", key),
-    };
-
-    for (name, value) in adapter_for(block.api_format).extra_headers() {
-        builder = builder.header(name, value);
-    }
-
-    let response = builder
+    let response = prepare_request(client, block, request, style, key)
         .send()
         .await
         .map_err(|error| Error::UpstreamUnavailable(format!("请求上游失败: {error}")))?;
@@ -391,6 +666,20 @@ pub async fn send(
     let body = response.json::<Value>().await.unwrap_or(Value::Null);
 
     Ok((status, body))
+}
+
+/// 建立流式上游请求，返回原始响应供调用方消费字节流。
+pub async fn send_stream(
+    client: &reqwest::Client,
+    block: &UpstreamBlock,
+    request: &UpstreamRequest,
+    style: AuthStyle,
+    key: &str,
+) -> Result<reqwest::Response> {
+    prepare_request(client, block, request, style, key)
+        .send()
+        .await
+        .map_err(|error| Error::UpstreamUnavailable(format!("请求上游失败: {error}")))
 }
 
 /// 一条日志的雏形：请求方信息固定，结果由各分支补齐。

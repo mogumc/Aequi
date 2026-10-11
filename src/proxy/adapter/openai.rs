@@ -10,8 +10,8 @@ use crate::model::ApiFormat;
 
 use super::{insert_if_present, Adapter, AuthStyle, ProbeOutcome, UpstreamRequest};
 use crate::proxy::scheme::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Role, ToolCall, ToolDefinition,
-    Usage,
+    ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Role, StreamEvent, ToolCall,
+    ToolCallDelta, ToolDefinition, Usage,
 };
 
 /// 对话接口。
@@ -65,6 +65,86 @@ impl Adapter for OpenAiAdapter {
             path: CHAT_PATH.to_string(),
             body: Some(Value::Object(body)),
         }
+    }
+
+    fn build_chat_stream(&self, request: &ChatRequest, model: &str) -> UpstreamRequest {
+        let mut upstream = self.build_chat(request, model);
+        if let Some(body) = &mut upstream.body {
+            if let Some(object) = body.as_object_mut() {
+                object.insert("stream".to_string(), Value::Bool(true));
+                // 请求上游在流末尾单独发一个只含 usage 的 chunk，计费才有依据。
+                object.insert(
+                    "stream_options".to_string(),
+                    json!({ "include_usage": true }),
+                );
+            }
+        }
+        upstream
+    }
+
+    fn parse_stream_event(&self, payload: &str) -> Result<Vec<StreamEvent>> {
+        if payload.trim() == "[DONE]" {
+            return Ok(vec![StreamEvent::End]);
+        }
+
+        let value: Value = serde_json::from_str(payload).map_err(|error| {
+            Error::UpstreamUnavailable(format!("上游流载荷解析失败: {error}"))
+        })?;
+
+        // 只含 usage 的收尾 chunk（include_usage 模式）。
+        if value.get("choices").and_then(Value::as_array).is_none_or(|c| c.is_empty()) {
+            let usage = parse_usage(value.get("usage"));
+            if usage.total_tokens > 0 {
+                return Ok(vec![StreamEvent::Usage(usage)]);
+            }
+            return Ok(Vec::new());
+        }
+
+        let choice = &value["choices"][0];
+        let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
+
+        let text = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let tool_calls: Vec<ToolCallDelta> = delta
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|call| {
+                        let function = call.get("function")?;
+                        Some(ToolCallDelta {
+                            index: call
+                                .get("index")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0) as usize,
+                            id: call.get("id").and_then(Value::as_str).map(str::to_string),
+                            name: function.get("name").and_then(Value::as_str).map(str::to_string),
+                            arguments_fragment: function
+                                .get("arguments")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut events = Vec::new();
+        if !text.is_empty() || !tool_calls.is_empty() {
+            events.push(StreamEvent::Delta { text, tool_calls });
+        }
+
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            events.push(StreamEvent::Finish {
+                finish_reason: finish_reason(Some(reason)),
+            });
+        }
+
+        Ok(events)
     }
 
     fn parse_chat(&self, body: &Value) -> Result<ChatResponse> {

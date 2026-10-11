@@ -13,8 +13,8 @@ use super::{
     insert_if_present, parse_arguments, Adapter, AuthStyle, ProbeOutcome, UpstreamRequest,
 };
 use crate::proxy::scheme::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Role, ToolCall, ToolDefinition,
-    Usage,
+    ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Role, StreamEvent, ToolCall,
+    ToolCallDelta, ToolDefinition, Usage,
 };
 
 /// 对话接口。
@@ -82,6 +82,135 @@ impl Adapter for AnthropicAdapter {
         UpstreamRequest {
             path: CHAT_PATH.to_string(),
             body: Some(Value::Object(body)),
+        }
+    }
+
+    fn build_chat_stream(&self, request: &ChatRequest, model: &str) -> UpstreamRequest {
+        let mut upstream = self.build_chat(request, model);
+        if let Some(body) = &mut upstream.body {
+            if let Some(object) = body.as_object_mut() {
+                object.insert("stream".to_string(), Value::Bool(true));
+            }
+        }
+        upstream
+    }
+
+    /// Anthropic 的流事件：content_block_start / content_block_delta /
+    /// message_delta / message_stop。
+    ///
+    /// 工具调用的 index 直接沿用 Anthropic 的内容块序号——客户端按 index
+    /// 聚合分片，序号在同一流内一致即可，不必从 0 连续。
+    fn parse_stream_event(&self, payload: &str) -> Result<Vec<StreamEvent>> {
+        let value: Value = serde_json::from_str(payload).map_err(|error| {
+            Error::UpstreamUnavailable(format!("上游流载荷解析失败: {error}"))
+        })?;
+
+        match value.get("type").and_then(Value::as_str) {
+            Some("content_block_start") => {
+                let block = value.get("content_block").cloned().unwrap_or(Value::Null);
+                if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                    return Ok(Vec::new());
+                }
+
+                let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                Ok(vec![StreamEvent::Delta {
+                    text: String::new(),
+                    tool_calls: vec![ToolCallDelta {
+                        index,
+                        id: Some(text_at(&block, "id")),
+                        name: Some(text_at(&block, "name")),
+                        arguments_fragment: None,
+                    }],
+                }])
+            }
+            Some("content_block_delta") => {
+                let delta = value.get("delta").cloned().unwrap_or(Value::Null);
+                let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        let text = delta.get("text").and_then(Value::as_str).unwrap_or("");
+                        if text.is_empty() {
+                            Ok(Vec::new())
+                        } else {
+                            Ok(vec![StreamEvent::Delta {
+                                text: text.to_string(),
+                                tool_calls: Vec::new(),
+                            }])
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        let fragment = delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if fragment.is_empty() {
+                            Ok(Vec::new())
+                        } else {
+                            Ok(vec![StreamEvent::Delta {
+                                text: String::new(),
+                                tool_calls: vec![ToolCallDelta {
+                                    index,
+                                    id: None,
+                                    name: None,
+                                    arguments_fragment: Some(fragment.to_string()),
+                                }],
+                            }])
+                        }
+                    }
+                    _ => Ok(Vec::new()),
+                }
+            }
+            // 结束原因与累计的输出用量在同一条 message_delta 里，产出两个事件。
+            Some("message_delta") => {
+                let mut events = Vec::new();
+
+                if let Some(reason) = value.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                    events.push(StreamEvent::Finish {
+                        finish_reason: finish_reason(Some(reason)),
+                    });
+                }
+
+                let prompt_tokens = value
+                    .pointer("/usage/input_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let completion_tokens = value
+                    .pointer("/usage/output_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                if prompt_tokens > 0 || completion_tokens > 0 {
+                    events.push(StreamEvent::Usage(Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                        cache_tokens: 0,
+                        estimated: false,
+                    }));
+                }
+
+                Ok(events)
+            }
+            // 输入用量在流开头就报了，与 message_delta 的输出分开——编排层聚合。
+            Some("message_start") => {
+                let prompt_tokens = value
+                    .pointer("/message/usage/input_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                if prompt_tokens > 0 {
+                    Ok(vec![StreamEvent::Usage(Usage {
+                        prompt_tokens,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                        cache_tokens: 0,
+                        estimated: false,
+                    })])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            Some("message_stop") => Ok(vec![StreamEvent::End]),
+            _ => Ok(Vec::new()),
         }
     }
 

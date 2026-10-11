@@ -182,6 +182,38 @@ pub struct ChatResponse {
     pub usage: Usage,
 }
 
+/// 流式输出的一个工具调用增量。
+///
+/// 与 OpenAI 的分片约定一致：客户端按 `index` 拼接 `arguments_fragment`。
+#[derive(Debug, Clone)]
+pub struct ToolCallDelta {
+    pub index: usize,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub arguments_fragment: Option<String>,
+}
+
+/// 上游流式事件翻译后的标准形态。
+///
+/// adapter 只负责把各家的 SSE 载荷翻译成这些事件；
+/// 增量聚合、计费与输出收尾由编排层统一处理。
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// 内容增量：一段文本和/或工具调用分片。
+    Delta {
+        text: String,
+        tool_calls: Vec<ToolCallDelta>,
+    },
+    /// 内容结束，结束原因就位。
+    Finish {
+        finish_reason: FinishReason,
+    },
+    /// 用量上报（通常在流末尾出现一次）。
+    Usage(Usage),
+    /// 上游声明流结束（OpenAI 的 `data: [DONE]`；其它家流自然结束时不发）。
+    End,
+}
+
 impl ChatResponse {
     /// 把文本内容拼成一串，供日志与简单场景使用。
     pub fn text(&self) -> String {
