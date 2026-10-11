@@ -43,3 +43,33 @@ pub async fn chat_completions(
 
     Ok(Json(response))
 }
+
+/// `POST /v1/images/generations`
+///
+/// 生图协议与对话共用同一套认证、调度与双轨日志；上游侧目前只有
+/// OpenAI 格式的块支持。
+pub async fn images_generations(
+    State(state): State<Arc<AppState>>,
+    Extension(context): Extension<KeyContext>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>> {
+    let settings = state.settings();
+    let ip = resolve_client_ip(&headers, addr, settings.trust_proxy);
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
+    let response = proxy::image::images_generations(
+        &state,
+        &context.key,
+        &body,
+        &ip,
+        user_agent.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(response))
+}

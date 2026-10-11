@@ -31,6 +31,7 @@ use crate::AppState;
 
 pub mod adapter;
 pub mod estimate;
+pub mod image;
 pub mod openai_in;
 pub mod scheme;
 
