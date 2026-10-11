@@ -972,31 +972,50 @@ async fn password_change_verifies_current_and_revokes_other_devices() {
 }
 
 #[tokio::test]
-async fn cli_reset_sets_password_without_the_current_one() {
+async fn cli_reset_generates_a_fresh_random_password() {
     let app = TestApp::new().await;
     let account_id = app.seed_account().await;
 
-    // 命令行重置不问旧密码——那恰恰是忘掉的东西
-    aequi::service::auth::reset_password(app.state.pool(), account_id, "reset-secret")
+    // 重置不接受外部密码，直接生成一个新的——与首次初始化同一口径
+    let password = aequi::service::auth::reset_password(app.state.pool(), account_id)
         .await
         .expect("重置应当成功");
 
+    assert_eq!(password.len(), 24, "应与初始化一致：24 位");
+    assert!(
+        password.chars().all(|c| c.is_ascii_alphanumeric()),
+        "应为字母加数字"
+    );
+
+    // 新密码可用
     let response = app
         .router()
         .oneshot(json_request(
             Method::POST,
             "/api/auth/login",
-            json!({ "username": DEMO_USERNAME, "password": "reset-secret" }),
+            json!({ "username": DEMO_USERNAME, "password": password }),
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK, "重置后的新密码应当可用");
 
-    // 空密码仍然被拒
-    let error = aequi::service::auth::reset_password(app.state.pool(), account_id, "")
+    // 旧密码立即失效
+    let response = app
+        .router()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/auth/login",
+            json!({ "username": DEMO_USERNAME, "password": DEMO_PASSWORD }),
+        ))
         .await
-        .expect_err("空密码应当被拒绝");
-    assert!(matches!(error, aequi::Error::BadRequest(_)));
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // 每次重置都是新密码
+    let again = aequi::service::auth::reset_password(app.state.pool(), account_id)
+        .await
+        .expect("再次重置应当成功");
+    assert_ne!(password, again, "两次重置不应得到同一个密码");
 }
 
 /// 用与验证器 App 相同的方式算出当前验证码。

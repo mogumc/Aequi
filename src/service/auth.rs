@@ -237,18 +237,19 @@ pub async fn sole_account(pool: &SqlitePool) -> Result<Account> {
         .ok_or_else(|| Error::NotFound("账号尚未初始化，请先启动一次服务".to_string()))
 }
 
-/// 直接设定新密码，不校验旧密码。
+/// 重置密码：随机生成一个写入，并把明文返回给调用方打印一次。
 ///
-/// 供命令行重置使用：能在这台机器上执行命令的人本就掌握着整个服务，
-/// 再要一次旧密码没有意义——那恰恰是忘记的东西。
-pub async fn reset_password(pool: &SqlitePool, account_id: i64, new_password: &str) -> Result<()> {
-    ensure_password_usable(new_password)?;
+/// 刻意**不接受外部传入的密码**。这样口令只有两个来源——初始化时的随机生成，
+/// 或者后台里带着当前密码的修改。任何入口都塞不进一个来历不明的口令，
+/// 也就不存在「多个地方都能改数据」的口子。
+pub async fn reset_password(pool: &SqlitePool, account_id: i64) -> Result<String> {
+    let new_password = random::string(INITIAL_PASSWORD_LEN);
+    let hash = password::hash(new_password.clone()).await?;
 
-    let hash = password::hash(new_password.to_string()).await?;
     db::account::update_password(pool, account_id, &hash, time::now_secs()).await?;
 
     tracing::info!(account_id, "已通过命令行重置密码");
-    Ok(())
+    Ok(new_password)
 }
 
 /// 修改密码，返回被撤销的其它设备数。

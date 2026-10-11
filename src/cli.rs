@@ -40,7 +40,7 @@ pub fn print_help() {
 
 用法:
   aequi                 启动服务
-  aequi reset-password  重置账号密码（忘记密码时使用）
+  aequi reset-password  把账号密码重置为新的随机值（忘记密码时使用）
   aequi help            显示本帮助
 
 环境变量:
@@ -53,6 +53,9 @@ pub fn print_help() {
 }
 
 /// 重置账号密码。
+///
+/// 新密码完全由软件随机生成并打印一次，这里不接受任何输入——与首次启动的
+/// 初始化保持同一套口径。想换成自己记得住的密码，请登录后台用当前密码修改。
 pub async fn reset_password(bootstrap: &Bootstrap) -> anyhow::Result<()> {
     // 先确认库已存在。连库会顺手把文件创建出来，那样下次正常启动就会被误判成
     // 「非首次」，从而跳过初始账号的初始化，把首次启动的环境变量也一并吞掉。
@@ -65,37 +68,24 @@ pub async fn reset_password(bootstrap: &Bootstrap) -> anyhow::Result<()> {
     db::migrate_control(&pool).await?;
 
     let account = service::auth::sole_account(&pool).await?;
+    let password = service::auth::reset_password(&pool, account.id).await?;
 
-    println!("将重置账号 {} 的密码。", account.username);
-    let new_password = prompt_new_password()?;
-
-    service::auth::reset_password(&pool, account.id, &new_password).await?;
-
-    println!("密码已更新，请用新密码登录。");
+    print_reset_credentials(&account.username, &password);
     Ok(())
 }
 
-/// 交互式读取新密码，要求输入两次且一致。
+/// 打印重置后的凭据。
 ///
-/// 输入不回显。不一致或为空时重来而不是直接退出——使用者此刻很可能正着急。
-fn prompt_new_password() -> anyhow::Result<String> {
-    loop {
-        let first = rpassword::prompt_password("输入新密码: ")?;
-
-        if first.is_empty() {
-            println!("密码不能为空，请重试。");
-            continue;
-        }
-
-        let second = rpassword::prompt_password("再次输入新密码: ")?;
-
-        if first != second {
-            println!("两次输入不一致，请重试。");
-            continue;
-        }
-
-        return Ok(first);
-    }
+/// 用户名保持不变，只换密码；密码只在这里出现这一次。
+fn print_reset_credentials(username: &str, password: &str) {
+    println!();
+    println!("================= Aequi 密码已重置 =================");
+    println!("  用户名 : {username}");
+    println!("  密码   : {password}");
+    println!();
+    println!("  该密码为随机生成，仅显示这一次，请立即妥善保存。");
+    println!("===================================================");
+    println!();
 }
 
 #[cfg(test)]
