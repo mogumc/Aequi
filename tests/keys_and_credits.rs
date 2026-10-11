@@ -501,3 +501,93 @@ async fn admin_can_top_up_and_limits_are_sane() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn charging_a_disabled_key_reports_forbidden_not_insufficient() {
+    let app = TestApp::new().await;
+    let (key, _secret) = app.make_key("10", Vec::new()).await;
+
+    // 管理员把它停用，但调用方手里还是停用前的快照
+    key_service::update(
+        app.data(),
+        &key.id,
+        aequi::model::KeyUpdate {
+            enabled: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let error = billing::charge(app.data(), &key, "demo-model", 100)
+        .await
+        .expect_err("停用的密钥不应扣费成功");
+    assert!(
+        matches!(error, Error::Forbidden(_)),
+        "应报权限问题，而不是误导成余额问题"
+    );
+    assert_eq!(error.status(), StatusCode::FORBIDDEN);
+
+    // 余额没有被误扣
+    let current = key_service::get(app.data(), &key.id).await.unwrap();
+    assert_eq!(credits::format_credits(current.credits_scaled), "10.0000");
+
+    // 确实余额不足时，仍然是 402
+    let (poor, _poor_secret) = app.make_key("0.0001", Vec::new()).await;
+    let error = billing::charge(app.data(), &poor, "demo-model", 100)
+        .await
+        .expect_err("余额不足应当报错");
+    assert!(matches!(error, Error::InsufficientCredits));
+    assert_eq!(error.status(), StatusCode::PAYMENT_REQUIRED);
+}
+
+#[tokio::test]
+async fn deleting_a_key_cascades_its_usage_records() {
+    let app = TestApp::new().await;
+    let (key, _secret) = app.make_key("10", Vec::new()).await;
+
+    billing::charge(app.data(), &key, "demo-model", 5_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        key_service::usage(app.data(), &key.id, 10).await.unwrap().len(),
+        1
+    );
+
+    key_service::delete(app.data(), &key.id).await.unwrap();
+
+    // 记录随密钥一起清掉，不留下无主的孤儿数据
+    assert_eq!(
+        key_service::usage(app.data(), &key.id, 10).await.unwrap().len(),
+        0
+    );
+    assert_eq!(
+        key_service::usage_summary(app.data(), &key.id)
+            .await
+            .unwrap()
+            .requests,
+        0
+    );
+}
+
+#[tokio::test]
+async fn usage_limit_is_clamped_by_the_data_layer() {
+    let app = TestApp::new().await;
+    let (key, _secret) = app.make_key("10", Vec::new()).await;
+
+    for _ in 0..3 {
+        billing::charge(app.data(), &key, "demo-model", 1)
+            .await
+            .unwrap();
+    }
+
+    // 负数在 SQLite 里表示「不设上限」，必须被数据层挡住
+    let records = key_service::usage(app.data(), &key.id, -1).await.unwrap();
+    assert_eq!(records.len(), 1, "负数 limit 应被收敛为 1");
+
+    // 超上限的值收敛到数据层允许的最大值，这里只有 3 条，就返回 3 条
+    let records = key_service::usage(app.data(), &key.id, 999_999)
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 3);
+}
