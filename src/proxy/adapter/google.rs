@@ -10,6 +10,8 @@
 //! 都不能出现在输入里，所以多轮工具对话要把「assistant 的调用」折叠掉、
 //! 把「工具结果」伪装成一段 `user_input` 文本补回去。
 
+use std::collections::HashMap;
+
 use serde_json::{Map, Value, json};
 
 use crate::error::{Error, Result};
@@ -17,7 +19,7 @@ use crate::model::ApiFormat;
 
 use super::{Adapter, AuthStyle, ProbeOutcome, UpstreamRequest};
 use crate::proxy::scheme::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, Role, StreamEvent, ToolCall,
+    ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Role, StreamEvent, ToolCall,
     ToolCallDelta, Usage,
 };
 
@@ -358,15 +360,22 @@ impl Adapter for GoogleAdapter {
 
 /// 把标准请求折成 Interactions API 的 body。
 ///
-/// 多轮工具对话按官方文档（api-revision 2026-05-20）回放：`store: false` 的
-/// 无状态模式下，模型生成的 `function_call` 步骤要**原样**放进历史，
-/// 工具结果用 `function_result` 形态（name + call_id + result 数组）。
-/// 早期版本的 API 拒绝这两种输入，旧版 Aequi 因此把调用折叠、把结果伪装成
-/// user_input 文本——现在官方已经支持，伪装反而会让模型看不到自己上轮
-/// 发起过调用，下一轮就把调用意图退化写成正文里的伪标记。
+/// 多轮工具对话沿用旧版 Aequi 的方式：assistant 的调用折叠（只留
+/// id→名字映射），工具结果伪装成「[Tool 名字 result] 正文」的 user_input。
+/// 官方的 function_call/function_result 回放要求调用与结果严格交错，而
+/// 平台侧难以保证历史结构恰好满足（实测会 400）；伪装方式经过线上长期
+/// 验证，工具定义照常传、真调用照常返回，只有历史回放这一环走伪装。
 fn build_body(request: &ChatRequest, model: &str, stream: bool) -> Value {
     let mut input = Vec::new();
     let mut system_parts: Vec<String> = Vec::new();
+
+    // 多轮工具对话采用旧版 Aequi 的方式：assistant 的调用折叠（只留
+    // id→名字映射），工具结果伪装成「[Tool 名字 result] 正文」的 user_input。
+    // 官方的 function_call/function_result 回放要求调用与结果严格交错，
+    // 而平台侧难以保证历史结构恰好满足，线上验证过的伪装方式更稳——
+    // 工具定义照常传给模型（tools 字段），模型发起的真调用也照常返回
+    // 给客户端（function_call 形态），只有**历史回放**这一环走伪装。
+    let mut call_names: HashMap<String, String> = HashMap::new();
 
     for message in &request.messages {
         match message.role {
@@ -382,15 +391,7 @@ fn build_body(request: &ChatRequest, model: &str, stream: bool) -> Value {
                     push_input(&mut input, "model_output", &message.content);
                 } else {
                     for call in &message.tool_calls {
-                        // arguments 在响应里是对象，回放时也要对象形态。
-                        let arguments: Value =
-                            serde_json::from_str(&call.arguments).unwrap_or(json!({}));
-                        input.push(json!({
-                            "type": "function_call",
-                            "id": call.id,
-                            "name": call.name,
-                            "arguments": arguments,
-                        }));
+                        call_names.insert(call.id.clone(), call.name.clone());
                     }
                 }
             }
@@ -399,24 +400,26 @@ fn build_body(request: &ChatRequest, model: &str, stream: bool) -> Value {
                     .name
                     .clone()
                     .or_else(|| {
-                        message.tool_call_id.as_ref().map(|id| {
-                            // 名字缺失时用调用 id 占位：call_id 才是官方的
-                            // 关联键，占位只影响可读性不影响配对。
-                            format!("call_{id}")
-                        })
+                        message
+                            .tool_call_id
+                            .as_ref()
+                            .and_then(|id| call_names.get(id).cloned())
                     })
                     .unwrap_or_default();
                 // MCP 客户端常把结果双重编码成 JSON 字符串，先解开一层。
                 let text = unwrap_json_content(&message.text());
-                // 空结果不发——result 为空的条目会被整个拒掉。
+                // 空结果不发——content 为空的条目会被整个拒掉。
                 if text.is_empty() {
                     continue;
                 }
+                let text = if name.is_empty() {
+                    text
+                } else {
+                    format!("[Tool {name} result]\n{text}")
+                };
                 input.push(json!({
-                    "type": "function_result",
-                    "name": name,
-                    "call_id": message.tool_call_id,
-                    "result": [{"type": "text", "text": text}],
+                    "type": "user_input",
+                    "content": [{"type": "text", "text": text}],
                 }));
             }
         }
@@ -607,10 +610,10 @@ mod tests {
     }
 
     #[test]
-    fn tool_history_replays_as_function_call_and_result() {
-        // store:false 的无状态模式要求把模型生成的 function_call 步骤原样
-        // 回放进历史，工具结果用官方的 function_result 形态——否则模型
-        // 看不到自己上轮发起过调用，下一轮会把调用意图写成正文伪标记。
+    fn tool_history_is_replayed_as_user_input_text() {
+        // 沿用旧版 Aequi 的伪装方式：assistant 的调用折叠，工具结果伪装成
+        // 「[Tool 名字 result] 正文」的 user_input——避开官方对调用与结果
+        // 严格交错的约束。工具定义本身照常传给模型（tools 字段）。
         let request = request(vec![
             user_message("查下天气"),
             Message {
@@ -636,25 +639,21 @@ mod tests {
         let body = build_body(&request, "gemini-3.5-flash-lite", false);
         let input = body["input"].as_array().unwrap();
 
-        // user_input + function_call + function_result 三条。
-        assert_eq!(input.len(), 3);
+        assert_eq!(input.len(), 2);
         assert_eq!(input[0]["type"], "user_input");
-        // assistant 的调用原样回放：id / name / arguments（对象形态）。
-        assert_eq!(input[1]["type"], "function_call");
-        assert_eq!(input[1]["id"], "call-1");
-        assert_eq!(input[1]["name"], "get_weather");
-        assert_eq!(input[1]["arguments"]["location"], "北京");
-        // 工具结果用官方的 function_result 形态。
-        assert_eq!(input[2]["type"], "function_result");
-        assert_eq!(input[2]["name"], "get_weather");
-        assert_eq!(input[2]["call_id"], "call-1");
-        assert_eq!(input[2]["result"][0]["text"], "晴，25 度");
+        assert_eq!(input[1]["type"], "user_input");
+        assert_eq!(
+            input[1]["content"][0]["text"],
+            "[Tool get_weather result]\n晴，25 度"
+        );
+        // input 里不允许出现 function_call / function_result 形态。
+        for item in input {
+            assert_ne!(item["type"], "function_call");
+            assert_ne!(item["type"], "function_result");
+        }
         // 系统级字段
         assert_eq!(body["store"], false);
-        assert!(
-            body.get("stream").is_none(),
-            "非流式 body 不该有 stream 字段"
-        );
+        assert!(body.get("stream").is_none(), "非流式 body 不该有 stream 字段");
     }
 
     #[test]
