@@ -1,0 +1,234 @@
+//! 请求目标的解析：模型名前缀（块命名空间）与 `X-Aequi-Block` 请求头。
+//!
+//! 所有凭据均为测试用假数据，不涉及任何真实服务。
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use aequi::config::Settings;
+use aequi::db;
+use aequi::model::BlockCreate;
+use aequi::service::upstream as upstream_service;
+use aequi::utils::random;
+use aequi::{model::ApiFormat, AppState, Error};
+
+const DEMO_MOCK_URL: &str = "https://mock-upstream.invalid";
+
+struct TestApp {
+    state: Arc<AppState>,
+    dir: PathBuf,
+}
+
+impl TestApp {
+    async fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("aequi-routing-{}", random::string(12)));
+        std::fs::create_dir_all(&dir).expect("创建临时目录失败");
+
+        let store = db::Store::connect(&dir.join("test.db"), &dir.join("test-data.db"))
+            .await
+            .expect("建库失败");
+        store.migrate().await.expect("建表失败");
+
+        aequi::service::settings::ensure(&store.control)
+            .await
+            .expect("初始化设置失败");
+
+        let state = Arc::new(AppState::new(Settings::default(), store));
+        Self { state, dir }
+    }
+
+    fn data(&self) -> &sqlx::SqlitePool {
+        &self.state.store.data
+    }
+
+    /// 建一个块，模型条目按 `(name, multiplier_bp)` 给。
+    async fn add_block(&self, id: &str, models: &[&str]) -> Result<(), Error> {
+        upstream_service::create_block(
+            self.data(),
+            BlockCreate {
+                id: id.to_string(),
+                name: id.to_string(),
+                api_format: ApiFormat::Openai,
+                weight: 1,
+                base_url: DEMO_MOCK_URL.to_string(),
+                proxy: None,
+                models: models
+                    .iter()
+                    .map(|name| aequi::model::ModelEntry {
+                        name: name.to_string(),
+                        forward: None,
+                        multiplier_bp: 10_000,
+                    })
+                    .collect(),
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
+impl Drop for TestApp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[tokio::test]
+async fn plain_model_name_does_not_lock_a_block() {
+    let app = TestApp::new().await;
+    app.add_block("block-a", &["demo-model"]).await.unwrap();
+    app.add_block("block-b", &["demo-model"]).await.unwrap();
+
+    let target = upstream_service::resolve_target(app.data(), "demo-model")
+        .await
+        .unwrap();
+
+    assert_eq!(target.model, "demo-model");
+    assert_eq!(target.block_id, None, "短名应当交给加权轮询");
+}
+
+#[tokio::test]
+async fn block_prefix_locks_that_block() {
+    let app = TestApp::new().await;
+    app.add_block("block-a", &["demo-model"]).await.unwrap();
+    app.add_block("block-b", &["demo-model"]).await.unwrap();
+
+    let target = upstream_service::resolve_target(app.data(), "block-b/demo-model")
+        .await
+        .unwrap();
+
+    assert_eq!(target.model, "demo-model", "前缀要剥掉，发给上游的是模型名");
+    assert_eq!(target.block_id.as_deref(), Some("block-b"));
+}
+
+#[tokio::test]
+async fn whole_name_wins_over_prefix_splitting() {
+    let app = TestApp::new().await;
+    // 块 id 恰好叫 demo，模型名自带斜杠——整名优先，不能被拆成「块 demo 的模型 x」
+    app.add_block("demo", &["other-model"]).await.unwrap();
+    app.add_block("block-a", &["demo/x"]).await.unwrap();
+
+    let target = upstream_service::resolve_target(app.data(), "demo/x")
+        .await
+        .unwrap();
+
+    assert_eq!(target.model, "demo/x");
+    assert_eq!(
+        target.block_id, None,
+        "整名能匹配上时不该拆前缀，否则本身带斜杠的模型名永远调不到"
+    );
+}
+
+#[tokio::test]
+async fn unknown_prefix_or_model_is_reported() {
+    let app = TestApp::new().await;
+    app.add_block("block-a", &["demo-model"]).await.unwrap();
+
+    // 前缀不存在
+    let error = upstream_service::resolve_target(app.data(), "no-such/model")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotFound(_)));
+
+    // 前缀存在，但那个块没有该模型
+    let error = upstream_service::resolve_target(app.data(), "block-a/no-such")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotFound(_)));
+
+    // 两种都不是
+    let error = upstream_service::resolve_target(app.data(), "nothing")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotFound(_)));
+}
+
+#[tokio::test]
+async fn header_block_is_merged_and_conflicts_are_rejected() {
+    let app = TestApp::new().await;
+    app.add_block("block-a", &["demo-model"]).await.unwrap();
+    app.add_block("block-b", &["demo-model"]).await.unwrap();
+
+    // 头指定块
+    let target = upstream_service::resolve_with_header(app.data(), "demo-model", Some("block-b"))
+        .await
+        .unwrap();
+    assert_eq!(target.block_id.as_deref(), Some("block-b"));
+
+    // 头与前缀一致：放行
+    let target =
+        upstream_service::resolve_with_header(app.data(), "block-b/demo-model", Some("block-b"))
+            .await
+            .unwrap();
+    assert_eq!(target.block_id.as_deref(), Some("block-b"));
+
+    // 头与前缀矛盾：报错而不是猜
+    let error =
+        upstream_service::resolve_with_header(app.data(), "block-a/demo-model", Some("block-b"))
+            .await
+            .unwrap_err();
+    assert!(matches!(error, Error::BadRequest(_)));
+}
+
+#[tokio::test]
+async fn block_id_must_be_prefix_safe() {
+    let app = TestApp::new().await;
+
+    // 含大写、斜杠、空格都不行
+    for bad in ["Block-A", "a/b", "with space", "中文"] {
+        let error = app.add_block(bad, &["demo-model"]).await.unwrap_err();
+        assert!(
+            matches!(error, Error::BadRequest(_)),
+            "块 id {bad} 应当被拒绝，实际 {error:?}"
+        );
+    }
+
+    // 合法的：小写字母、数字、点、下划线、连字符
+    app.add_block("block-a.v2_test", &["demo-model"]).await.unwrap();
+}
+
+#[tokio::test]
+async fn available_models_list_both_spellings() {
+    let app = TestApp::new().await;
+    app.add_block("block-a", &["shared", "a-only"]).await.unwrap();
+    app.add_block("block-b", &["shared"]).await.unwrap();
+
+    let models = upstream_service::available_models(app.data()).await.unwrap();
+
+    // 短名去重
+    assert!(models.contains(&"shared".to_string()));
+    assert_eq!(
+        models.iter().filter(|name| name.as_str() == "shared").count(),
+        1
+    );
+    // 带块前缀的全名每块一条
+    assert!(models.contains(&"block-a/shared".to_string()));
+    assert!(models.contains(&"block-b/shared".to_string()));
+    assert!(models.contains(&"block-a/a-only".to_string()));
+    assert!(!models.contains(&"block-b/a-only".to_string()));
+
+    // 白名单按模型名比对，不认前缀
+    let mut key = aequi::model::ApiKey {
+        id: "k".to_string(),
+        name: "k".to_string(),
+        secret: "ak_demo".to_string(),
+        key_prefix: "ak_demo".to_string(),
+        credits_scaled: 0,
+        unlimited: false,
+        enabled: true,
+        allowed_models: vec!["shared".to_string()],
+        created_at: 0,
+        updated_at: 0,
+        last_used_at: None,
+    };
+    let kept = upstream_service::filter_by_whitelist(models.clone(), &key);
+    assert!(kept.contains(&"block-a/shared".to_string()));
+    assert!(!kept.contains(&"block-a/a-only".to_string()));
+
+    // 白名单为空即不限制
+    key.allowed_models.clear();
+    assert_eq!(
+        upstream_service::filter_by_whitelist(models.clone(), &key).len(),
+        models.len()
+    );
+}

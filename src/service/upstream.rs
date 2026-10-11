@@ -118,6 +118,36 @@ impl UpstreamState {
 
 // ---------- 管理面 ----------
 
+/// 块 id 的长度上限。
+const MAX_BLOCK_ID_LEN: usize = 64;
+
+/// 校验块的 id。
+///
+/// 它会被当作请求里模型名的前缀（`块id/模型名`），所以只允许能安全出现在
+/// URL 与模型名里的字符——含 `/` 或空格会直接破坏那条解析规则。
+fn validate_block_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        return Err(Error::BadRequest("块的 id 不能为空".to_string()));
+    }
+    if id.chars().count() > MAX_BLOCK_ID_LEN {
+        return Err(Error::BadRequest(format!(
+            "块的 id 不能超过 {MAX_BLOCK_ID_LEN} 个字符"
+        )));
+    }
+
+    let ok = id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'));
+    if !ok {
+        return Err(Error::BadRequest(
+            "块的 id 只能用小写字母、数字、点、下划线或连字符——它会作为模型名前缀使用"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// 校验块的模型条目。
 ///
 /// 倍率是计费的乘数，负数会让计费方向反转（消耗变收入），必须在入口挡住。
@@ -136,28 +166,32 @@ fn validate_models(models: &[ModelEntry]) -> Result<()> {
     Ok(())
 }
 
-/// 当前对外可用的模型名（各块模型去重、排序）。
+/// 当前对外可用的模型名，含**短名**与**带块前缀的全名**两种写法。
+///
+/// 短名（`gpt-4o`）在所有提供它的块之间加权轮询；全名（`block-a/gpt-4o`）
+/// 把请求锁定到那个块。短名去重合并，全名一个块一条——同一个模型在不同块
+/// 可能有不同的价与出口，那正是要能分别指定的理由。
 ///
 /// 只统计**启用**的块：停用的块不参与调度，它的模型也就调不到。
 pub async fn available_models(pool: &SqlitePool) -> Result<Vec<String>> {
     let blocks = db::block::list_blocks(pool).await?;
 
-    let mut names = Vec::new();
+    let mut names = std::collections::BTreeSet::new();
     for block in blocks.iter().filter(|block| block.enabled) {
         for model in &block.models {
-            names.push(model.name.clone());
+            names.insert(model.name.clone());
+            names.insert(format!("{}/{}", block.id, model.name));
         }
     }
 
-    names.sort();
-    names.dedup();
-    Ok(names)
+    Ok(names.into_iter().collect())
 }
 
 /// 按密钥白名单收敛可用模型。
 ///
 /// 白名单为空表示不限制；非空时只留下白名单里确实存在的那些——
 /// 白名单里的名字可能已经从所有块里删掉了，那种名字调不到，不该报给下游。
+/// 带块前缀的写法按**模型名**比对白名单（白名单里存的是模型名，不含块）。
 pub fn filter_by_whitelist(models: Vec<String>, key: &ApiKey) -> Vec<String> {
     if key.allowed_models.is_empty() {
         return models;
@@ -165,7 +199,10 @@ pub fn filter_by_whitelist(models: Vec<String>, key: &ApiKey) -> Vec<String> {
 
     models
         .into_iter()
-        .filter(|name| key.allows_model(name))
+        .filter(|name| {
+            let short = name.rsplit_once('/').map_or(name.as_str(), |(_, rest)| rest);
+            key.allows_model(short)
+        })
         .collect()
 }
 
@@ -234,9 +271,7 @@ pub async fn fetch_models(
 /// 创建块。
 pub async fn create_block(pool: &SqlitePool, payload: BlockCreate) -> Result<UpstreamBlock> {
     let id = payload.id.trim().to_string();
-    if id.is_empty() {
-        return Err(Error::BadRequest("块的 id 不能为空".to_string()));
-    }
+    validate_block_id(&id)?;
     if payload.base_url.trim().is_empty() {
         return Err(Error::BadRequest("base_url 不能为空".to_string()));
     }
@@ -500,21 +535,109 @@ pub async fn test_key(
 /// 按模型选出可用的块。
 ///
 /// 候选是「启用且接受该模型」的块，平滑加权轮询决定这一次用谁。
+/// 请求里模型名的解析结果。
+#[derive(Debug, Clone)]
+pub struct ResolvedTarget {
+    /// 归一化后的模型名（已剥掉块前缀），也是发给上游的名字。
+    pub model: String,
+    /// 显式锁定的块 id；`None` 表示在所有提供该模型的块之间加权轮询。
+    pub block_id: Option<String>,
+}
+
+impl ResolvedTarget {
+    /// 没锁定块、模型名原样。
+    pub fn plain(model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            block_id: None,
+        }
+    }
+}
+
+/// 解析请求里的模型名，支持 `块id/模型名` 形式的显式命名空间。
+///
+/// **整名优先**：先拿整个字符串去匹配块里的模型——`anthropic/claude-3`
+/// 这种本身带 `/` 的模型名不能被误拆成「块 anthropic 的模型 claude-3」。
+/// 整名匹配不到，才尝试把它拆成前缀与模型名，前缀必须是存在的块 id。
+///
+/// 两级都匹配不到就报错，**不静默回退到轮询**：打错一个字就悄悄走别的块，
+/// 账目和日志都会说不清。
+pub async fn resolve_target(pool: &SqlitePool, requested: &str) -> Result<ResolvedTarget> {
+    let blocks = db::block::list_blocks(pool).await?;
+    let enabled: Vec<&UpstreamBlock> = blocks.iter().filter(|block| block.enabled).collect();
+
+    if enabled.iter().any(|block| block.accepts(requested)) {
+        return Ok(ResolvedTarget::plain(requested));
+    }
+
+    if let Some((prefix, rest)) = requested.split_once('/') {
+        if let Some(block) = enabled.iter().find(|block| block.id == prefix) {
+            if block.accepts(rest) {
+                return Ok(ResolvedTarget {
+                    model: rest.to_string(),
+                    block_id: Some(prefix.to_string()),
+                });
+            }
+            return Err(Error::NotFound(format!("块 {prefix} 没有提供模型 {rest}")));
+        }
+    }
+
+    Err(Error::NotFound(format!(
+        "没有可处理模型 {requested} 的上游"
+    )))
+}
+
+/// 解析请求目标，并合入请求头里指定的块。
+///
+/// 模型名前缀与 `X-Aequi-Block` 是两种等价的指定方式；都给了且指向不同的块时
+/// 直接报错——这种矛盾没法猜用户想要哪个，静默取其一只会让人以为设置生效了。
+pub async fn resolve_with_header(
+    pool: &SqlitePool,
+    model: &str,
+    header_block: Option<&str>,
+) -> Result<ResolvedTarget> {
+    let mut target = resolve_target(pool, model).await?;
+
+    let Some(header_block) = header_block else {
+        return Ok(target);
+    };
+
+    if let Some(from_prefix) = target.block_id.as_deref() {
+        if from_prefix != header_block {
+            return Err(Error::BadRequest(format!(
+                "请求头指定的块 {header_block} 与模型名里的前缀 {from_prefix} 冲突"
+            )));
+        }
+    }
+
+    target.block_id = Some(header_block.to_string());
+    Ok(target)
+}
+
+/// 选一个能处理该模型的块。
+///
+/// `only` 非空时只在指定块里选——请求里带了块前缀或 `X-Aequi-Block` 头时为真。
+/// 其余情况把所有提供该模型的启用块交给平滑加权轮询。
 pub async fn select_block(
     pool: &SqlitePool,
     state: &UpstreamState,
     model: &str,
+    only: Option<&str>,
 ) -> Result<UpstreamBlock> {
     let blocks = db::block::list_blocks(pool).await?;
 
     let candidates: Vec<(String, u32)> = blocks
         .iter()
         .filter(|block| block.enabled && block.accepts(model))
+        .filter(|block| only.is_none_or(|id| block.id == id))
         .map(|block| (block.id.clone(), block.weight))
         .collect();
 
     if candidates.is_empty() {
-        return Err(Error::NotFound(format!("没有可处理模型 {model} 的上游")));
+        return Err(match only {
+            Some(id) => Error::NotFound(format!("块 {id} 不提供模型 {model}")),
+            None => Error::NotFound(format!("没有可处理模型 {model} 的上游")),
+        });
     }
 
     let picked = state

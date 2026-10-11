@@ -120,11 +120,12 @@ pub async fn chat_completion(
     body: &Value,
     ip: &str,
     user_agent: Option<&str>,
+    header_block: Option<&str>,
 ) -> Result<Value> {
     let started = Instant::now();
     let pool = &state.store.data;
 
-    let request = match openai_in::parse_request(body) {
+    let mut request = match openai_in::parse_request(body) {
         Ok(request) => request,
         Err(error) => {
             // 参数错误：还没有块与上游密钥可记，但请求本身进日志。
@@ -138,6 +139,10 @@ pub async fn chat_completion(
             return Err(error);
         }
     };
+
+    // 解析目标：归一化模型名（剥掉块前缀），并记下是否锁定了某个块。
+    let target = upstream::resolve_with_header(pool, &request.model, header_block).await?;
+    request.model = target.model;
 
     // 余额为零（且不是无限额度）时直接拒绝，免得替用户白白消耗上游。
     // 真实扣减由 charge 的原子 UPDATE 兜底，这里只是省一次无谓的上游调用。
@@ -153,7 +158,7 @@ pub async fn chat_completion(
         return Err(error);
     }
 
-    match dispatch(state, key, &request, started).await {
+    match dispatch(state, key, &request, started, target.block_id.as_deref()).await {
         Ok(outcome) => {
             write_log(
                 pool,
@@ -229,14 +234,21 @@ pub async fn chat_completion_stream(
     body: Value,
     ip: String,
     user_agent: Option<String>,
+    header_block: Option<String>,
 ) -> Result<impl FutureStream<Item = std::result::Result<Vec<u8>, std::io::Error>> + 'static> {
     let started = Instant::now();
     let pool = &state.store.data;
 
-    let request = openai_in::parse_request(&body)?;
+    let mut request = openai_in::parse_request(&body)?;
+    // 解析目标：归一化模型名（剥掉块前缀），并记下是否锁定了某个块。
+    let target = upstream::resolve_with_header(pool, &request.model, header_block.as_deref()).await?;
+    request.model = target.model;
+
     if !key.unlimited && key.credits_scaled <= 0 {
         return Err(Error::InsufficientCredits);
     }
+
+    let only = target.block_id.as_deref();
 
     // 建流前的重试窗口。
     let mut upstream = None;
@@ -246,7 +258,7 @@ pub async fn chat_completion_stream(
     let mut last_failure = None;
 
     for _ in 0..MAX_ATTEMPTS {
-        let block = match upstream::select_block(pool, &state.upstream, &request.model).await {
+        let block = match upstream::select_block(pool, &state.upstream, &request.model, only).await {
             Ok(block) => block,
             Err(error) => return Err(error),
         };
@@ -361,6 +373,9 @@ pub async fn chat_completion_stream(
         let mut finished = false;
         let mut sse = std::pin::pin!(payload_stream);
 
+        // 流内只读名字，拷一份所有权（生命周期长于本函数）。
+        let model = request.model.clone();
+
         // 每条输出都是一行 `data: <json>` 加空行。
         let frame = |value: Value| {
             Ok::<Vec<u8>, std::io::Error>(format!("data: {value}\n\n").into_bytes())
@@ -373,7 +388,7 @@ pub async fn chat_completion_stream(
             .into_bytes()
         };
 
-        yield frame(openai_in::render_stream_role(&id, created, &request.model));
+        yield frame(openai_in::render_stream_role(&id, created, &model));
 
         while let Some(item) = sse.next().await {
             let payload = match item {
@@ -392,7 +407,7 @@ pub async fn chat_completion_stream(
                     if let Err(log_error) = crate::db::usage::insert_error(
                         pool,
                         &key.id,
-                        &request.model,
+                        &model,
                         &message,
                         true,
                         time::now_secs(),
@@ -420,7 +435,7 @@ pub async fn chat_completion_stream(
                     if let Err(log_error) = crate::db::usage::insert_error(
                         pool,
                         &key.id,
-                        &request.model,
+                        &model,
                         &error.to_string(),
                         true,
                         time::now_secs(),
@@ -439,14 +454,14 @@ pub async fn chat_completion_stream(
                     StreamEvent::Delta { text, tool_calls } => {
                         text_acc.push_str(&text);
                         yield frame(openai_in::render_stream_delta(
-                            &id, created, &request.model, &text, &tool_calls,
+                            &id, created, &model, &text, &tool_calls,
                         ));
                     }
                     StreamEvent::Finish { finish_reason } => {
                         if !finished {
                             finished = true;
                             yield frame(openai_in::render_stream_finish(
-                                &id, created, &request.model, finish_reason,
+                                &id, created, &model, finish_reason,
                             ));
                         }
                     }
@@ -459,7 +474,7 @@ pub async fn chat_completion_stream(
         // 上游没发结束原因就补一个 Stop，避免客户端把流挂起。
         if !finished {
             yield frame(openai_in::render_stream_finish(
-                &id, created, &request.model, FinishReason::Stop,
+                &id, created, &model, FinishReason::Stop,
             ));
         }
 
@@ -471,7 +486,7 @@ pub async fn chat_completion_stream(
             usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
         }
 
-        match billing::charge(pool, &key, &request.model, usage, multiplier_bp, true).await {
+        match billing::charge(pool, &key, &model, usage, multiplier_bp, true).await {
             Ok(charge) => {
                 write_log(
                     pool,
@@ -497,7 +512,7 @@ pub async fn chat_completion_stream(
                 );
 
                 yield frame(openai_in::render_stream_usage(
-                    &id, created, &request.model, charge.usage,
+                    &id, created, &model, charge.usage,
                 ));
                 yield Ok(b"data: [DONE]\n\n".to_vec());
             }
@@ -513,7 +528,7 @@ pub async fn chat_completion_stream(
                 if let Err(log_error) = crate::db::usage::insert_error(
                     pool,
                     &key.id,
-                    &request.model,
+                    &model,
                     &error.to_string(),
                     true,
                     time::now_secs(),
@@ -538,13 +553,15 @@ async fn dispatch(
     key: &ApiKey,
     request: &ChatRequest,
     started: Instant,
+    // 请求里显式锁定的块；None 即按权重轮询所有能处理该模型的块。
+    only: Option<&str>,
 ) -> std::result::Result<DispatchOutcome, Failure> {
     let pool = &state.store.data;
     let mut last_failure = None;
 
     for _ in 0..MAX_ATTEMPTS {
         // 每一轮都重新挑：上一把密钥进入退避后，这里会自然落到下一把。
-        let block = match upstream::select_block(pool, &state.upstream, &request.model).await {
+        let block = match upstream::select_block(pool, &state.upstream, &request.model, only).await {
             Ok(block) => block,
             Err(error) => return Err(Failure::bare(error)),
         };

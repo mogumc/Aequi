@@ -52,6 +52,19 @@ pub async fn list_models(
     ))
 }
 
+/// 请求头里指定的块（`X-Aequi-Block`）。空值当作没给。
+///
+/// 这是「模型名前缀」之外的另一条指定路径：不想改模型名的客户端可以用头，
+/// 两者冲突时 service 层会报错。
+fn header_block(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-aequi-block")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 /// `POST /v1/chat/completions`
 ///
 /// `stream: true` 走 SSE（text/event-stream），其余返回普通 JSON。
@@ -76,6 +89,7 @@ pub async fn chat_completions(
             body,
             ip,
             user_agent,
+            header_block(&headers),
         )
         .await?;
 
@@ -86,8 +100,15 @@ pub async fn chat_completions(
             .expect("SSE 响应的固定头不会构建失败"));
     }
 
-    let response = proxy::chat_completion(&state, &context.key, &body, &ip, user_agent.as_deref())
-        .await?;
+    let response = proxy::chat_completion(
+        &state,
+        &context.key,
+        &body,
+        &ip,
+        user_agent.as_deref(),
+        header_block(&headers).as_deref(),
+    )
+    .await?;
     Ok(Json(response).into_response())
 }
 
@@ -115,6 +136,7 @@ pub async fn images_generations(
         &body,
         &ip,
         user_agent.as_deref(),
+        header_block(&headers).as_deref(),
     )
     .await?;
 

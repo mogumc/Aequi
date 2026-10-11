@@ -46,6 +46,7 @@ pub async fn images_generations(
     body: &Value,
     ip: &str,
     user_agent: Option<&str>,
+    header_block: Option<&str>,
 ) -> Result<Value> {
     let started = Instant::now();
     let pool = &state.store.data;
@@ -65,6 +66,11 @@ pub async fn images_generations(
         }
     };
 
+    // 解析目标：归一化模型名（剥掉块前缀），并记下是否锁定了某个块。
+    let target = upstream::resolve_with_header(pool, &model, header_block).await?;
+    let model = &target.model;
+    let only = target.block_id.as_deref();
+
     // 余额为零（且不是无限额度）时直接拒绝，免得替用户白白消耗上游。
     if !key.unlimited && key.credits_scaled <= 0 {
         let error = Error::InsufficientCredits;
@@ -78,7 +84,7 @@ pub async fn images_generations(
         return Err(error);
     }
 
-    match dispatch(state, key, body, &model, started).await {
+    match dispatch(state, key, body, model, started, only).await {
         Ok(outcome) => {
             write_log(
                 pool,
@@ -127,12 +133,14 @@ async fn dispatch(
     body: &Value,
     model: &str,
     started: Instant,
+    // 请求里显式锁定的块；None 即按权重轮询所有能处理该模型的块。
+    only: Option<&str>,
 ) -> std::result::Result<ImageOutcome, Failure> {
     let pool = &state.store.data;
     let mut last_failure = None;
 
     for _ in 0..MAX_ATTEMPTS {
-        let block = match upstream::select_block(pool, &state.upstream, model).await {
+        let block = match upstream::select_block(pool, &state.upstream, model, only).await {
             Ok(block) => block,
             Err(error) => return Err(Failure::bare(error)),
         };
