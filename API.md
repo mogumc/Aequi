@@ -199,7 +199,7 @@ gpt-4o，短名请求却被轮询到 b」这种越权。数组为空表示不限
 | `PATCH` | `/api/blocks/{id}` | 更新（`proxy` 传 `null` 表示清空） |
 | `DELETE` | `/api/blocks/{id}` | 删除（密钥级联清理） |
 | `GET` | `/api/blocks/{id}/keys` | 块内密钥列表 |
-| `POST` | `/api/blocks/{id}/keys` | 批量添加：`{ secrets: ["..."], weight? }`；同块重复密钥会被拒绝 |
+| `POST` | `/api/blocks/{id}/keys` | 批量添加：`{ secrets: ["..."], weight? }`；重复条目自动跳过，返回 `{ keys, skipped }` |
 | `POST` | `/api/blocks/{id}/keys/remove` | 批量删除：`{ ids }` |
 | `POST` | `/api/blocks/{id}/keys/pause` | 批量暂停：`{ ids }` |
 | `POST` | `/api/blocks/{id}/keys/resume` | 批量恢复：`{ ids }`（同时清零失败计数） |

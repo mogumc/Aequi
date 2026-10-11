@@ -28,6 +28,13 @@ pub struct FetchedModelsResponse {
     pub models: Vec<String>,
 }
 
+/// 批量添加密钥的响应：入库的密钥与被跳过的重复数量。
+#[derive(Debug, Serialize)]
+pub struct AddKeysResponse {
+    pub keys: Vec<UpstreamKeyView>,
+    pub skipped: usize,
+}
+
 /// 密钥列表响应。
 #[derive(Debug, Serialize)]
 pub struct KeyListResponse {
@@ -92,9 +99,11 @@ pub async fn add_keys(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(payload): Json<UpstreamKeyCreate>,
-) -> Result<Json<KeyListResponse>> {
-    Ok(Json(KeyListResponse {
-        keys: upstream::add_keys(&state.store.data, &id, payload).await?,
+) -> Result<Json<AddKeysResponse>> {
+    let outcome = upstream::add_keys(&state.store.data, &id, payload).await?;
+    Ok(Json(AddKeysResponse {
+        keys: outcome.keys,
+        skipped: outcome.skipped,
     }))
 }
 

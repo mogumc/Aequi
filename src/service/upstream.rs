@@ -404,35 +404,53 @@ async fn block_view_of(pool: &SqlitePool, block: &UpstreamBlock) -> Result<Block
 }
 
 /// 给块添加密钥。批量提交，要么全进要么全不进。
+/// 批量添加的结果：真正入库的密钥，与被跳过的重复数量。
+pub struct AddKeysOutcome {
+    pub keys: Vec<UpstreamKeyView>,
+    /// 与块内已有密钥、或本批内彼此重复而被跳过的数量。
+    pub skipped: usize,
+}
+
+/// 批量添加密钥。重复的（与块内已有、或本批内彼此重复）自动跳过，
+/// 其余正常入库——批量导入几百把时不可能让人自己去把重复的挑出来。
 pub async fn add_keys(
     pool: &SqlitePool,
     block_id: &str,
     payload: UpstreamKeyCreate,
-) -> Result<Vec<UpstreamKeyView>> {
+) -> Result<AddKeysOutcome> {
     // 块不存在时先给出可读的错误，而不是等外键约束来报。
     if db::block::find_block(pool, block_id).await?.is_none() {
         return Err(Error::NotFound("块不存在".to_string()));
     }
 
+    let existing = db::block::list_keys(pool, block_id).await?;
+    let known: std::collections::HashSet<&str> =
+        existing.iter().map(|key| key.secret.as_str()).collect();
+
     let now = time::now_secs();
-    let mut entries = Vec::with_capacity(payload.secrets.len());
+    let mut entries = Vec::new();
+    let mut skipped = 0usize;
+    let mut batch: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for secret in &payload.secrets {
         let secret = secret.trim();
         if secret.is_empty() {
-            return Err(Error::BadRequest("密钥不能为空".to_string()));
+            skipped += 1;
+            continue;
+        }
+        // 同块内重复的密钥会让调度对同一把加倍用力，所以宁可跳过也不入库。
+        if known.contains(secret) || !batch.insert(secret) {
+            skipped += 1;
+            continue;
         }
         entries.push((random::string(16), secret.to_string()));
     }
 
-    let mut tx = pool.begin().await?;
-    let result = db::block::insert_keys(&mut *tx, &entries, block_id, payload.weight, now).await;
-    if let Err(error) = &result {
-        // 同块内重复的密钥会让调度对同一把加倍用力，直接拒绝。
-        if db::block::is_unique_violation(error) {
-            return Err(Error::BadRequest("存在与本块已有密钥重复的条目".to_string()));
-        }
+    if entries.is_empty() {
+        return Ok(AddKeysOutcome { keys: Vec::new(), skipped });
     }
-    result?;
+
+    let mut tx = pool.begin().await?;
+    db::block::insert_keys(&mut *tx, &entries, block_id, payload.weight, now).await?;
     tx.commit().await?;
 
     let mut views = Vec::with_capacity(entries.len());
@@ -443,7 +461,7 @@ pub async fn add_keys(
         views.push(view_key(&key));
     }
 
-    Ok(views)
+    Ok(AddKeysOutcome { keys: views, skipped })
 }
 
 /// 删除一批密钥。
