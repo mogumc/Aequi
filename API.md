@@ -147,12 +147,17 @@
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/keys` | 列表（支持分页与搜索，见下） |
-| `POST` | `/api/keys` | 创建：`{ name?, credits?, allowed_models? }` |
+| `POST` | `/api/keys` | 创建：`{ name?, credits?, unlimited?, allowed_models? }` |
 | `GET` | `/api/keys/{id}` | 详情（含明文） |
 | `PATCH` | `/api/keys/{id}` | 更新：`{ name?, enabled?, allowed_models? }` |
 | `DELETE` | `/api/keys/{id}` | 删除 |
-| `POST` | `/api/keys/{id}/credits` | 重设余额：`{ credits: "10" }` |
+| `POST` | `/api/keys/{id}/credits` | 调整额度：`{ credits?, unlimited? }`，只改提交的那部分 |
 | `GET` | `/api/keys/{id}/usage` | 该密钥的用量（结构同 `/api/key/usage`） |
+
+**无限额度**：`unlimited: true` 的密钥不参与余额判定——扣费时跳过余额检查，
+**但每次请求的用量与消耗照常记录**（`usage_records` 里一样能看到）。
+它与 `credits` 并存但互不影响：无限时余额字段不参与判定，
+保留原值只是为了切回有限额度时有个起点。
 
 #### `GET /api/keys?page=1&page_size=20&search=xxx`
 
@@ -171,7 +176,7 @@
 }
 ```
 
-`KeyView`：`id`、`name`、`secret`（明文）、`key_prefix`、`credits`、`credits_scaled`、`enabled`、`allowed_models`、`created_at`、`updated_at`、`last_used_at`。
+`KeyView`：`id`、`name`、`secret`（明文）、`key_prefix`、`credits`、`credits_scaled`、`unlimited`、`enabled`、`allowed_models`、`created_at`、`updated_at`、`last_used_at`。
 
 ### 上游块
 
@@ -265,7 +270,7 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/api/key/me` | 自身信息（`KeySelfView`，不含明文） |
+| `GET` | `/api/key/me` | 自身信息（`KeySelfView`：`name`、`key_prefix`、`credits`、`credits_scaled`、`unlimited`、`enabled`、`allowed_models`、`created_at`、`last_used_at`——不含明文） |
 | `GET` | `/api/key/usage?limit=50` | 自身用量 |
 
 用量响应：
@@ -317,7 +322,7 @@ OpenAI 生图协议，与对话共用认证、调度、重试与双轨日志。
 3. 429 → 该密钥退避 30 秒并换下一把；401/403/5xx、网络故障、200 但响应结构损坏 → 记失败并换下一把；最多 3 次。
 4. 其它 4xx 是请求本身的问题（参数、模型名等），直接透传错误，不重试。
 5. 上游不报 usage 时按本地估算计费（CJK 每字 1 token、其余每 4 字符 1 token、图片每张 1000），估算结果在日志里带 `estimated: true`。
-6. 计费按对外模型名的倍率折算，缓存 token 只记录不打折；余额为零的密钥在发请求前就被拒绝（402）。
+6. 计费按对外模型名的倍率折算，缓存 token 只记录不打折；余额为零的密钥在发请求前就被拒绝（402）——**无限额度的密钥除外**，它跳过余额判定但照常记账。
 
 ---
 

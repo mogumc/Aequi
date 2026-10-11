@@ -244,6 +244,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
     secret         TEXT    NOT NULL UNIQUE,
     key_prefix     TEXT    NOT NULL,
     credits_scaled INTEGER NOT NULL,
+    -- 无限额度：扣费时跳过余额判断，但用量与消耗照记。
+    unlimited      INTEGER NOT NULL DEFAULT 0,
     enabled        INTEGER NOT NULL DEFAULT 1,
     allowed_models TEXT    NOT NULL DEFAULT '[]',
     created_at     INTEGER NOT NULL,

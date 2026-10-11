@@ -65,8 +65,8 @@ pub async fn images_generations(
         }
     };
 
-    // 余额为零时直接拒绝，免得替用户白白消耗上游。
-    if key.credits_scaled <= 0 {
+    // 余额为零（且不是无限额度）时直接拒绝，免得替用户白白消耗上游。
+    if !key.unlimited && key.credits_scaled <= 0 {
         let error = Error::InsufficientCredits;
         write_log(
             pool,

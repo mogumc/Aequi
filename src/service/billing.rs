@@ -82,11 +82,16 @@ pub async fn charge(
 
     let mut tx = pool.begin().await?;
 
-    // 扣费语句自带余额与启用状态判断，不满足时一条都不会命中。
-    // 此时事务没有任何改动，回滚即可——但必须把「已停用」和「余额不足」
-    // 区分开，否则调用方拿到的错误会指向完全错误的方向。
-    let Some(remaining_scaled) = db::keys::charge(&mut *tx, &key.id, credits_scaled, now).await?
-    else {
+    // 无限额度的密钥不走余额判定：只更新使用时间，消耗照记进用量表。
+    // 有限额度的走原子扣费——语句自带余额与启用状态判断，
+    // 不满足时一条都不会命中，此时事务没有任何改动，回滚即可；
+    // 但必须把「已停用」和「余额不足」区分开，
+    // 否则调用方拿到的错误会指向完全错误的方向。
+    let Some(remaining_scaled) = (if key.unlimited {
+        db::keys::touch(&mut *tx, &key.id, now).await?
+    } else {
+        db::keys::charge(&mut *tx, &key.id, credits_scaled, now).await?
+    }) else {
         return Err(classify_charge_failure(pool, &key.id).await);
     };
 

@@ -139,9 +139,9 @@ pub async fn chat_completion(
         }
     };
 
-    // 余额为零时直接拒绝，免得替用户白白消耗上游。
+    // 余额为零（且不是无限额度）时直接拒绝，免得替用户白白消耗上游。
     // 真实扣减由 charge 的原子 UPDATE 兜底，这里只是省一次无谓的上游调用。
-    if key.credits_scaled <= 0 {
+    if !key.unlimited && key.credits_scaled <= 0 {
         let error = Error::InsufficientCredits;
         write_log(
             pool,
@@ -234,7 +234,7 @@ pub async fn chat_completion_stream(
     let pool = &state.store.data;
 
     let request = openai_in::parse_request(&body)?;
-    if key.credits_scaled <= 0 {
+    if !key.unlimited && key.credits_scaled <= 0 {
         return Err(Error::InsufficientCredits);
     }
 

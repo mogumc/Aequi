@@ -101,9 +101,14 @@ pub async fn set_credits(
     Path(id): Path<String>,
     Json(payload): Json<KeyCreditsUpdate>,
 ) -> Result<Json<KeyView>> {
-    let key = keys::set_credits(&state.store.data, &id, &payload.credits).await?;
+    let key = keys::set_credits(&state.store.data, &id, payload).await?;
 
-    tracing::info!(key_prefix = %key.key_prefix, credits = %key.credits_scaled, "已调整密钥积分");
+    tracing::info!(
+        key_prefix = %key.key_prefix,
+        credits = %key.credits_scaled,
+        unlimited = key.unlimited,
+        "已调整密钥额度"
+    );
 
     Ok(Json(KeyView::from(&key)))
 }

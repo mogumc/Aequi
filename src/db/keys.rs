@@ -6,23 +6,23 @@ use sqlx::{Executor, Row, Sqlite, SqlitePool};
 use crate::model::ApiKey;
 
 const SQL_FIND_BY_ID: &str = "\
-SELECT id, name, secret, key_prefix, credits_scaled, enabled, allowed_models, \
+SELECT id, name, secret, key_prefix, credits_scaled, unlimited, enabled, allowed_models, \
        created_at, updated_at, last_used_at \
 FROM api_keys WHERE id = ?";
 
 const SQL_FIND_BY_SECRET: &str = "\
-SELECT id, name, secret, key_prefix, credits_scaled, enabled, allowed_models, \
+SELECT id, name, secret, key_prefix, credits_scaled, unlimited, enabled, allowed_models, \
        created_at, updated_at, last_used_at \
 FROM api_keys WHERE secret = ?";
 
 const SQL_LIST: &str = "\
-SELECT id, name, secret, key_prefix, credits_scaled, enabled, allowed_models, \
+SELECT id, name, secret, key_prefix, credits_scaled, unlimited, enabled, allowed_models, \
        created_at, updated_at, last_used_at \
 FROM api_keys ORDER BY created_at DESC";
 
 /// 分页查询；`search` 非空时按名称或密钥前缀模糊匹配。
 const SQL_LIST_PAGED: &str = "\
-SELECT id, name, secret, key_prefix, credits_scaled, enabled, allowed_models, \
+SELECT id, name, secret, key_prefix, credits_scaled, unlimited, enabled, allowed_models, \
        created_at, updated_at, last_used_at \
 FROM api_keys \
 WHERE (? IS NULL OR name LIKE '%' || ? || '%' OR key_prefix LIKE '%' || ? || '%') \
@@ -39,8 +39,8 @@ SELECT COUNT(*) AS total, COALESCE(SUM(enabled), 0) AS enabled FROM api_keys";
 
 const SQL_INSERT: &str = "\
 INSERT INTO api_keys \
-(id, name, secret, key_prefix, credits_scaled, enabled, allowed_models, created_at, updated_at) \
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+(id, name, secret, key_prefix, credits_scaled, unlimited, enabled, allowed_models, created_at, updated_at) \
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 const SQL_UPDATE_META: &str = "\
 UPDATE api_keys SET name = ?, enabled = ?, allowed_models = ?, updated_at = ? WHERE id = ?";
@@ -48,12 +48,20 @@ UPDATE api_keys SET name = ?, enabled = ?, allowed_models = ?, updated_at = ? WH
 const SQL_SET_CREDITS: &str =
     "UPDATE api_keys SET credits_scaled = ?, updated_at = ? WHERE id = ?";
 
+const SQL_SET_UNLIMITED: &str =
+    "UPDATE api_keys SET unlimited = ?, updated_at = ? WHERE id = ?";
+
 /// 原子扣费：`credits_scaled >= ?` 保证不会透支，余额不足时一条都不会命中。
 ///
 /// 用 `RETURNING` 一次拿到扣减后的余额，省掉「先查余额再更新」的竞态与额外往返。
 const SQL_CHARGE: &str = "\
 UPDATE api_keys SET credits_scaled = credits_scaled - ?, updated_at = ?, last_used_at = ? \
 WHERE id = ? AND enabled = 1 AND credits_scaled >= ? \
+RETURNING credits_scaled";
+
+/// 无限额度的扣费：不动余额，只记使用时间——用量由调用方照常写进记录表。
+const SQL_TOUCH: &str = "\
+UPDATE api_keys SET updated_at = ?, last_used_at = ? WHERE id = ? AND enabled = 1 \
 RETURNING credits_scaled";
 
 const SQL_DELETE: &str = "DELETE FROM api_keys WHERE id = ?";
@@ -66,6 +74,8 @@ pub struct NewApiKey<'a> {
     pub secret: &'a str,
     pub key_prefix: &'a str,
     pub credits_scaled: i64,
+    /// 无限额度：扣费跳过余额判断，用量照样记。
+    pub unlimited: bool,
     pub enabled: bool,
     pub allowed_models: &'a [String],
     pub created_at: i64,
@@ -78,6 +88,7 @@ fn map_row(row: &SqliteRow) -> ApiKey {
         secret: row.get("secret"),
         key_prefix: row.get("key_prefix"),
         credits_scaled: row.get("credits_scaled"),
+        unlimited: row.get::<i64, _>("unlimited") != 0,
         enabled: row.get::<i64, _>("enabled") != 0,
         allowed_models: parse_models(row.get("allowed_models")),
         created_at: row.get("created_at"),
@@ -178,6 +189,7 @@ pub async fn insert(pool: &SqlitePool, key: &NewApiKey<'_>) -> Result<(), sqlx::
         .bind(key.secret)
         .bind(key.key_prefix)
         .bind(key.credits_scaled)
+        .bind(i64::from(key.unlimited))
         .bind(i64::from(key.enabled))
         .bind(encode_models(key.allowed_models))
         .bind(key.created_at)
@@ -248,6 +260,40 @@ where
         .await?;
 
     Ok(row.map(|row| row.get("credits_scaled")))
+}
+
+/// 无限额度的"扣费"：余额不动，只更新使用时间。
+///
+/// 返回余额原值（供调用方回显）；`None` 表示密钥已停用。
+/// 用量记录仍由调用方照常写入——无限额度指的是不设上限，不是不记账。
+pub async fn touch<'e, E>(executor: E, id: &str, now: i64) -> Result<Option<i64>, sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let row = sqlx::query(SQL_TOUCH)
+        .bind(now)
+        .bind(now)
+        .bind(id)
+        .fetch_optional(executor)
+        .await?;
+
+    Ok(row.map(|row| row.get("credits_scaled")))
+}
+
+/// 切换无限额度。
+pub async fn set_unlimited(
+    pool: &SqlitePool,
+    id: &str,
+    unlimited: bool,
+    now: i64,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(SQL_SET_UNLIMITED)
+        .bind(i64::from(unlimited))
+        .bind(now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// 删除密钥。用量记录随外键级联清理。

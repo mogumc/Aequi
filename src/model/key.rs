@@ -18,6 +18,11 @@ pub struct ApiKey {
     pub key_prefix: String,
     /// 剩余积分，整数最小单位（1 积分 = 10000）。
     pub credits_scaled: i64,
+    /// 无限额度：扣费跳过余额判断，但用量与消耗照记。
+    ///
+    /// 与 `credits_scaled` 并存但互不影响——无限时余额字段不再参与判定，
+    /// 保留原值只是为了切回有限额度时有个起点。
+    pub unlimited: bool,
     pub enabled: bool,
     /// 允许使用的模型。空表示不限制。
     ///
@@ -49,6 +54,8 @@ pub struct KeyView {
     pub credits: String,
     /// 同一数值的整数形式，便于前端精确处理。
     pub credits_scaled: i64,
+    /// 无限额度：前端据此显示「无限」，不再看余额。
+    pub unlimited: bool,
     pub enabled: bool,
     pub allowed_models: Vec<String>,
     pub created_at: i64,
@@ -65,6 +72,7 @@ impl From<&ApiKey> for KeyView {
             key_prefix: key.key_prefix.clone(),
             credits: credits::format_credits(key.credits_scaled),
             credits_scaled: key.credits_scaled,
+            unlimited: key.unlimited,
             enabled: key.enabled,
             allowed_models: key.allowed_models.clone(),
             created_at: key.created_at,
@@ -84,6 +92,8 @@ pub struct KeySelfView {
     pub key_prefix: String,
     pub credits: String,
     pub credits_scaled: i64,
+    /// 无限额度：持有者据此知道余额不是限制。
+    pub unlimited: bool,
     pub enabled: bool,
     pub allowed_models: Vec<String>,
     pub created_at: i64,
@@ -97,6 +107,7 @@ impl From<&ApiKey> for KeySelfView {
             key_prefix: key.key_prefix.clone(),
             credits: credits::format_credits(key.credits_scaled),
             credits_scaled: key.credits_scaled,
+            unlimited: key.unlimited,
             enabled: key.enabled,
             allowed_models: key.allowed_models.clone(),
             created_at: key.created_at,
@@ -113,6 +124,9 @@ pub struct KeyCreate {
     /// 初始积分，四位小数以内。缺省为 0。
     #[serde(default)]
     pub credits: Option<String>,
+    /// 初始即为无限额度；此时 `credits` 只是留个起点，不参与判定。
+    #[serde(default)]
+    pub unlimited: bool,
     /// 允许使用的模型；留空表示不限制。
     #[serde(default)]
     pub allowed_models: Vec<String>,
@@ -126,9 +140,11 @@ pub struct KeyUpdate {
     pub allowed_models: Option<Vec<String>>,
 }
 
-/// 密钥的资源限制更新。
-#[derive(Debug, Deserialize)]
+/// 额度设置：余额与无限开关，各改各的，不传的字段保持不变。
+#[derive(Debug, Default, Deserialize)]
 pub struct KeyCreditsUpdate {
     /// 新的积分余额，四位小数以内。
-    pub credits: String,
+    pub credits: Option<String>,
+    /// 是否无限额度。
+    pub unlimited: Option<bool>,
 }

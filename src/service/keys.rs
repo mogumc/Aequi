@@ -8,7 +8,9 @@ use sqlx::SqlitePool;
 use crate::db;
 use crate::db::keys::NewApiKey;
 use crate::error::{Error, Result};
-use crate::model::{credits, ApiKey, KeyCreate, KeyUpdate, UsageRecord, UsageSummary};
+use crate::model::{
+    credits, ApiKey, KeyCreate, KeyCreditsUpdate, KeyUpdate, UsageRecord, UsageSummary,
+};
 use crate::utils::{random, time};
 
 /// 密钥前缀长度，含 `ak_`。
@@ -46,6 +48,7 @@ pub async fn create(pool: &SqlitePool, payload: KeyCreate) -> Result<ApiKey> {
             secret: &plaintext,
             key_prefix: &prefix_of(&plaintext),
             credits_scaled,
+            unlimited: payload.unlimited,
             enabled: true,
             allowed_models: &payload.allowed_models,
             created_at: time::now_secs(),
@@ -132,13 +135,26 @@ pub async fn update(pool: &SqlitePool, id: &str, patch: KeyUpdate) -> Result<Api
 }
 
 /// 设定余额（充值或人工校正）。
-pub async fn set_credits(pool: &SqlitePool, id: &str, text: &str) -> Result<ApiKey> {
-    let credits_scaled = parse_credits(text)?;
+/// 调整额度设置：余额与无限开关，只改传了的那部分。
+pub async fn set_credits(pool: &SqlitePool, id: &str, patch: KeyCreditsUpdate) -> Result<ApiKey> {
+    if patch.credits.is_none() && patch.unlimited.is_none() {
+        return Err(Error::BadRequest(
+            "至少要提交 credits 或 unlimited 之一".to_string(),
+        ));
+    }
 
     // 不存在就提前报错，避免静默更新 0 行。
     get(pool, id).await?;
 
-    db::keys::set_credits(pool, id, credits_scaled, time::now_secs()).await?;
+    if let Some(text) = patch.credits.as_deref() {
+        let credits_scaled = parse_credits(text)?;
+        db::keys::set_credits(pool, id, credits_scaled, time::now_secs()).await?;
+    }
+
+    if let Some(unlimited) = patch.unlimited {
+        db::keys::set_unlimited(pool, id, unlimited, time::now_secs()).await?;
+    }
+
     get(pool, id).await
 }
 

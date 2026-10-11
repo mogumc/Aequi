@@ -109,11 +109,22 @@ impl TestApp {
 
     /// 直接建一个业务层密钥对象（绕过 HTTP）。
     async fn make_key(&self, credits_text: &str, models: Vec<String>) -> aequi::model::ApiKey {
+        self.make_key_with(credits_text, models, false).await
+    }
+
+    /// 同上，可指定是否无限额度。
+    async fn make_key_with(
+        &self,
+        credits_text: &str,
+        models: Vec<String>,
+        unlimited: bool,
+    ) -> aequi::model::ApiKey {
         key_service::create(
             self.data(),
             KeyCreate {
                 name: "mock-key".to_string(),
                 credits: Some(credits_text.to_string()),
+                unlimited,
                 allowed_models: models,
             },
         )
@@ -614,4 +625,58 @@ async fn usage_limit_is_clamped_by_the_data_layer() {
         .await
         .unwrap();
     assert_eq!(records.len(), 3);
+}
+
+#[tokio::test]
+async fn unlimited_key_never_runs_out_but_still_records_usage() {
+    let app = TestApp::new().await;
+    // 余额为 0 且无限额度：这正是「初始额度无限」的常见形态。
+    let key = app.make_key_with("0", Vec::new(), true).await;
+
+    for _ in 0..3 {
+        let outcome = charge_total(app.data(), &key, "demo-model", 10_000)
+            .await
+            .expect("无限额度不该因余额不足失败");
+        assert_eq!(outcome.credits_scaled, credits::CREDIT_SCALE);
+    }
+
+    // 余额始终不动。
+    let current = key_service::get(app.data(), &key.id).await.unwrap();
+    assert_eq!(current.credits_scaled, 0, "无限额度不应扣减余额");
+    assert!(current.unlimited);
+
+    // 但消耗照记：三笔记录，合计 3 积分。
+    let records = key_service::usage(app.data(), &key.id, 10).await.unwrap();
+    assert_eq!(records.len(), 3, "无限额度同样每次请求都记账");
+    let total: i64 = records.iter().map(|record| record.credits_scaled).sum();
+    assert_eq!(total, 3 * credits::CREDIT_SCALE);
+}
+
+#[tokio::test]
+async fn switching_off_unlimited_restores_the_balance_check() {
+    let app = TestApp::new().await;
+    let key = app.make_key_with("0", Vec::new(), true).await;
+
+    // 无限时随便花。
+    charge_total(app.data(), &key, "demo-model", 10_000)
+        .await
+        .unwrap();
+
+    // 切回有限额度：余额还是 0，下一次就该被拒。
+    let updated = key_service::set_credits(
+        app.data(),
+        &key.id,
+        aequi::model::KeyCreditsUpdate {
+            credits: Some("0".to_string()),
+            unlimited: Some(false),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!updated.unlimited);
+
+    let error = charge_total(app.data(), &updated, "demo-model", 1)
+        .await
+        .expect_err("切回有限额度后余额为 0，应拒绝");
+    assert!(matches!(error, aequi::Error::InsufficientCredits));
 }
