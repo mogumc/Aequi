@@ -169,6 +169,22 @@ async fn json_body(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).expect("响应不是合法 JSON")
 }
 
+/// 便捷包装：按总 token 数构造一次简单计费（输入为 0、输出为总量）。
+async fn charge_total(
+    pool: &sqlx::SqlitePool,
+    key: &aequi::model::ApiKey,
+    model: &str,
+    total_tokens: i64,
+) -> Result<aequi::service::billing::ChargeOutcome, aequi::Error> {
+    aequi::service::billing::charge(
+        pool,
+        key,
+        model,
+        aequi::proxy::scheme::Usage::new(0, total_tokens),
+    )
+    .await
+}
+
 #[tokio::test]
 async fn created_key_can_authenticate_and_admin_can_read_it_back() {
     let app = TestApp::new().await;
@@ -269,7 +285,7 @@ async fn charging_deducts_credits_and_records_usage() {
     let key = app.make_key("1", Vec::new()).await;
 
     // 10000 token、1.0 倍 → 恰好 1 积分
-    let outcome = billing::charge(app.data(), &key, "demo-model", 10_000)
+    let outcome = charge_total(app.data(), &key, "demo-model", 10_000)
         .await
         .expect("扣费应当成功");
 
@@ -278,7 +294,7 @@ async fn charging_deducts_credits_and_records_usage() {
     assert_eq!(outcome.remaining_scaled, 0);
 
     // 余额已空，再扣一分都不行
-    let error = billing::charge(app.data(), &key, "demo-model", 1)
+    let error = charge_total(app.data(), &key, "demo-model", 1)
         .await
         .expect_err("余额不足应当报错");
     assert!(matches!(error, Error::InsufficientCredits));
@@ -312,7 +328,7 @@ async fn model_multiplier_scales_the_bill() {
 
     let key = app.make_key("5", Vec::new()).await;
 
-    let outcome = billing::charge(app.data(), &key, "demo-double", 10_000)
+    let outcome = charge_total(app.data(), &key, "demo-double", 10_000)
         .await
         .expect("扣费应当成功");
 
@@ -340,7 +356,7 @@ async fn model_whitelist_and_disabled_state_are_enforced() {
     assert!(limited.allows_model("demo-allowed"));
     assert!(!limited.allows_model("demo-denied"));
 
-    let error = billing::charge(app.data(), &limited, "demo-denied", 100)
+    let error = charge_total(app.data(), &limited, "demo-denied", 100)
         .await
         .expect_err("白名单外的模型应当被拒");
     assert!(matches!(error, Error::Forbidden(_)));
@@ -348,7 +364,7 @@ async fn model_whitelist_and_disabled_state_are_enforced() {
     // 白名单为空表示不限制
     let open = app.make_key("10", Vec::new()).await;
     assert!(open.allows_model("anything"));
-    assert!(billing::charge(app.data(), &open, "anything", 100)
+    assert!(charge_total(app.data(), &open, "anything", 100)
         .await
         .is_ok());
 
@@ -421,7 +437,7 @@ async fn key_only_reads_its_own_usage() {
 
     // 第一把密钥产生一条用量
     let first_key = key_service::authenticate(app.data(), &first).await.unwrap();
-    billing::charge(app.data(), &first_key, "demo-model", 5_000)
+    charge_total(app.data(), &first_key, "demo-model", 5_000)
         .await
         .unwrap();
 
@@ -526,7 +542,7 @@ async fn charging_a_disabled_key_reports_forbidden_not_insufficient() {
     .await
     .unwrap();
 
-    let error = billing::charge(app.data(), &key, "demo-model", 100)
+    let error = charge_total(app.data(), &key, "demo-model", 100)
         .await
         .expect_err("停用的密钥不应扣费成功");
     assert!(
@@ -541,7 +557,7 @@ async fn charging_a_disabled_key_reports_forbidden_not_insufficient() {
 
     // 确实余额不足时，仍然是 402
     let poor = app.make_key("0.0001", Vec::new()).await;
-    let error = billing::charge(app.data(), &poor, "demo-model", 100)
+    let error = charge_total(app.data(), &poor, "demo-model", 100)
         .await
         .expect_err("余额不足应当报错");
     assert!(matches!(error, Error::InsufficientCredits));
@@ -553,7 +569,7 @@ async fn deleting_a_key_cascades_its_usage_records() {
     let app = TestApp::new().await;
     let key = app.make_key("10", Vec::new()).await;
 
-    billing::charge(app.data(), &key, "demo-model", 5_000)
+    charge_total(app.data(), &key, "demo-model", 5_000)
         .await
         .unwrap();
     assert_eq!(
@@ -583,7 +599,7 @@ async fn usage_limit_is_clamped_by_the_data_layer() {
     let key = app.make_key("10", Vec::new()).await;
 
     for _ in 0..3 {
-        billing::charge(app.data(), &key, "demo-model", 1)
+        charge_total(app.data(), &key, "demo-model", 1)
             .await
             .unwrap();
     }

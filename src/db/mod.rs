@@ -24,6 +24,7 @@ pub mod account;
 pub mod block;
 pub mod keys;
 pub mod models;
+pub mod proxy_log;
 pub mod session;
 pub mod settings;
 pub mod usage;
@@ -141,6 +142,8 @@ pub async fn migrate_data(pool: &SqlitePool) -> anyhow::Result<()> {
         ("upstream_blocks", UPSTREAM_BLOCKS_DDL),
         ("upstream_keys", UPSTREAM_KEYS_DDL),
         ("idx_upstream_keys_block", UPSTREAM_KEYS_BLOCK_INDEX),
+        ("proxy_logs", PROXY_LOGS_DDL),
+        ("idx_proxy_logs_time", PROXY_LOGS_TIME_INDEX),
     ] {
         sqlx::query(ddl)
             .execute(pool)
@@ -254,16 +257,48 @@ CREATE TABLE IF NOT EXISTS api_keys (
 /// 倍率按记账当时的取值快照下来，事后调整倍率不会改写历史账单。
 const USAGE_RECORDS_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS usage_records (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    key_id         TEXT    NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
-    model          TEXT    NOT NULL,
-    raw_tokens     INTEGER NOT NULL,
-    multiplier_bp  INTEGER NOT NULL,
-    final_tokens   INTEGER NOT NULL,
-    credits_scaled INTEGER NOT NULL,
-    created_at     INTEGER NOT NULL
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_id            TEXT    NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+    model             TEXT    NOT NULL,
+    raw_tokens        INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_tokens      INTEGER NOT NULL DEFAULT 0,
+    estimated         INTEGER NOT NULL DEFAULT 0,
+    multiplier_bp     INTEGER NOT NULL DEFAULT 10000,
+    final_tokens      INTEGER NOT NULL DEFAULT 0,
+    credits_scaled    INTEGER NOT NULL DEFAULT 0,
+    status            TEXT    NOT NULL DEFAULT 'success',
+    error             TEXT,
+    created_at        INTEGER NOT NULL
 )
 "#;
+
+/// 代理详细日志。管理员排障用，与密钥侧的用量记录物理分表。
+const PROXY_LOGS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS proxy_logs (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at        INTEGER NOT NULL,
+    access_key_id     TEXT    NOT NULL,
+    block_id          TEXT,
+    upstream_key_id   TEXT,
+    model             TEXT    NOT NULL DEFAULT '',
+    ip                TEXT,
+    user_agent        TEXT,
+    status            TEXT    NOT NULL,
+    error_detail      TEXT,
+    duration_ms       INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_tokens      INTEGER NOT NULL DEFAULT 0,
+    estimated         INTEGER NOT NULL DEFAULT 0,
+    credits_scaled    INTEGER NOT NULL DEFAULT 0
+)
+"#;
+
+/// 按时间清理与按时间倒序列都要走到这一列。
+const PROXY_LOGS_TIME_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_proxy_logs_time ON proxy_logs(created_at)";
 
 /// 模型配置。
 ///

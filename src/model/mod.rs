@@ -4,6 +4,7 @@ mod account;
 mod block;
 pub mod credits;
 mod key;
+mod log;
 mod session;
 mod usage;
 
@@ -13,5 +14,6 @@ pub use block::{
     UpstreamBlock, UpstreamKey, UpstreamKeyCreate, UpstreamKeyView,
 };
 pub use key::{ApiKey, KeyCreate, KeyCreditsUpdate, KeySelfView, KeyUpdate, KeyView};
+pub use log::{NewProxyLog, ProxyLog, ProxyLogView};
 pub use session::{NewSession, Session, SessionView};
 pub use usage::{UsageRecord, UsageSummary, UsageView};
