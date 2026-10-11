@@ -193,7 +193,9 @@ async fn available_models_list_both_spellings() {
     app.add_block("block-a", &["shared", "a-only"]).await.unwrap();
     app.add_block("block-b", &["shared"]).await.unwrap();
 
-    let models = upstream_service::available_models(app.data()).await.unwrap();
+    let models = upstream_service::available_models(app.data(), &demo_key(Vec::new()))
+        .await
+        .unwrap();
 
     // 短名去重
     assert!(models.contains(&"shared".to_string()));
@@ -207,8 +209,62 @@ async fn available_models_list_both_spellings() {
     assert!(models.contains(&"block-a/a-only".to_string()));
     assert!(!models.contains(&"block-b/a-only".to_string()));
 
-    // 白名单按模型名比对，不认前缀
-    let mut key = aequi::model::ApiKey {
+    // 白名单决定能看到什么：只放行 block-a 的 shared
+    let key = demo_key(vec!["block-a/shared".to_string()]);
+    let visible = upstream_service::available_models(app.data(), &key)
+        .await
+        .unwrap();
+    assert!(visible.contains(&"shared".to_string()), "被允许的块提供它，短名可用");
+    assert!(visible.contains(&"block-a/shared".to_string()));
+    assert!(!visible.contains(&"block-b/shared".to_string()), "没被允许的块不该出现");
+    assert!(!visible.contains(&"a-only".to_string()));
+
+    // 白名单为空即不限制
+    let open = demo_key(Vec::new());
+    let all = upstream_service::available_models(app.data(), &open)
+        .await
+        .unwrap();
+    assert!(all.contains(&"block-a/shared".to_string()));
+    assert!(all.contains(&"block-b/shared".to_string()));
+}
+
+/// 白名单必须能区分「a 的 shared」与「b 的 shared」。
+///
+/// 否则下游密钥只允许了 a 的同名模型，请求短名时仍可能被轮询到 b——
+/// 那是它没有获得授权的上游。
+#[tokio::test]
+async fn whitelist_is_per_block_not_just_model_name() {
+    let app = TestApp::new().await;
+    app.add_block("block-a", &["shared"]).await.unwrap();
+    app.add_block("block-b", &["shared"]).await.unwrap();
+
+    // 只允许块 a 的 shared
+    let key = demo_key(vec!["block-a/shared".to_string()]);
+
+    let allowed = upstream_service::allowed_blocks(app.data(), "shared", &key)
+        .await
+        .unwrap();
+    assert_eq!(allowed, vec!["block-a".to_string()], "只该剩下被允许的那个块");
+}
+
+/// 白名单为空 = 不限制，所有块都可用。
+#[tokio::test]
+async fn empty_whitelist_allows_every_block() {
+    let app = TestApp::new().await;
+    app.add_block("block-a", &["shared"]).await.unwrap();
+    app.add_block("block-b", &["shared"]).await.unwrap();
+
+    let key = demo_key(Vec::new());
+    let allowed = upstream_service::allowed_blocks(app.data(), "shared", &key)
+        .await
+        .unwrap();
+
+    assert_eq!(allowed.len(), 2);
+    assert!(allowed.contains(&"block-a".to_string()) && allowed.contains(&"block-b".to_string()));
+}
+
+fn demo_key(allowed_models: Vec<String>) -> aequi::model::ApiKey {
+    aequi::model::ApiKey {
         id: "k".to_string(),
         name: "k".to_string(),
         secret: "ak_demo".to_string(),
@@ -216,19 +272,9 @@ async fn available_models_list_both_spellings() {
         credits_scaled: 0,
         unlimited: false,
         enabled: true,
-        allowed_models: vec!["shared".to_string()],
+        allowed_models,
         created_at: 0,
         updated_at: 0,
         last_used_at: None,
-    };
-    let kept = upstream_service::filter_by_whitelist(models.clone(), &key);
-    assert!(kept.contains(&"block-a/shared".to_string()));
-    assert!(!kept.contains(&"block-a/a-only".to_string()));
-
-    // 白名单为空即不限制
-    key.allowed_models.clear();
-    assert_eq!(
-        upstream_service::filter_by_whitelist(models.clone(), &key).len(),
-        models.len()
-    );
+    }
 }

@@ -29,8 +29,7 @@ pub async fn list_models(
     Extension(context): Extension<KeyContext>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>> {
-    let models = upstream::available_models(&state.store.data).await?;
-    let models = upstream::filter_by_whitelist(models, &context.key);
+    let models = upstream::available_models(&state.store.data, &context.key).await?;
 
     // 各家客户端对 created / owned_by 的处理不一，但 OpenAI 的形状里带着，
     // 缺了会让部分 SDK 解析失败，所以补齐。

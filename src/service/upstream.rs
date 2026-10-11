@@ -166,44 +166,29 @@ fn validate_models(models: &[ModelEntry]) -> Result<()> {
     Ok(())
 }
 
-/// 当前对外可用的模型名，含**短名**与**带块前缀的全名**两种写法。
+/// 该密钥当前可用的模型名，含**短名**与**带块前缀的全名**两种写法。
 ///
-/// 短名（`gpt-4o`）在所有提供它的块之间加权轮询；全名（`block-a/gpt-4o`）
-/// 把请求锁定到那个块。短名去重合并，全名一个块一条——同一个模型在不同块
-/// 可能有不同的价与出口，那正是要能分别指定的理由。
+/// 短名（`gpt-4o`）在该密钥**被允许的**那些块之间加权轮询；全名
+/// （`block-a/gpt-4o`）把请求锁定到那个块。白名单为空即不限制。
 ///
-/// 只统计**启用**的块：停用的块不参与调度，它的模型也就调不到。
-pub async fn available_models(pool: &SqlitePool) -> Result<Vec<String>> {
+/// 短名只在**至少有一个被允许的块**提供它时才出现——否则列出来也调不通。
+pub async fn available_models(pool: &SqlitePool, key: &ApiKey) -> Result<Vec<String>> {
     let blocks = db::block::list_blocks(pool).await?;
 
-    let mut names = std::collections::BTreeSet::new();
+    let mut short = std::collections::BTreeSet::new();
+    let mut full = std::collections::BTreeSet::new();
+
     for block in blocks.iter().filter(|block| block.enabled) {
         for model in &block.models {
-            names.insert(model.name.clone());
-            names.insert(format!("{}/{}", block.id, model.name));
+            if !key.allows_capability(&block.id, &model.name) {
+                continue;
+            }
+            short.insert(model.name.clone());
+            full.insert(format!("{}/{}", block.id, model.name));
         }
     }
 
-    Ok(names.into_iter().collect())
-}
-
-/// 按密钥白名单收敛可用模型。
-///
-/// 白名单为空表示不限制；非空时只留下白名单里确实存在的那些——
-/// 白名单里的名字可能已经从所有块里删掉了，那种名字调不到，不该报给下游。
-/// 带块前缀的写法按**模型名**比对白名单（白名单里存的是模型名，不含块）。
-pub fn filter_by_whitelist(models: Vec<String>, key: &ApiKey) -> Vec<String> {
-    if key.allowed_models.is_empty() {
-        return models;
-    }
-
-    models
-        .into_iter()
-        .filter(|name| {
-            let short = name.rsplit_once('/').map_or(name.as_str(), |(_, rest)| rest);
-            key.allows_model(short)
-        })
-        .collect()
+    Ok(short.into_iter().chain(full).collect())
 }
 
 /// 用块自己的出口与密钥去上游拉一次可用模型列表。
@@ -614,27 +599,57 @@ pub async fn resolve_with_header(
     Ok(target)
 }
 
+/// 该密钥请求某个模型时，实际允许使用的块。
+///
+/// 白名单的条目是**全名**（`块id/模型名`）。同一个模型名出现在两个块里时，
+/// 那是两条彼此独立的授权——出口与价格都可能不同。所以「只允许了 a 的 gpt-4o」
+/// 时，这里不会把 b 也算进来，短名请求自然也不会被轮询到 b。
+///
+/// 白名单为空表示不限制，返回全部可用的块。
+pub async fn allowed_blocks(
+    pool: &SqlitePool,
+    model: &str,
+    key: &ApiKey,
+) -> Result<Vec<String>> {
+    let blocks = db::block::list_blocks(pool).await?;
+
+    Ok(blocks
+        .iter()
+        .filter(|block| block.enabled && block.accepts(model))
+        .filter(|block| key.allows_capability(&block.id, model))
+        .map(|block| block.id.clone())
+        .collect())
+}
+
 /// 选一个能处理该模型的块。
 ///
 /// `only` 非空时只在指定块里选——请求里带了块前缀或 `X-Aequi-Block` 头时为真。
-/// 其余情况把所有提供该模型的启用块交给平滑加权轮询。
+/// 其余情况在**该密钥被允许的、能处理该模型的块**之间做平滑加权轮询；
+/// 一个都没有就报错，绝不退到未授权的块上。
 pub async fn select_block(
     pool: &SqlitePool,
     state: &UpstreamState,
+    key: &ApiKey,
     model: &str,
     only: Option<&str>,
 ) -> Result<UpstreamBlock> {
     let blocks = db::block::list_blocks(pool).await?;
 
+    let allowed = allowed_blocks(pool, model, key).await?;
+
     let candidates: Vec<(String, u32)> = blocks
         .iter()
         .filter(|block| block.enabled && block.accepts(model))
+        .filter(|block| allowed.contains(&block.id))
         .filter(|block| only.is_none_or(|id| block.id == id))
         .map(|block| (block.id.clone(), block.weight))
         .collect();
 
     if candidates.is_empty() {
         return Err(match only {
+            Some(id) if !allowed.iter().any(|item| item == id) => Error::Forbidden(format!(
+                "该密钥无权使用模型 {model}（块 {id}）"
+            )),
             Some(id) => Error::NotFound(format!("块 {id} 不提供模型 {model}")),
             None => Error::NotFound(format!("没有可处理模型 {model} 的上游")),
         });

@@ -258,7 +258,7 @@ pub async fn chat_completion_stream(
     let mut last_failure = None;
 
     for _ in 0..MAX_ATTEMPTS {
-        let block = match upstream::select_block(pool, &state.upstream, &request.model, only).await {
+        let block = match upstream::select_block(pool, &state.upstream, &key, &request.model, only).await {
             Ok(block) => block,
             Err(error) => return Err(error),
         };
@@ -486,7 +486,7 @@ pub async fn chat_completion_stream(
             usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
         }
 
-        match billing::charge(pool, &key, &model, usage, multiplier_bp, true).await {
+        match billing::charge(pool, &key, &block_id, &model, usage, multiplier_bp, true).await {
             Ok(charge) => {
                 write_log(
                     pool,
@@ -561,7 +561,7 @@ async fn dispatch(
 
     for _ in 0..MAX_ATTEMPTS {
         // 每一轮都重新挑：上一把密钥进入退避后，这里会自然落到下一把。
-        let block = match upstream::select_block(pool, &state.upstream, &request.model, only).await {
+        let block = match upstream::select_block(pool, &state.upstream, &key, &request.model, only).await {
             Ok(block) => block,
             Err(error) => return Err(Failure::bare(error)),
         };
@@ -661,6 +661,7 @@ async fn dispatch(
                 let charge = match billing::charge(
                     pool,
                     key,
+                    &block.id,
                     &request.model,
                     usage,
                     block.multiplier_bp(&request.model),

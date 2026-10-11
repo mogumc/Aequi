@@ -140,7 +140,7 @@ async fn dispatch(
     let mut last_failure = None;
 
     for _ in 0..MAX_ATTEMPTS {
-        let block = match upstream::select_block(pool, &state.upstream, model, only).await {
+        let block = match upstream::select_block(pool, &state.upstream, key, model, only).await {
             Ok(block) => block,
             Err(error) => return Err(Failure::bare(error)),
         };
@@ -253,7 +253,15 @@ async fn dispatch(
                 });
 
                 let charge =
-                    match billing::charge(pool, key, model, usage, block.multiplier_bp(model), false)
+                    match billing::charge(
+                            pool,
+                            key,
+                            &block.id,
+                            model,
+                            usage,
+                            block.multiplier_bp(model),
+                            false,
+                        )
                         .await
                     {
                         Ok(charge) => charge,

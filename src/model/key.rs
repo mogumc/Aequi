@@ -34,9 +34,20 @@ pub struct ApiKey {
 }
 
 impl ApiKey {
-    /// 是否允许调用该模型。白名单为空时视为不限制。
-    pub fn allows_model(&self, model: &str) -> bool {
-        self.allowed_models.is_empty() || self.allowed_models.iter().any(|item| item == model)
+    /// 是否允许调用**某个块的**某个模型。
+    ///
+    /// 白名单的条目是**全名**（`块id/模型名`）。同一个模型名出现在两个块里时，
+    /// 那是两条彼此独立的授权——两个块的出口、价格都可能不同，允许一个不等于
+    /// 允许另一个。所以白名单不能只记模型名，否则「只允许了 a 的 gpt-4o」
+    /// 会连 b 的 gpt-4o 一起放行。
+    ///
+    /// 白名单为空表示不限制。
+    pub fn allows_capability(&self, block_id: &str, model: &str) -> bool {
+        self.allowed_models.is_empty()
+            || self
+                .allowed_models
+                .iter()
+                .any(|item| item == &format!("{block_id}/{model}"))
     }
 }
 

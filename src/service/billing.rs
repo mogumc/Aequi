@@ -30,12 +30,15 @@ pub struct ChargeOutcome {
 pub async fn charge(
     pool: &SqlitePool,
     key: &ApiKey,
+    // 实际命中并已向上游发起请求的块——白名单按「块 + 模型」判定，
+    // 所以这里必须知道是哪个块，光有模型名无法确认这次调用是否被授权。
+    block_id: &str,
     model: &str,
     usage: Usage,
     multiplier_bp: i64,
     stream: bool,
 ) -> Result<ChargeOutcome> {
-    ensure_usable(key, model)?;
+    ensure_usable(key, block_id, model)?;
 
     if usage.total_tokens < 0 {
         return Err(Error::BadRequest("token 用量不能为负".to_string()));
@@ -91,13 +94,15 @@ pub async fn charge(
     })
 }
 
-/// 校验密钥本身可用，且允许调用该模型。
-fn ensure_usable(key: &ApiKey, model: &str) -> Result<()> {
+/// 校验密钥本身可用，且允许调用该块的该模型。
+fn ensure_usable(key: &ApiKey, block_id: &str, model: &str) -> Result<()> {
     if !key.enabled {
         return Err(Error::Forbidden("该密钥已被停用".to_string()));
     }
-    if !key.allows_model(model) {
-        return Err(Error::Forbidden(format!("该密钥无权使用模型 {model}")));
+    if !key.allows_capability(block_id, model) {
+        return Err(Error::Forbidden(format!(
+            "该密钥无权使用模型 {model}（块 {block_id}）"
+        )));
     }
     Ok(())
 }

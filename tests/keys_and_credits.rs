@@ -21,6 +21,9 @@ use aequi::service::{keys as key_service, password};
 use aequi::utils::random;
 use aequi::{api, AppState, Error};
 
+/// 计费测试里假装命中的块 id（白名单是全名，所以要有个块）。
+const DEMO_BLOCK_ID: &str = "demo-block";
+
 const DEMO_USERNAME: &str = "mock-operator";
 const DEMO_PASSWORD: &str = "mock-password-for-tests";
 
@@ -208,6 +211,7 @@ async fn charge_with_multiplier(
     aequi::service::billing::charge(
         pool,
         key,
+        DEMO_BLOCK_ID,
         model,
         aequi::proxy::scheme::Usage::new(0, total_tokens),
         multiplier_bp,
@@ -390,9 +394,11 @@ fn model_entry_multiplier_defaults_to_one() {
 async fn model_whitelist_and_disabled_state_are_enforced() {
     let app = TestApp::new().await;
 
-    let limited = app.make_key("10", vec!["demo-allowed".to_string()]).await;
-    assert!(limited.allows_model("demo-allowed"));
-    assert!(!limited.allows_model("demo-denied"));
+    let limited = app
+        .make_key("10", vec![format!("{DEMO_BLOCK_ID}/demo-allowed")])
+        .await;
+    assert!(limited.allows_capability(DEMO_BLOCK_ID, "demo-allowed"));
+    assert!(!limited.allows_capability(DEMO_BLOCK_ID, "demo-denied"));
 
     let error = charge_total(app.data(), &limited, "demo-denied", 100)
         .await
@@ -401,7 +407,7 @@ async fn model_whitelist_and_disabled_state_are_enforced() {
 
     // 白名单为空表示不限制
     let open = app.make_key("10", Vec::new()).await;
-    assert!(open.allows_model("anything"));
+    assert!(open.allows_capability(DEMO_BLOCK_ID, "anything"));
     assert!(charge_total(app.data(), &open, "anything", 100)
         .await
         .is_ok());
