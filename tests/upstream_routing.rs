@@ -278,3 +278,43 @@ fn demo_key(allowed_models: Vec<String>) -> aequi::model::ApiKey {
         last_used_at: None,
     }
 }
+
+/// 批量添加密钥：重复的自动跳过，其余入库——批量导入几百把时
+/// 不可能让人自己去把重复的挑出来。
+#[tokio::test]
+async fn duplicate_keys_are_skipped_not_rejected() {
+    let app = TestApp::new().await;
+    app.add_block("block-a", &["demo-model"]).await.unwrap();
+
+    let create = |secrets: Vec<&str>| upstream_service::add_keys(
+        app.data(),
+        "block-a",
+        aequi::model::UpstreamKeyCreate {
+            secrets: secrets.into_iter().map(str::to_string).collect(),
+            weight: 1,
+        },
+    );
+
+    // 首批：两把正常入库
+    let first = create(vec!["sk-alpha", "sk-beta"]).await.unwrap();
+    assert_eq!(first.keys.len(), 2);
+    assert_eq!(first.skipped, 0);
+
+    // 二批：一把与已有重复、一把与同批重复、一把全新、一把空白
+    let second = create(vec!["sk-alpha", "sk-gamma", "sk-gamma", "  ", "sk-delta"])
+        .await
+        .unwrap();
+    assert_eq!(second.keys.len(), 2, "只有 gamma 与 delta 是新的");
+    assert_eq!(second.skipped, 3);
+    let names: Vec<&str> = second
+        .keys
+        .iter()
+        .map(|key| key.secret.as_str())
+        .collect();
+    assert_eq!(names, vec!["sk-gamma", "sk-delta"]);
+
+    // 全部重复：不报错，返回空 + 跳过数
+    let third = create(vec!["sk-alpha", "sk-beta"]).await.unwrap();
+    assert!(third.keys.is_empty());
+    assert_eq!(third.skipped, 2);
+}
