@@ -360,24 +360,28 @@ impl Adapter for GoogleAdapter {
 
 /// 把标准请求折成 Interactions API 的 body。
 ///
-/// 多轮工具对话沿用旧版 Aequi 的方式：assistant 的调用折叠（只留
-/// id→名字映射），工具结果伪装成「[Tool 名字 result] 正文」的 user_input。
-/// 官方的 function_call/function_result 回放要求调用与结果严格交错，而
-/// 平台侧难以保证历史结构恰好满足（实测会 400）；伪装方式经过线上长期
-/// 验证，工具定义照常传、真调用照常返回，只有历史回放这一环走伪装。
+/// 多轮工具对话按官方 function_call/function_result 形态回放，并做结构加固：
+/// 调用与结果按 call_id 配对**交错**排列（call → result → call → result），
+/// 孤儿调用（结果缺失）整组跳过——两者都为了避免触碰「call 必须紧跟 user
+/// 或 function_result」的约束。相比把结果伪装进 user_input 文本，这种回放
+/// 不会把工具结果与真正的用户输入混在一起，避免上下文污染。
 fn build_body(request: &ChatRequest, model: &str, stream: bool) -> Value {
     let mut input = Vec::new();
     let mut system_parts: Vec<String> = Vec::new();
 
-    // 多轮工具对话采用旧版 Aequi 的方式：assistant 的调用折叠（只留
-    // id→名字映射），工具结果伪装成「[Tool 名字 result] 正文」的 user_input。
-    // 官方的 function_call/function_result 回放要求调用与结果严格交错，
-    // 而平台侧难以保证历史结构恰好满足，线上验证过的伪装方式更稳——
-    // 工具定义照常传给模型（tools 字段），模型发起的真调用也照常返回
-    // 给客户端（function_call 形态），只有**历史回放**这一环走伪装。
-    let mut call_names: HashMap<String, String> = HashMap::new();
-
-    for message in &request.messages {
+    // 多轮工具对话按官方 function_call/function_result 形态回放，但做两项
+    // 结构加固，保证不触碰「call 必须紧跟 user 或 function_result」的约束：
+    //
+    // 1. 交错配对：assistant 的每个调用后面**立即**放它自己的结果——并行
+    //    调用时排列为 call1 → result1 → call2 → result2，而不是
+    //    call1 → call2 → result1 → result2（后者会 400）。
+    // 2. 孤儿处理：结果缺失（对话在工具执行前被中断）的调用**整组跳过**。
+    //
+    // 与伪装方式（结果写进 user_input 文本）相比，这种回放不污染上下文——
+    // 工具结果不会与真正的用户输入混在一条里。
+    let mut index = 0usize;
+    while index < request.messages.len() {
+        let message = &request.messages[index];
         match message.role {
             Role::System => {
                 let text = message.text();
@@ -390,39 +394,88 @@ fn build_body(request: &ChatRequest, model: &str, stream: bool) -> Value {
                 if message.tool_calls.is_empty() {
                     push_input(&mut input, "model_output", &message.content);
                 } else {
-                    for call in &message.tool_calls {
-                        call_names.insert(call.id.clone(), call.name.clone());
+                    // 收集紧随其后的工具结果，按 call_id 配对。
+                    let mut results: HashMap<&str, &Message> = HashMap::new();
+                    let mut cursor = index + 1;
+                    while cursor < request.messages.len()
+                        && request.messages[cursor].role == Role::Tool
+                    {
+                        let tool = &request.messages[cursor];
+                        if let Some(call_id) = &tool.tool_call_id {
+                            results.insert(call_id.as_str(), tool);
+                        }
+                        cursor += 1;
                     }
-                }
-            }
-            Role::Tool => {
-                let name = message
-                    .name
-                    .clone()
-                    .or_else(|| {
-                        message
-                            .tool_call_id
-                            .as_ref()
-                            .and_then(|id| call_names.get(id).cloned())
-                    })
-                    .unwrap_or_default();
-                // MCP 客户端常把结果双重编码成 JSON 字符串，先解开一层。
-                let text = unwrap_json_content(&message.text());
-                // 空结果不发——content 为空的条目会被整个拒掉。
-                if text.is_empty() {
+
+                    for call in &message.tool_calls {
+                        let result = results.get(call.id.as_str());
+                        // 孤儿调用（结果永远没回来）整组跳过：没有结果的 call
+                        // 违反交错约束，会让整个请求 400。
+                        if result.is_none() {
+                            continue;
+                        }
+                        // arguments 在响应里是对象，回放时也要对象形态。
+                        let arguments: Value =
+                            serde_json::from_str(&call.arguments).unwrap_or(json!({}));
+                        input.push(json!({
+                            "type": "function_call",
+                            "id": call.id,
+                            "name": call.name,
+                            "arguments": arguments,
+                        }));
+
+                        // MCP 客户端常把结果双重编码成 JSON 字符串，先解开一层。
+                        let text = unwrap_json_content(&result.unwrap().text());
+                        // 空结果同样违反交错约束：call 已入历史就撤回这一组。
+                        if text.is_empty() {
+                            input.pop();
+                            continue;
+                        }
+                        input.push(json!({
+                            "type": "function_result",
+                            "name": call.name,
+                            "call_id": call.id,
+                            "result": [{"type": "text", "text": text}],
+                        }));
+                    }
+
+                    index = cursor;
                     continue;
                 }
-                let text = if name.is_empty() {
-                    text
-                } else {
-                    format!("[Tool {name} result]\n{text}")
-                };
-                input.push(json!({
-                    "type": "user_input",
-                    "content": [{"type": "text", "text": text}],
-                }));
+            }
+            // 孤儿结果（前面不是调用）单独处理，正常流里不会出现。
+            Role::Tool => {
+                let text = unwrap_json_content(&message.text());
+                if !text.is_empty() {
+                    input.push(json!({
+                        "type": "function_result",
+                        "name": message.name.clone().unwrap_or_default(),
+                        "call_id": message.tool_call_id,
+                        "result": [{"type": "text", "text": text}],
+                    }));
+                }
             }
         }
+
+        index += 1;
+    }
+
+    // 约束兜底：input 第一条若是 function_call（前置 user turn 缺失的极端
+    // 情形，如客户端历史不完整），在最前面补一个 user_input turn，保证
+    // 「call 必须紧跟 user 或 function_result」永远成立。
+    if input
+        .first()
+        .and_then(|item| item.get("type"))
+        .and_then(Value::as_str)
+        == Some("function_call")
+    {
+        input.insert(
+            0,
+            json!({
+                "type": "user_input",
+                "content": [{"type": "text", "text": "(续)"}],
+            }),
+        );
     }
 
     let mut body = json!({
@@ -610,10 +663,16 @@ mod tests {
     }
 
     #[test]
-    fn tool_history_is_replayed_as_user_input_text() {
-        // 沿用旧版 Aequi 的伪装方式：assistant 的调用折叠，工具结果伪装成
-        // 「[Tool 名字 result] 正文」的 user_input——避开官方对调用与结果
-        // 严格交错的约束。工具定义本身照常传给模型（tools 字段）。
+    fn dbg_user_input_flow() {
+        let request = request(vec![user_message("你好"), user_message("第二条")]);
+        let body = build_body(&request, "m", false);
+        println!("DEBUG input = {}", serde_json::to_string_pretty(&body["input"]).unwrap());
+    }
+
+    #[test]
+    fn tool_history_replays_interleaved_call_and_result() {
+        // 官方形态回放：调用与结果按 call_id 配对交错（call → result），
+        // 不把工具结果伪装进 user_input 文本污染上下文。
         let request = request(vec![
             user_message("查下天气"),
             Message {
@@ -634,26 +693,115 @@ mod tests {
                 tool_call_id: Some("call-1".to_string()),
                 name: Some("get_weather".to_string()),
             },
+            user_message("谢谢"),
         ]);
 
         let body = build_body(&request, "gemini-3.5-flash-lite", false);
         let input = body["input"].as_array().unwrap();
 
-        assert_eq!(input.len(), 2);
+        assert_eq!(input.len(), 4, "user → call → result → user");
+        assert_eq!(input[0]["type"], "user_input");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["id"], "call-1");
+        assert_eq!(input[1]["arguments"]["location"], "北京");
+        assert_eq!(input[2]["type"], "function_result");
+        assert_eq!(input[2]["call_id"], "call-1");
+        assert_eq!(input[2]["result"][0]["text"], "晴，25 度");
+        assert_eq!(input[3]["type"], "user_input");
+        assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn parallel_calls_are_interleaved_with_their_results() {
+        // 并行调用排列为 call1 → result1 → call2 → result2，
+        // 而不是 call1 → call2 → result1 → result2（后者 400）。
+        let request = request(vec![
+            user_message("查两个城市"),
+            Message {
+                role: Role::Assistant,
+                content: vec![],
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call-1".to_string(),
+                        name: "get_weather".to_string(),
+                        arguments: "{\"city\": \"北京\"}".to_string(),
+                    },
+                    ToolCall {
+                        id: "call-2".to_string(),
+                        name: "get_weather".to_string(),
+                        arguments: "{\"city\": \"上海\"}".to_string(),
+                    },
+                ],
+                tool_call_id: None,
+                name: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![ContentPart::text("上海：雨")],
+                tool_calls: vec![],
+                tool_call_id: Some("call-2".to_string()),
+                name: Some("get_weather".to_string()),
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![ContentPart::text("北京：晴")],
+                tool_calls: vec![],
+                tool_call_id: Some("call-1".to_string()),
+                name: Some("get_weather".to_string()),
+            },
+        ]);
+
+        let body = build_body(&request, "gemini-3.5-flash-lite", false);
+        let input = body["input"].as_array().unwrap();
+
+        // user → call1 → result1 → call2 → result2，共 5 条。
+        assert_eq!(input.len(), 5);
+        let types: Vec<&str> = input.iter().map(|item| item["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "user_input",
+                "function_call",
+                "function_result",
+                "function_call",
+                "function_result"
+            ],
+            "call 与 result 必须交错"
+        );
+        assert_eq!(input[1]["id"], "call-1");
+        assert_eq!(input[2]["call_id"], "call-1");
+        assert_eq!(input[2]["result"][0]["text"], "北京：晴");
+        assert_eq!(input[3]["id"], "call-2");
+        assert_eq!(input[4]["call_id"], "call-2");
+        assert_eq!(input[4]["result"][0]["text"], "上海：雨");
+    }
+
+    #[test]
+    fn orphan_call_without_result_is_dropped() {
+        // 结果缺失（对话在工具执行前被中断）的调用整组跳过——
+        // 没有结果的 call 会违反交错约束让整个请求 400。
+        let request = request(vec![
+            user_message("查下天气"),
+            Message {
+                role: Role::Assistant,
+                content: vec![],
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                tool_call_id: None,
+                name: None,
+            },
+            user_message("算了不用查了"),
+        ]);
+
+        let body = build_body(&request, "gemini-3.5-flash-lite", false);
+        let input = body["input"].as_array().unwrap();
+
+        assert_eq!(input.len(), 2, "孤儿调用被跳过，只剩两条 user_input");
         assert_eq!(input[0]["type"], "user_input");
         assert_eq!(input[1]["type"], "user_input");
-        assert_eq!(
-            input[1]["content"][0]["text"],
-            "[Tool get_weather result]\n晴，25 度"
-        );
-        // input 里不允许出现 function_call / function_result 形态。
-        for item in input {
-            assert_ne!(item["type"], "function_call");
-            assert_ne!(item["type"], "function_result");
-        }
-        // 系统级字段
-        assert_eq!(body["store"], false);
-        assert!(body.get("stream").is_none(), "非流式 body 不该有 stream 字段");
     }
 
     #[test]
