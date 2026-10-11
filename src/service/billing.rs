@@ -6,6 +6,7 @@ use crate::db;
 use crate::db::usage::NewUsage;
 use crate::error::{Error, Result};
 use crate::model::{credits, ApiKey};
+use crate::proxy::scheme::Usage;
 use crate::utils::time;
 
 /// 试算结果。
@@ -22,7 +23,8 @@ pub struct Quote {
 #[derive(Debug, Clone)]
 pub struct ChargeOutcome {
     pub model: String,
-    pub raw_tokens: i64,
+    /// 上游报（或本地估算）的用量。
+    pub usage: Usage,
     pub multiplier_bp: i64,
     pub final_tokens: i64,
     pub credits_scaled: i64,
@@ -59,21 +61,22 @@ pub async fn quote(pool: &SqlitePool, key: &ApiKey, model: &str, raw_tokens: i64
 /// 记账：校验 → 折算 → 扣费 → 写用量。
 ///
 /// 扣费与写记录放在同一个事务里，不会出现「扣了钱没账单」或反过来的情况。
+/// 用量是完整的分解（输入/输出/缓存），缓存部分只记录、不参与折扣。
 pub async fn charge(
     pool: &SqlitePool,
     key: &ApiKey,
     model: &str,
-    raw_tokens: i64,
+    usage: Usage,
 ) -> Result<ChargeOutcome> {
     ensure_usable(key, model)?;
 
-    if raw_tokens < 0 {
+    if usage.total_tokens < 0 {
         return Err(Error::BadRequest("token 用量不能为负".to_string()));
     }
 
     let multiplier_bp = multiplier_bp(pool, model).await?;
-    let final_tokens = credits::final_tokens(raw_tokens, multiplier_bp);
-    let credits_scaled = credits::cost_scaled(raw_tokens, multiplier_bp);
+    let final_tokens = credits::final_tokens(usage.total_tokens, multiplier_bp);
+    let credits_scaled = credits::cost_scaled(usage.total_tokens, multiplier_bp);
     let now = time::now_secs();
 
     let mut tx = pool.begin().await?;
@@ -91,7 +94,11 @@ pub async fn charge(
         &NewUsage {
             key_id: &key.id,
             model,
-            raw_tokens,
+            raw_tokens: usage.total_tokens,
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            cache_tokens: usage.cache_tokens,
+            estimated: usage.estimated,
             multiplier_bp,
             final_tokens,
             credits_scaled,
@@ -104,7 +111,7 @@ pub async fn charge(
 
     Ok(ChargeOutcome {
         model: model.to_string(),
-        raw_tokens,
+        usage,
         multiplier_bp,
         final_tokens,
         credits_scaled,
