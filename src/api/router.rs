@@ -22,14 +22,14 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::response::Redirect;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, post};
 use axum::{middleware, Json, Router};
 use serde::Serialize;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::api::{
-    auth, blocks, device, key_auth, key_portal, keys, logs, middleware as auth_middleware, models,
-    otp, proxy_api, settings, stats,
+    auth, blocks, device, key_auth, key_portal, keys, logs, middleware as auth_middleware, otp,
+    proxy_api, settings, stats,
 };
 use crate::db;
 use crate::error::Result;
@@ -75,8 +75,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/blocks/{id}/test", post(blocks::test_block))
         .route("/logs", get(logs::list))
         .route("/stats", get(stats::overview))
-        .route("/models", get(models::list).post(models::create))
-        .route("/models/{name}", patch(models::update).delete(models::delete))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware::require_auth,

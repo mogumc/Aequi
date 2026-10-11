@@ -244,8 +244,11 @@ async fn dispatch(
                     )
                 });
 
-                let charge = match billing::charge(pool, key, model, usage, false).await {
-                    Ok(charge) => charge,
+                let charge =
+                    match billing::charge(pool, key, model, usage, block.multiplier_bp(model), false)
+                        .await
+                    {
+                        Ok(charge) => charge,
                     Err(error) => {
                         let user_message = error.to_string();
                         return Err(Failure::with_context(error, user_message, context));

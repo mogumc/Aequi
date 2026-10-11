@@ -34,7 +34,7 @@
 
 - 时间一律秒级 Unix 时间戳（INTEGER）。
 - 积分在 JSON 里是**四位小数字符串**，同值另有 `*_scaled` 整数字段（1 积分 = 10000）便于精确计算。
-- 倍率（万分比整数，10000 = 1.0 倍）在 JSON 里是四位小数字符串。
+- 计费倍率是**万分比整数**（10000 = 1.0 倍），配置在块的模型条目上（`multiplier_bp`）。
 - 列表类接口的 `limit` 类参数都会被服务端收敛到安全区间，传超界值不会报错、只会被夹住。
 
 ---
@@ -178,26 +178,11 @@
 
 `KeyView`：`id`、`name`、`secret`（明文）、`key_prefix`、`credits`、`credits_scaled`、`unlimited`、`enabled`、`allowed_models`、`created_at`、`updated_at`、`last_used_at`。
 
-### 模型（计费配置）
-
-管的是「对外模型名 → 倍率」这张表。**模型能不能调用由上游块决定**，
-没配倍率的模型照常可用，只是按默认 1.0 倍计费；删除配置同样是回落默认，
-不会让模型不可用。
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET` | `/api/models` | 列表（按名称排序） |
-| `POST` | `/api/models` | 创建：`{ name, multiplier? }`，倍率缺省 1.0；重名报 400 |
-| `PATCH` | `/api/models/{name}` | 更新：`{ multiplier?, enabled? }`，只改提交的字段 |
-| `DELETE` | `/api/models/{name}` | 删除（回落默认倍率） |
-
-`ModelView`：`name`、`multiplier`（四位小数字符串）、`multiplier_bp`（万分比整数）、
-`enabled`、`created_at`、`updated_at`。停用（`enabled: false`）即该配置不生效。
-
-模型名走路径参数，**含 `/` 的名称需要调用方先做 URL 编码**
-（前端用 `encodeURIComponent`）。倍率是四位小数以内的非负数。
-
 ### 上游块
+
+块是代理的调度单位：**一个块只允许一种 API 格式**，内含一组上游密钥，
+以及它对外接受的**模型列表**——模型属于块，计费倍率也跟着模型走，
+所以同一个模型名在不同块里可以有不同的价。
 
 块是代理的调度单位：**一个块只允许一种 API 格式**，内含一组上游密钥。
 
@@ -226,12 +211,16 @@
   "weight": 1,
   "base_url": "https://api.openai.com",
   "proxy": "http://127.0.0.1:7890",
-  "models": [{ "name": "gpt-4o", "forward": "gpt-4o-2024-11-20" }]
+  "models": [
+    { "name": "gpt-4o", "forward": "gpt-4o-2024-11-20", "multiplier_bp": 15000 },
+    { "name": "gpt-4o-mini" }
+  ]
 }
 ```
 
 - `api_format`：`openai` | `google` | `anthropic`。
-- `models[].forward` 缺省表示同名转发。
+- `models[]`：本块对外接受的模型；`forward` 缺省表示同名转发；
+  **`multiplier_bp` 是该模型的计费倍率（万分比整数，10000 = 1.0 倍）**，缺省 1.0。
 - 密钥生命周期自治：成功清零失败计数、429 退避 30 秒、连续失败 3 次自动停用。
 
 #### `POST /api/blocks/{id}/test`

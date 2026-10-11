@@ -23,7 +23,6 @@
 pub mod account;
 pub mod block;
 pub mod keys;
-pub mod models;
 pub mod proxy_log;
 pub mod session;
 pub mod settings;
@@ -137,7 +136,6 @@ pub async fn migrate_data(pool: &SqlitePool) -> anyhow::Result<()> {
     for (name, ddl) in [
         ("api_keys", API_KEYS_DDL),
         ("usage_records", USAGE_RECORDS_DDL),
-        ("models", MODELS_DDL),
         ("idx_usage_key_time", USAGE_KEY_TIME_INDEX),
         ("upstream_blocks", UPSTREAM_BLOCKS_DDL),
         ("upstream_keys", UPSTREAM_KEYS_DDL),
@@ -304,18 +302,7 @@ CREATE TABLE IF NOT EXISTS proxy_logs (
 const PROXY_LOGS_TIME_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_proxy_logs_time ON proxy_logs(created_at)";
 
-/// 模型配置。
-///
-/// 本轮只建表预留：倍率参与计费，但模型的增删改查属于模型管理模块，尚未实现。
-const MODELS_DDL: &str = r#"
-CREATE TABLE IF NOT EXISTS models (
-    name          TEXT    PRIMARY KEY,
-    multiplier_bp INTEGER NOT NULL DEFAULT 10000,
-    enabled       INTEGER NOT NULL DEFAULT 1,
-    created_at    INTEGER NOT NULL,
-    updated_at    INTEGER NOT NULL
-)
-"#;
+
 
 const USAGE_KEY_TIME_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_usage_key_time ON usage_records(key_id, created_at DESC)";

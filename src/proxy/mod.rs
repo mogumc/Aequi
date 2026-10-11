@@ -23,7 +23,7 @@ use futures_util::{Stream as FutureStream, StreamExt};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
-use crate::model::{ApiKey, NewProxyLog, UpstreamBlock};
+use crate::model::{credits, ApiKey, NewProxyLog, UpstreamBlock};
 use crate::proxy::adapter::{adapter_for, AuthStyle, UpstreamRequest};
 use crate::proxy::scheme::{ChatRequest, ChatResponse, FinishReason, StreamEvent, Usage};
 use crate::service::{billing, upstream};
@@ -241,6 +241,8 @@ pub async fn chat_completion_stream(
     // 建流前的重试窗口。
     let mut upstream = None;
     let mut chosen: Option<(String, String, crate::model::ApiFormat)> = None;
+    // 倍率取自最终选中的那个块的模型条目；块本身不会进到流里，这里先取出来。
+    let mut multiplier_bp = credits::DEFAULT_MULTIPLIER_BP;
     let mut last_failure = None;
 
     for _ in 0..MAX_ATTEMPTS {
@@ -263,6 +265,7 @@ pub async fn chat_completion_stream(
             .await
         {
             Ok(response) if response.status().is_success() => {
+                multiplier_bp = block.multiplier_bp(&request.model);
                 upstream = Some(response);
                 chosen = Some((block.id, upstream_key.id, block.api_format));
                 break;
@@ -468,7 +471,7 @@ pub async fn chat_completion_stream(
             usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
         }
 
-        match billing::charge(pool, &key, &request.model, usage, true).await {
+        match billing::charge(pool, &key, &request.model, usage, multiplier_bp, true).await {
             Ok(charge) => {
                 write_log(
                     pool,
@@ -638,7 +641,16 @@ async fn dispatch(
                     response.usage
                 };
 
-                let charge = match billing::charge(pool, key, &request.model, usage, false).await {
+                let charge = match billing::charge(
+                    pool,
+                    key,
+                    &request.model,
+                    usage,
+                    block.multiplier_bp(&request.model),
+                    false,
+                )
+                .await
+                {
                     Ok(charge) => charge,
                     Err(error) => {
                         let user_message = error.to_string();

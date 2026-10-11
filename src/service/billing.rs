@@ -9,16 +9,6 @@ use crate::model::{credits, ApiKey};
 use crate::proxy::scheme::Usage;
 use crate::utils::time;
 
-/// 试算结果。
-#[derive(Debug, Clone, Copy)]
-pub struct Quote {
-    pub multiplier_bp: i64,
-    pub final_tokens: i64,
-    pub credits_scaled: i64,
-    /// 当前余额是否够付。
-    pub affordable: bool,
-}
-
 /// 一次记账的结果。
 #[derive(Debug, Clone)]
 pub struct ChargeOutcome {
@@ -32,34 +22,9 @@ pub struct ChargeOutcome {
     pub remaining_scaled: i64,
 }
 
-/// 取模型倍率；表里没有该模型时用默认倍率。
-///
-/// 倍率的维护接口属于模型模块，本轮只消费它。
-pub async fn multiplier_bp(pool: &SqlitePool, model: &str) -> Result<i64> {
-    Ok(db::models::find_multiplier_bp(pool, model)
-        .await?
-        .unwrap_or(credits::DEFAULT_MULTIPLIER_BP))
-}
-
-/// 试算：只算不落账。
-///
-/// 便于调用方在真正发起上游请求前先确认余额够不够。
-pub async fn quote(pool: &SqlitePool, key: &ApiKey, model: &str, raw_tokens: i64) -> Result<Quote> {
-    ensure_usable(key, model)?;
-
-    let multiplier_bp = multiplier_bp(pool, model).await?;
-    let credits_scaled = credits::cost_scaled(raw_tokens, multiplier_bp);
-
-    Ok(Quote {
-        multiplier_bp,
-        final_tokens: credits::final_tokens(raw_tokens, multiplier_bp),
-        credits_scaled,
-        affordable: key.credits_scaled >= credits_scaled,
-    })
-}
-
 /// 记账：校验 → 折算 → 扣费 → 写用量。
 ///
+/// 倍率由调用方传入——它是**块内模型条目**的属性，只有调度层知道这次用了哪个块。
 /// 扣费与写记录放在同一个事务里，不会出现「扣了钱没账单」或反过来的情况。
 /// 用量是完整的分解（输入/输出/缓存），缓存部分只记录、不参与折扣。
 pub async fn charge(
@@ -67,6 +32,7 @@ pub async fn charge(
     key: &ApiKey,
     model: &str,
     usage: Usage,
+    multiplier_bp: i64,
     stream: bool,
 ) -> Result<ChargeOutcome> {
     ensure_usable(key, model)?;
@@ -75,7 +41,6 @@ pub async fn charge(
         return Err(Error::BadRequest("token 用量不能为负".to_string()));
     }
 
-    let multiplier_bp = multiplier_bp(pool, model).await?;
     let final_tokens = credits::final_tokens(usage.total_tokens, multiplier_bp);
     let credits_scaled = credits::cost_scaled(usage.total_tokens, multiplier_bp);
     let now = time::now_secs();

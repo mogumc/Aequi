@@ -11,7 +11,6 @@ pub mod billing;
 pub mod device;
 pub mod keys;
 pub mod maintenance;
-pub mod models;
 pub mod otp;
 pub mod password;
 pub mod provider;

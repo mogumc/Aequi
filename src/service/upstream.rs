@@ -15,8 +15,8 @@ use sqlx::SqlitePool;
 use crate::db;
 use crate::error::{Error, Result};
 use crate::model::{
-    BlockCreate, BlockUpdate, BlockView, KeyStatus, UpstreamBlock, UpstreamKey, UpstreamKeyCreate,
-    UpstreamKeyView,
+    BlockCreate, BlockUpdate, BlockView, KeyStatus, ModelEntry, UpstreamBlock, UpstreamKey,
+    UpstreamKeyCreate, UpstreamKeyView,
 };
 use crate::proxy;
 use crate::proxy::adapter::{adapter_for, ProbeOutcome};
@@ -118,6 +118,24 @@ impl UpstreamState {
 
 // ---------- 管理面 ----------
 
+/// 校验块的模型条目。
+///
+/// 倍率是计费的乘数，负数会让计费方向反转（消耗变收入），必须在入口挡住。
+fn validate_models(models: &[ModelEntry]) -> Result<()> {
+    for entry in models {
+        if entry.name.trim().is_empty() {
+            return Err(Error::BadRequest("模型名不能为空".to_string()));
+        }
+        if entry.multiplier_bp < 0 {
+            return Err(Error::BadRequest(format!(
+                "模型 {} 的倍率不能为负",
+                entry.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// 创建块。
 pub async fn create_block(pool: &SqlitePool, payload: BlockCreate) -> Result<UpstreamBlock> {
     let id = payload.id.trim().to_string();
@@ -127,6 +145,7 @@ pub async fn create_block(pool: &SqlitePool, payload: BlockCreate) -> Result<Ups
     if payload.base_url.trim().is_empty() {
         return Err(Error::BadRequest("base_url 不能为空".to_string()));
     }
+    validate_models(&payload.models)?;
 
     let now = time::now_secs();
     let block = UpstreamBlock {
@@ -169,6 +188,10 @@ pub async fn update_block(
         models,
         enabled,
     } = patch;
+
+    if let Some(models) = &models {
+        validate_models(models)?;
+    }
 
     let current = get_block(pool, id).await?;
     let mut block = current;

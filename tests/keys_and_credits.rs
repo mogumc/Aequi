@@ -17,7 +17,7 @@ use tower::ServiceExt;
 use aequi::config::Settings;
 use aequi::db;
 use aequi::model::{credits, KeyCreate};
-use aequi::service::{billing, keys as key_service, models as model_service, password};
+use aequi::service::{keys as key_service, password};
 use aequi::utils::random;
 use aequi::{api, AppState, Error};
 
@@ -180,18 +180,37 @@ async fn json_body(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).expect("响应不是合法 JSON")
 }
 
-/// 便捷包装：按总 token 数构造一次简单计费（输入为 0、输出为总量）。
+/// 便捷包装：按总 token 数构造一次简单计费（输入为 0、输出为总量），默认 1.0 倍率。
 async fn charge_total(
     pool: &sqlx::SqlitePool,
     key: &aequi::model::ApiKey,
     model: &str,
     total_tokens: i64,
 ) -> Result<aequi::service::billing::ChargeOutcome, aequi::Error> {
+    charge_with_multiplier(
+        pool,
+        key,
+        model,
+        total_tokens,
+        aequi::model::credits::DEFAULT_MULTIPLIER_BP,
+    )
+    .await
+}
+
+/// 同上，但指定倍率——现实中倍率来自块内的模型条目，由调度层传入。
+async fn charge_with_multiplier(
+    pool: &sqlx::SqlitePool,
+    key: &aequi::model::ApiKey,
+    model: &str,
+    total_tokens: i64,
+    multiplier_bp: i64,
+) -> Result<aequi::service::billing::ChargeOutcome, aequi::Error> {
     aequi::service::billing::charge(
         pool,
         key,
         model,
         aequi::proxy::scheme::Usage::new(0, total_tokens),
+        multiplier_bp,
         false,
     )
     .await
@@ -326,21 +345,10 @@ async fn charging_deducts_credits_and_records_usage() {
 #[tokio::test]
 async fn model_multiplier_scales_the_bill() {
     let app = TestApp::new().await;
-
-    // 预置一条 2 倍模型（模型管理接口尚未实现，这里直接写表）
-    sqlx::query(
-        "INSERT INTO models (name, multiplier_bp, enabled, created_at, updated_at) \
-         VALUES (?, ?, 1, 0, 0)",
-    )
-    .bind("demo-double")
-    .bind(20_000_i64)
-    .execute(app.data())
-    .await
-    .expect("写入模型失败");
-
     let key = app.make_key("5", Vec::new()).await;
 
-    let outcome = charge_total(app.data(), &key, "demo-double", 10_000)
+    // 倍率由调度层按块内模型条目给出，这里直接传进去。
+    let outcome = charge_with_multiplier(app.data(), &key, "demo-double", 10_000, 20_000)
         .await
         .expect("扣费应当成功");
 
@@ -351,13 +359,31 @@ async fn model_multiplier_scales_the_bill() {
         "3.0000"
     );
 
-    // 未配置倍率的模型走默认 1.0 倍
-    let plain = billing::quote(app.data(), &key, "demo-plain", 10_000)
+    // 不传倍率的那条路走默认 1.0 倍
+    let plain = charge_total(app.data(), &key, "demo-plain", 10_000)
         .await
         .unwrap();
     assert_eq!(plain.multiplier_bp, credits::DEFAULT_MULTIPLIER_BP);
     assert_eq!(plain.credits_scaled, credits::CREDIT_SCALE);
-    assert!(plain.affordable);
+}
+
+/// 块内模型条目自带倍率：显式配置生效，缺省按 1.0。
+#[test]
+fn model_entry_multiplier_defaults_to_one() {
+    let premium: aequi::model::ModelEntry =
+        serde_json::from_value(serde_json::json!({ "name": "premium", "multiplier_bp": 25000 }))
+            .expect("条目应当能解析");
+    assert_eq!(premium.multiplier_bp, 25_000);
+    assert_eq!(premium.target(), "premium");
+
+    // 旧数据没有倍率字段，也必须能解析（按 1.0 处理）。
+    let legacy: aequi::model::ModelEntry = serde_json::from_value(serde_json::json!({
+        "name": "plain",
+        "forward": "upstream-plain"
+    }))
+    .expect("缺少倍率字段的旧条目也应当能解析");
+    assert_eq!(legacy.multiplier_bp, credits::DEFAULT_MULTIPLIER_BP);
+    assert_eq!(legacy.target(), "upstream-plain");
 }
 
 #[tokio::test]
@@ -679,80 +705,4 @@ async fn switching_off_unlimited_restores_the_balance_check() {
         .await
         .expect_err("切回有限额度后余额为 0，应拒绝");
     assert!(matches!(error, aequi::Error::InsufficientCredits));
-}
-
-#[tokio::test]
-async fn model_multiplier_config_drives_billing() {
-    let app = TestApp::new().await;
-    let key = app.make_key("10", Vec::new()).await;
-
-    // 没配置：按默认 1.0 计费。
-    let outcome = charge_total(app.data(), &key, "demo-model", 10_000)
-        .await
-        .unwrap();
-    assert_eq!(outcome.credits_scaled, credits::CREDIT_SCALE);
-
-    // 配 2.0 倍率：同样 10000 token 花两倍。
-    model_service::create(
-        app.data(),
-        aequi::model::ModelCreate {
-            name: "demo-model".to_string(),
-            multiplier: Some("2.0".to_string()),
-        },
-    )
-    .await
-    .unwrap();
-
-    let outcome = charge_total(app.data(), &key, "demo-model", 10_000)
-        .await
-        .unwrap();
-    assert_eq!(outcome.credits_scaled, 2 * credits::CREDIT_SCALE);
-
-    // 停用配置：回落默认倍率。
-    model_service::update(
-        app.data(),
-        "demo-model",
-        aequi::model::ModelUpdate {
-            multiplier: None,
-            enabled: Some(false),
-        },
-    )
-    .await
-    .unwrap();
-
-    let outcome = charge_total(app.data(), &key, "demo-model", 10_000)
-        .await
-        .unwrap();
-    assert_eq!(outcome.credits_scaled, credits::CREDIT_SCALE);
-
-    // 重名创建被拒。
-    let error = model_service::create(
-        app.data(),
-        aequi::model::ModelCreate {
-            name: "demo-model".to_string(),
-            multiplier: None,
-        },
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(error, aequi::Error::BadRequest(_)));
-
-    // 倍率必须是非负数。
-    let error = model_service::create(
-        app.data(),
-        aequi::model::ModelCreate {
-            name: "negative-model".to_string(),
-            multiplier: Some("-1".to_string()),
-        },
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(error, aequi::Error::BadRequest(_)));
-
-    // 删除后同样回落默认。
-    model_service::delete(app.data(), "demo-model").await.unwrap();
-    let outcome = charge_total(app.data(), &key, "demo-model", 10_000)
-        .await
-        .unwrap();
-    assert_eq!(outcome.credits_scaled, credits::CREDIT_SCALE);
 }

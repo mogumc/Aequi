@@ -35,7 +35,7 @@ impl ApiFormat {
     }
 }
 
-/// 模型条目：本块对外接受的名字，以及转发给上游时替换成的名字。
+/// 模型条目：本块对外接受的名字、转发给上游时替换成的名字，以及计费倍率。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntry {
     /// 对外的模型名，也就是用户请求里写的那个。
@@ -43,6 +43,17 @@ pub struct ModelEntry {
     /// 转发给上游时使用的名字。留空表示同名转发。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forward: Option<String>,
+    /// 计费倍率，万分比整数（10000 = 1.0 倍）。
+    ///
+    /// 倍率跟着模型走，而模型是块内配置的——同一个模型名在不同块里
+    /// 可以有不同的价。旧数据缺这个字段时按 1.0 处理。
+    #[serde(default = "default_multiplier_bp")]
+    pub multiplier_bp: i64,
+}
+
+/// 未配置倍率时的默认值：1.0 倍。
+fn default_multiplier_bp() -> i64 {
+    crate::model::credits::DEFAULT_MULTIPLIER_BP
 }
 
 impl ModelEntry {
@@ -83,6 +94,18 @@ impl UpstreamBlock {
             .find(|entry| entry.name == model)
             .map(|entry| entry.target().to_string())
             .unwrap_or_else(|| model.to_string())
+    }
+
+    /// 该模型在本块的计费倍率（万分比）。
+    ///
+    /// 块里没列这个模型时返回默认倍率——能走到计费说明请求已经被本块接下了，
+    /// 此时缺一条倍率配置不该让请求失败。
+    pub fn multiplier_bp(&self, model: &str) -> i64 {
+        self.models
+            .iter()
+            .find(|entry| entry.name == model)
+            .map(|entry| entry.multiplier_bp)
+            .unwrap_or(crate::model::credits::DEFAULT_MULTIPLIER_BP)
     }
 }
 
