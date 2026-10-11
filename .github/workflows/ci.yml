@@ -1,0 +1,35 @@
+name: CI
+
+# 持续质量门：每次推送与 PR 都跑检查和测试。
+# 发布流水线（docker.yml / rust_release.yml）各自内嵌了同样的测试门，
+# 这里的价值在于日常开发期的快速反馈。
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Check & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Check（含测试与示例代码）
+        run: cargo check --all-targets --locked
+
+      - name: Test
+        run: cargo test --locked

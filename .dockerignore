@@ -1,0 +1,5 @@
+# 构建上下文只需要 Dockerfile 与预编译二进制，其余全部排除——
+# 仓库里的 target/ 动辄几个 GB，不排除的话每次构建上传上下文就要几分钟。
+*
+!aequi-linux-*
+!Dockerfile
