@@ -844,6 +844,161 @@ async fn device_ip(app: &TestApp, token: &str) -> String {
     body["devices"][0]["ip"].as_str().unwrap().to_string()
 }
 
+#[tokio::test]
+async fn password_change_verifies_current_and_revokes_other_devices() {
+    let app = TestApp::new().await;
+    app.seed_account().await;
+
+    // 两台设备同时在线
+    let first = app.login().await;
+    let second = app.login().await;
+
+    // 当前密码不对 → 拒绝
+    let response = app
+        .router()
+        .oneshot(authorized(
+            json_request(
+                Method::POST,
+                "/api/auth/password",
+                json!({
+                    "current_password": "not-the-password",
+                    "new_password": "new-secret",
+                    "confirm_password": "new-secret",
+                }),
+            ),
+            &first,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // 两次输入不一致 → 400（前端已比对，后端不依赖它）
+    let response = app
+        .router()
+        .oneshot(authorized(
+            json_request(
+                Method::POST,
+                "/api/auth/password",
+                json!({
+                    "current_password": DEMO_PASSWORD,
+                    "new_password": "new-secret",
+                    "confirm_password": "new-secret-typo",
+                }),
+            ),
+            &first,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // 与当前密码相同 → 拒绝
+    let response = app
+        .router()
+        .oneshot(authorized(
+            json_request(
+                Method::POST,
+                "/api/auth/password",
+                json!({
+                    "current_password": DEMO_PASSWORD,
+                    "new_password": DEMO_PASSWORD,
+                    "confirm_password": DEMO_PASSWORD,
+                }),
+            ),
+            &first,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // 正常修改
+    let body = json_body(
+        app.router()
+            .oneshot(authorized(
+                json_request(
+                    Method::POST,
+                    "/api/auth/password",
+                    json!({
+                        "current_password": DEMO_PASSWORD,
+                        "new_password": "new-secret",
+                        "confirm_password": "new-secret",
+                    }),
+                ),
+                &first,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["revoked_devices"], 1, "应撤销其它设备");
+
+    // 发起修改的设备保持登录
+    let response = app
+        .router()
+        .oneshot(authorized(get("/api/auth/me"), &first))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 另一台设备被要求重新登录
+    let response = app
+        .router()
+        .oneshot(authorized(get("/api/auth/me"), &second))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // 旧密码失效、新密码可用
+    let response = app
+        .router()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/auth/login",
+            json!({ "username": DEMO_USERNAME, "password": DEMO_PASSWORD }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .router()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/auth/login",
+            json!({ "username": DEMO_USERNAME, "password": "new-secret" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn cli_reset_sets_password_without_the_current_one() {
+    let app = TestApp::new().await;
+    let account_id = app.seed_account().await;
+
+    // 命令行重置不问旧密码——那恰恰是忘掉的东西
+    aequi::service::auth::reset_password(app.state.pool(), account_id, "reset-secret")
+        .await
+        .expect("重置应当成功");
+
+    let response = app
+        .router()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/auth/login",
+            json!({ "username": DEMO_USERNAME, "password": "reset-secret" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "重置后的新密码应当可用");
+
+    // 空密码仍然被拒
+    let error = aequi::service::auth::reset_password(app.state.pool(), account_id, "")
+        .await
+        .expect_err("空密码应当被拒绝");
+    assert!(matches!(error, aequi::Error::BadRequest(_)));
+}
+
 /// 用与验证器 App 相同的方式算出当前验证码。
 fn current_code(secret_base32: &str) -> String {
     use totp_rs::{Algorithm, Builder, Secret};
