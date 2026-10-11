@@ -142,6 +142,10 @@ pub struct Usage {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    /// 命中缓存的输入 token。各家字段不同，这里归一。
+    pub cache_tokens: i64,
+    /// true 表示这套数字是本地估算的，不是上游报的。
+    pub estimated: bool,
 }
 
 impl Usage {
@@ -151,6 +155,19 @@ impl Usage {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            cache_tokens: 0,
+            estimated: false,
+        }
+    }
+
+    /// 本地估算出来的用量（见 [`crate::proxy::estimate`]）。
+    pub fn estimated(prompt_tokens: i64, completion_tokens: i64) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            cache_tokens: 0,
+            estimated: true,
         }
     }
 }

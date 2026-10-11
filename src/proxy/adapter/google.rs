@@ -235,7 +235,7 @@ fn finish_reason(value: Option<&str>) -> FinishReason {
     }
 }
 
-/// 用量字段名与 OpenAI 完全不同。
+/// 用量字段名与 OpenAI 完全不同，缓存命中在 cachedContentTokenCount。
 fn parse_usage(value: Option<&Value>) -> Usage {
     let Some(value) = value else {
         return Usage::default();
@@ -257,5 +257,10 @@ fn parse_usage(value: Option<&Value>) -> Usage {
             .get("totalTokenCount")
             .and_then(Value::as_i64)
             .unwrap_or(prompt_tokens + completion_tokens),
+        cache_tokens: value
+            .get("cachedContentTokenCount")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        estimated: false,
     }
 }

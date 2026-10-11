@@ -266,20 +266,31 @@ fn finish_reason(value: Option<&str>) -> FinishReason {
     }
 }
 
-/// 字段名与 OpenAI 不同：input_tokens / output_tokens。
+/// 字段名与 OpenAI 不同：input_tokens / output_tokens；
+/// 缓存命中分读、写两类，读的那部分记入 cache_tokens。
 fn parse_usage(value: Option<&Value>) -> Usage {
     let Some(value) = value else {
         return Usage::default();
     };
 
-    Usage::new(
-        value
-            .get("input_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
-        value
-            .get("output_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
-    )
+    let prompt_tokens = value
+        .get("input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let completion_tokens = value
+        .get("output_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let cache_tokens = value
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+
+    Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+        cache_tokens,
+        estimated: false,
+    }
 }

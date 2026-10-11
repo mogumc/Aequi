@@ -228,7 +228,7 @@ pub(crate) fn finish_reason(value: Option<&str>) -> FinishReason {
     }
 }
 
-/// 解析用量。上游给的字段名一致，缺失时按 0 处理。
+/// 解析用量。缓存命中在 `prompt_tokens_details.cached_tokens` 里。
 fn parse_usage(value: Option<&Value>) -> Usage {
     let Some(value) = value else {
         return Usage::default();
@@ -250,6 +250,11 @@ fn parse_usage(value: Option<&Value>) -> Usage {
             .get("total_tokens")
             .and_then(Value::as_i64)
             .unwrap_or(prompt_tokens + completion_tokens),
+        cache_tokens: value
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        estimated: false,
     }
 }
 
