@@ -10,8 +10,6 @@
 //! 都不能出现在输入里，所以多轮工具对话要把「assistant 的调用」折叠掉、
 //! 把「工具结果」伪装成一段 `user_input` 文本补回去。
 
-use std::collections::HashMap;
-
 use serde_json::{json, Map, Value};
 
 use crate::error::{Error, Result};
@@ -285,13 +283,15 @@ impl Adapter for GoogleAdapter {
 
 /// 把标准请求折成 Interactions API 的 body。
 ///
-/// 多轮工具对话的难点在 `input`：这个 API 拒绝 `function_call` 与
-/// `function_result` 形态的输入，所以 assistant 的调用只留下 id→名字的映射，
-/// 工具结果伪装成一段 `[Tool {name} result]` 的 `user_input` 文本补回去。
+/// 多轮工具对话按官方文档（api-revision 2026-05-20）回放：`store: false` 的
+/// 无状态模式下，模型生成的 `function_call` 步骤要**原样**放进历史，
+/// 工具结果用 `function_result` 形态（name + call_id + result 数组）。
+/// 早期版本的 API 拒绝这两种输入，旧版 Aequi 因此把调用折叠、把结果伪装成
+/// user_input 文本——现在官方已经支持，伪装反而会让模型看不到自己上轮
+/// 发起过调用，下一轮就把调用意图退化写成正文里的伪标记。
 fn build_body(request: &ChatRequest, model: &str, stream: bool) -> Value {
     let mut input = Vec::new();
     let mut system_parts: Vec<String> = Vec::new();
-    let mut call_names: HashMap<String, String> = HashMap::new();
 
     for message in &request.messages {
         match message.role {
@@ -307,7 +307,15 @@ fn build_body(request: &ChatRequest, model: &str, stream: bool) -> Value {
                     push_input(&mut input, "model_output", &message.content);
                 } else {
                     for call in &message.tool_calls {
-                        call_names.insert(call.id.clone(), call.name.clone());
+                        // arguments 在响应里是对象，回放时也要对象形态。
+                        let arguments: Value =
+                            serde_json::from_str(&call.arguments).unwrap_or(json!({}));
+                        input.push(json!({
+                            "type": "function_call",
+                            "id": call.id,
+                            "name": call.name,
+                            "arguments": arguments,
+                        }));
                     }
                 }
             }
@@ -319,23 +327,24 @@ fn build_body(request: &ChatRequest, model: &str, stream: bool) -> Value {
                         message
                             .tool_call_id
                             .as_ref()
-                            .and_then(|id| call_names.get(id).cloned())
+                            .map(|id| {
+                                // 名字缺失时用调用 id 占位：call_id 才是官方的
+                                // 关联键，占位只影响可读性不影响配对。
+                                format!("call_{id}")
+                            })
                     })
                     .unwrap_or_default();
                 // MCP 客户端常把结果双重编码成 JSON 字符串，先解开一层。
                 let text = unwrap_json_content(&message.text());
-                // 空结果不发——content 为空的条目会被整个拒掉。
+                // 空结果不发——result 为空的条目会被整个拒掉。
                 if text.is_empty() {
                     continue;
                 }
-                let text = if name.is_empty() {
-                    text
-                } else {
-                    format!("[Tool {name} result]\n{text}")
-                };
                 input.push(json!({
-                    "type": "user_input",
-                    "content": [{"type": "text", "text": text}],
+                    "type": "function_result",
+                    "name": name,
+                    "call_id": message.tool_call_id,
+                    "result": [{"type": "text", "text": text}],
                 }));
             }
         }
@@ -526,9 +535,10 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_becomes_user_input_not_function_result() {
-        // v1beta Interactions API 拒绝 function_result 输入；
-        // 工具结果必须伪装成 user_input 文本，并带上调用方名字。
+    fn tool_history_replays_as_function_call_and_result() {
+        // store:false 的无状态模式要求把模型生成的 function_call 步骤原样
+        // 回放进历史，工具结果用官方的 function_result 形态——否则模型
+        // 看不到自己上轮发起过调用，下一轮会把调用意图写成正文伪标记。
         let request = request(vec![
             user_message("查下天气"),
             Message {
@@ -537,7 +547,7 @@ mod tests {
                 tool_calls: vec![ToolCall {
                     id: "call-1".to_string(),
                     name: "get_weather".to_string(),
-                    arguments: "{}".to_string(),
+                    arguments: "{\"location\": \"北京\"}".to_string(),
                 }],
                 tool_call_id: None,
                 name: None,
@@ -547,21 +557,26 @@ mod tests {
                 content: vec![ContentPart::text("晴，25 度")],
                 tool_calls: vec![],
                 tool_call_id: Some("call-1".to_string()),
-                name: None,
+                name: Some("get_weather".to_string()),
             },
         ]);
 
         let body = build_body(&request, "gemini-3.5-flash-lite", false);
         let input = body["input"].as_array().unwrap();
 
-        // assistant 的 function_call 被折叠掉，工具结果以 user_input 出现。
-        assert_eq!(input.len(), 2, "input 里不允许出现 function_call/result");
+        // user_input + function_call + function_result 三条。
+        assert_eq!(input.len(), 3);
         assert_eq!(input[0]["type"], "user_input");
-        assert_eq!(input[1]["type"], "user_input");
-        assert_eq!(
-            input[1]["content"][0]["text"],
-            "[Tool get_weather result]\n晴，25 度"
-        );
+        // assistant 的调用原样回放：id / name / arguments（对象形态）。
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["id"], "call-1");
+        assert_eq!(input[1]["name"], "get_weather");
+        assert_eq!(input[1]["arguments"]["location"], "北京");
+        // 工具结果用官方的 function_result 形态。
+        assert_eq!(input[2]["type"], "function_result");
+        assert_eq!(input[2]["name"], "get_weather");
+        assert_eq!(input[2]["call_id"], "call-1");
+        assert_eq!(input[2]["result"][0]["text"], "晴，25 度");
         // 系统级字段
         assert_eq!(body["store"], false);
         assert!(body.get("stream").is_none(), "非流式 body 不该有 stream 字段");
