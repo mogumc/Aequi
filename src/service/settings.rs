@@ -61,12 +61,19 @@ pub async fn update(
         }
         next.token_ttl_hours = hours;
     }
+    if let Some(days) = patch.log_retention_days {
+        if !(1..=365).contains(&days) {
+            return Err(Error::BadRequest("日志保留天数必须在 1 到 365 之间".to_string()));
+        }
+        next.log_retention_days = days;
+    }
 
     db::settings::upsert_many(pool, &next.to_entries(), time::now_secs()).await?;
 
     tracing::info!(
         listen = %next.listen,
         token_ttl_hours = next.token_ttl_hours,
+        log_retention_days = next.log_retention_days,
         "后台设置已更新"
     );
 
