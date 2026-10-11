@@ -31,7 +31,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Row, SqlitePool};
+use sqlx::SqlitePool;
 
 /// 三个域的连接池。
 #[derive(Clone)]
@@ -76,7 +76,6 @@ impl Store {
             ("sessions", SESSIONS_DDL),
             ("settings", SETTINGS_DDL),
             ("idx_sessions_account", SESSIONS_ACCOUNT_INDEX),
-            ("drop idx_sessions_token", DROP_REDUNDANT_TOKEN_INDEX),
         ] {
             sqlx::query(ddl)
                 .execute(&self.control)
@@ -89,8 +88,6 @@ impl Store {
 
     /// 数据面表结构。
     async fn migrate_data(&self) -> anyhow::Result<()> {
-        self.drop_legacy_api_keys().await?;
-
         for (name, ddl) in [
             ("api_keys", API_KEYS_DDL),
             ("usage_records", USAGE_RECORDS_DDL),
@@ -102,43 +99,6 @@ impl Store {
                 .await
                 .with_context(|| format!("执行数据面建表语句失败: {name}"))?;
         }
-
-        Ok(())
-    }
-
-    /// 早期版本的密钥表用散列存凭证，散列不可逆，那些密钥注定取不回明文。
-    ///
-    /// 检测到旧结构就整表重建：留着也毫无用处，管理员重新生成即可。
-    /// 重建会连带清掉它们的用量记录（外键级联），属于数据丢失，
-    /// 所以明确打一条警告而不是静默处理。
-    async fn drop_legacy_api_keys(&self) -> anyhow::Result<()> {
-        let has_legacy_column = sqlx::query(
-            "SELECT COUNT(*) AS n FROM pragma_table_info('api_keys') WHERE name = 'key_hash'",
-        )
-        .fetch_one(&self.data)
-        .await
-        .context("检查密钥表结构失败")?
-        .get::<i64, _>("n")
-            > 0;
-
-        if !has_legacy_column {
-            return Ok(());
-        }
-
-        tracing::warn!(
-            "检测到旧版密钥表（凭证为散列、无法还原明文），正在重建；\
-             原密钥与其用量记录将被清除，请重新生成密钥"
-        );
-
-        // 先删引用方，免得外键约束挡住 DROP。
-        sqlx::query("DROP TABLE IF EXISTS usage_records")
-            .execute(&self.data)
-            .await
-            .context("清理旧用量表失败")?;
-        sqlx::query("DROP TABLE IF EXISTS api_keys")
-            .execute(&self.data)
-            .await
-            .context("清理旧密钥表失败")?;
 
         Ok(())
     }
@@ -216,10 +176,6 @@ CREATE TABLE IF NOT EXISTS settings (
 
 const SESSIONS_ACCOUNT_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id)";
-
-/// 早期版本建的显式索引。`token_hash` 上的唯一约束已经提供了索引，
-/// 这个属于重复，清掉以免白占写入成本。
-const DROP_REDUNDANT_TOKEN_INDEX: &str = "DROP INDEX IF EXISTS idx_sessions_token";
 
 /// 密钥表。积分直接挂在密钥上。
 ///
