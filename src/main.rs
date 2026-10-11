@@ -1,24 +1,68 @@
-#![forbid(unsafe_code)]
-
-//! Aequi v2 — OpenAI-format API transparent proxy.
+//! 二进制入口。
 //!
-//! 模块分层（REFACTOR_PLAN.md §4.1，D7 单 crate + 强边界）：
-//! - [`core`]    纯领域：零 IO、零 hyper、零 sqlx，可 100% 单测
-//! - [`storage`] SQLite 端口与适配（单写者 actor + keyset 分页 + JSONL logsink）
-//! - [`upstream`] 连接层 + 统一输出层（P3）
-//! - [`gateway`] 对外 HTTP（P4）
-//! - [`runtime`] 状态容器与后台任务（P5）
+//! 启动顺序：读引导参数 → 初始化日志 → 建库建表 → 载入设置 → 初始化账号
+//! → 启动后台维护任务 → 启动服务。
+//!
+//! 只有首次启动（数据库文件尚不存在）才接受环境变量形式的初始账号密码；
+//! 后台设置一律以数据库为准，没有配置文件。
 
-pub mod core;
-pub mod gateway;
-pub mod runtime;
-pub mod storage;
-pub mod upstream;
+use std::sync::Arc;
 
-pub use core as domain;
+use aequi::config::{Bootstrap, ADMIN_PASSWORD_ENV};
+use aequi::service::auth::InitialCredentials;
+use aequi::{db, server, service, utils, AppState};
 
-fn main() {
-    // P2 阶段：底层 API 与存储层重构的组装入口随 P4/P5 网关落地时补全。
-    // 当前 crate 以库模块 + 测试驱动（cargo test）为主要验证路径。
-    println!("aequi v2 — construction in progress (P1 core + P2 storage landed)");
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // 引导参数必须在连库之前确定：首次判定依赖数据库文件是否存在。
+    let bootstrap = Bootstrap::from_env();
+    let is_first_run = bootstrap.is_first_run();
+
+    utils::logging::init();
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        database = %bootstrap.database.display(),
+        first_run = is_first_run,
+        "Aequi 启动中"
+    );
+
+    let store = db::Store::connect(&bootstrap.database).await?;
+    store.migrate().await?;
+
+    // 首次启动导入默认设置，之后一律以数据库为准。
+    let settings = service::settings::ensure(&store.control).await?;
+    tracing::info!(listen = %settings.listen, "后台设置已载入");
+
+    match service::auth::initialize_account(&store.control, is_first_run).await? {
+        Some(credentials) => print_initial_credentials(&credentials),
+        None => tracing::info!("账号已存在，跳过初始化"),
+    }
+
+    let state = Arc::new(AppState::new(settings, store));
+    service::maintenance::spawn(state.clone());
+
+    server::serve(state).await
+}
+
+/// 把初始凭据打印到控制台。
+///
+/// 密码只在这一次输出中出现，之后系统仅保存其哈希。
+fn print_initial_credentials(credentials: &InitialCredentials) {
+    println!();
+    println!("================= Aequi 初始账号 =================");
+    println!("  用户名 : {}", credentials.username);
+    if credentials.from_env {
+        println!("  密码   : （由环境变量 {ADMIN_PASSWORD_ENV} 提供，此处不回显）");
+    } else {
+        println!("  密码   : {}", credentials.password);
+    }
+    println!();
+    if credentials.from_env {
+        println!("  凭据来自环境变量，仅首次启动生效，后续启动不再读取。");
+    } else {
+        println!("  该密码为随机生成，仅显示这一次，请立即妥善保存。");
+    }
+    println!("=================================================");
+    println!();
 }
