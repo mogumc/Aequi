@@ -394,6 +394,9 @@ pub async fn chat_completion_stream(
         let mut finished = false;
         // 上游是否真的产出过内容（文本或工具调用）。
         let mut produced = false;
+        // 最后一条原始载荷：一条内容都没有时，它是排障的唯一线索
+        // （最常见的原因是块格式与上游不匹配，解析器什么都提不出来）。
+        let mut last_payload: Option<String> = None;
         let mut sse = std::pin::pin!(payload_stream);
 
         // 流内只读名字，拷一份所有权（生命周期长于本函数）。
@@ -449,6 +452,7 @@ pub async fn chat_completion_stream(
             if payload.trim() == "[DONE]" {
                 continue;
             }
+            last_payload = Some(payload.chars().take(400).collect());
 
             let events = match adapter.parse_stream_event(&payload) {
                 Ok(events) => events,
@@ -503,11 +507,18 @@ pub async fn chat_completion_stream(
             }
         }
 
-        // 整个流没有任何实际产出（无用量、无文本、无工具调用）时按失败处理，
-        // 不估算也不计费——上游可能返回了 200 加一段错误事件，那不是服务，是故障。
-        // 之前这里会按请求体估出一笔 token 照样扣费，失败也收钱。
-        if !produced && usage_acc.total_tokens == 0 {
-            let message = "上游没有返回任何内容".to_string();
+        // 整个流没有任何实际产出（无文本、无工具调用）时按失败处理，
+        // 不估算也不计费——上游可能返回了 200 加一段错误事件，或根本不是
+        // 我们以为的格式（解析器什么都提不出来）。哪怕它报了用量，客户端
+        // 什么都没收到，这钱也不能收。之前这里会按请求体估算照样扣费。
+        if !produced {
+            let detail = match &last_payload {
+                Some(payload) => format!(
+                    "上游没有返回任何可识别的内容，最后一条原始载荷: {payload}"
+                ),
+                None => "上游没有返回任何内容".to_string(),
+            };
+            let message = format!("{detail}（请检查块的 API 格式是否与上游匹配）");
             write_log(
                 pool,
                 base_log(&key, &ip, user_agent.as_deref(), started)
@@ -515,7 +526,7 @@ pub async fn chat_completion_stream(
                     .block(&block_id)
                     .upstream_key(&upstream_key_id)
                     .streaming()
-                    .failed(&Error::UpstreamUnavailable(message.clone())),
+                    .failed(&Error::UpstreamUnavailable(detail.clone())),
             )
             .await;
             if let Err(log_error) = crate::db::usage::insert_error(
@@ -530,7 +541,8 @@ pub async fn chat_completion_stream(
             {
                 tracing::warn!(error = %log_error, "写入失败用量记录失败");
             }
-            yield Ok(error_frame(&message));
+            // 给客户端的是不含内部细节的短句；原始载荷进日志供排障。
+            yield Ok(error_frame("上游没有返回任何内容"));
             return;
         }
 

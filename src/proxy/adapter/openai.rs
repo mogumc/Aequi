@@ -72,11 +72,6 @@ impl Adapter for OpenAiAdapter {
         if let Some(body) = &mut upstream.body {
             if let Some(object) = body.as_object_mut() {
                 object.insert("stream".to_string(), Value::Bool(true));
-                // 请求上游在流末尾单独发一个只含 usage 的 chunk，计费才有依据。
-                object.insert(
-                    "stream_options".to_string(),
-                    json!({ "include_usage": true }),
-                );
             }
         }
         upstream

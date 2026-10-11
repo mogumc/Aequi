@@ -322,7 +322,8 @@ fn build_body(request: &ChatRequest, model: &str, stream: bool) -> Value {
                             .and_then(|id| call_names.get(id).cloned())
                     })
                     .unwrap_or_default();
-                let text = message.text();
+                // MCP 客户端常把结果双重编码成 JSON 字符串，先解开一层。
+                let text = unwrap_json_content(&message.text());
                 // 空结果不发——content 为空的条目会被整个拒掉。
                 if text.is_empty() {
                     continue;
@@ -448,6 +449,35 @@ fn image_block(url: &str) -> Option<Value> {
         return None;
     }
     Some(json!({ "type": "image", "mime_type": mime, "data": data }))
+}
+
+/// 工具结果若被双重编码（整段是 `[{type:"text",...}]` 或对象形式的 JSON 字符串），
+/// 解开取里面的纯文本；解不开就原样返回。移植自旧版实现——不处理这层，
+/// Google 收到的工具结果就是一坨转义文本。
+fn unwrap_json_content(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with('[') || trimmed.starts_with('{') {
+        if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+            if let Some(items) = parsed.as_array() {
+                let extracted: Vec<String> = items
+                    .iter()
+                    .filter_map(|item| {
+                        if item.get("type").and_then(Value::as_str) == Some("text") {
+                            item.get("text").and_then(Value::as_str).map(str::to_string)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !extracted.is_empty() {
+                    return extracted.join("\n");
+                }
+            }
+            // 是合法 JSON 但不是内容数组：维持原样。
+            return text.to_string();
+        }
+    }
+    text.to_string()
 }
 
 /// 剥掉 JSON Schema 里 Interactions API 不认的字段（递归）。
