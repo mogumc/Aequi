@@ -3,10 +3,12 @@
 //! 面板的构建产物通过 `rust-embed` 打进二进制，正式发行只需要一个可执行文件，
 //! 不必再单独部署静态资源。
 //!
-//! 面板**源码**独立在项目同级的 `../dev-web`，不随后端一起进版本库；
-//! 但它的构建**产物**输出到本项目的 `web/` 目录，后端只认这个目录。
+//! 面板**源码**在独立仓库 `../Aequi-web`（github.com/mogumc/aequi-web）。
+//! 它的构建产物先落在该仓库自己的 `dist/`，再**复制**到本项目的 `web/` 目录——
+//! 后端只认这里。不要在前端仓库里把构建输出直接指过来：CI 只 checkout 前端仓库，
+//! 跨仓库的路径在那边根本不存在，会让构建失败。
 //!
-//! - debug 构建：从产物目录读磁盘，配合 `npm run dev` 迭代更快；
+//! - debug 构建：从产物目录读磁盘，配合前端 `npm run dev` 迭代更快；
 //! - release 构建：内容嵌入二进制，运行时不再依赖文件。
 //!
 //! 所有面板路由都挂在 [`PANEL_PREFIX`] 下。前端是单页应用，深层路径
@@ -84,10 +86,23 @@ fn not_found() -> Response {
 }
 
 /// 组装文件响应。
+///
+/// 构建产物带内容哈希（`assets/index-<hash>.js`），内容一变文件名就变，
+/// 所以可以放心长期缓存；入口 HTML 与图标不保证改名，必须每次回源校验，
+/// 否则前端更新后用户会一直拿到旧版本。
 fn file_response(path: &str, content: rust_embed::EmbeddedFile) -> Response {
     let mime = mime_guess::from_path(path).first_or_octet_stream();
+    let cache = if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+
     (
-        [(header::CONTENT_TYPE, mime.as_ref())],
+        [
+            (header::CONTENT_TYPE, mime.as_ref()),
+            (header::CACHE_CONTROL, cache),
+        ],
         content.data.into_owned(),
     )
         .into_response()
@@ -102,10 +117,11 @@ fn not_built() -> Response {
 <head><meta charset="utf-8"><title>Aequi 控制台</title></head>
 <body style="font-family:system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;max-width:640px;margin:80px auto;padding:0 20px;line-height:1.7;color:#1f2430">
 <h1 style="font-size:20px">控制台尚未构建</h1>
-<p>前端资源还没有打包进来。面板源码在后端项目同级的 dev-web 目录，执行：</p>
-<pre style="background:#f5f6f8;border:1px solid #e4e7ed;padding:12px;border-radius:8px">cd ../dev-web
+<p>前端资源还没有复制进来。面板源码在 <a href="https://github.com/mogumc/aequi-web">Aequi-web</a>，构建后把产物复制到本项目的 <code>web/</code> 目录：</p>
+<pre style="background:#f5f6f8;border:1px solid #e4e7ed;padding:12px;border-radius:8px">cd aequi-web
 npm install
-npm run build</pre>
+npm run build
+# 把 dist/ 里的内容复制到后端项目的 web/ 目录</pre>
 <p>然后重新构建并启动后端。</p>
 </body>
 </html>"#;
