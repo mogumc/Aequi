@@ -23,11 +23,13 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         database = %bootstrap.database.display(),
+        data_database = %bootstrap.data_database.display(),
         first_run = is_first_run,
         "Aequi 启动中"
     );
 
-    let store = db::Store::connect(&bootstrap.database).await?;
+    // 控制面与数据面各自独立，密钥体系在文件层面就碰不到管理员数据。
+    let store = db::Store::connect(&bootstrap.database, &bootstrap.data_database).await?;
     store.migrate().await?;
 
     // 首次启动导入默认设置，之后一律以数据库为准。

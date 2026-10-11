@@ -19,6 +19,8 @@ pub use settings::{
 
 /// 覆盖数据库文件路径的环境变量。
 pub const DATABASE_PATH_ENV: &str = "AEQUI_DATABASE_PATH";
+/// 覆盖数据面数据库路径的环境变量。
+pub const DATA_DATABASE_PATH_ENV: &str = "AEQUI_DATA_DATABASE_PATH";
 /// 初始账号用户名的环境变量，**仅在首次启动时读取**。
 pub const ADMIN_USERNAME_ENV: &str = "AEQUI_ADMIN_USERNAME";
 /// 初始账号密码的环境变量，**仅在首次启动时读取**。

@@ -1,20 +1,19 @@
 //! 数据层：SQLite 连接、建表与各表的读写入口。
 //!
-//! 这是所有业务模块的底层。上层只通过本模块访问数据库，不直接持有 SQL。
+//! 上层只通过本模块访问数据库，不直接持有 SQL。
 //!
 //! # 分区
 //!
-//! 连接池按数据归属分成三个域：
+//! 连接池按数据归属分成三个域，**默认落在两个不同的数据库文件上**：
 //!
-//! | 域 | 内容 | 状态 |
+//! | 域 | 内容 | 默认文件 |
 //! | --- | --- | --- |
-//! | [`Store::control`] | 网关自身：账号、会话、设置 | 已实现 |
-//! | [`Store::data`] | 业务数据：下游用户与密钥、上游配置 | 待对应模块落地 |
-//! | [`Store::logs`] | 请求日志 | 待对应模块落地 |
+//! | [`Store::control`] | 网关自身：账号、会话、设置 | `aequi.db` |
+//! | [`Store::data`] | 业务数据：密钥、积分、用量、模型倍率 | `aequi-data.db` |
+//! | [`Store::logs`] | 请求日志 | 暂随数据面 |
 //!
-//! 三个域**默认共用同一个文件与连接池**。等业务表落地、写竞争变得明显时，
-//! 让某个域指向独立文件即可物理拆开——业务代码只认域，不认文件，届时无需改动
-//! 上层逻辑。这里刻意不预先设计业务表结构，避免在没有真实需求时猜错。
+//! 控制面与数据面分开存放，是为了让**管理员体系与密钥体系在文件层面就不共享读写**：
+//! 密钥侧的任何查询都碰不到管理员数据。两个路径相同时会退化成单文件模式。
 //!
 //! # 时间
 //!
@@ -22,8 +21,11 @@
 //! 不做本地时区换算——混用会直接导致过期判断错乱。
 
 pub mod account;
+pub mod keys;
+pub mod models;
 pub mod session;
 pub mod settings;
+pub mod usage;
 
 use std::path::Path;
 
@@ -32,38 +34,38 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::SqlitePool;
 
 /// 三个域的连接池。
-///
-/// 各域相互独立，可以指向不同文件，也可以（默认）共用同一个。
 #[derive(Clone)]
 pub struct Store {
     /// 控制面：账号、会话、设置等网关自身的数据。
     pub control: SqlitePool,
-    /// 数据面：下游用户与密钥、上游配置等业务数据。
+    /// 数据面：密钥、积分、用量等业务数据。
     pub data: SqlitePool,
     /// 日志面：请求日志。
     pub logs: SqlitePool,
 }
 
 impl Store {
-    /// 打开单文件存储：三个域共用同一个连接池。
-    ///
-    /// 需要拆分时，对目标域单独 [`open_pool`] 开一个池替换即可。
-    pub async fn connect(path: &Path) -> anyhow::Result<Self> {
-        let pool = open_pool(path).await?;
+    /// 打开存储。两个库各自独立；路径相同时共用同一个连接池。
+    pub async fn connect(control_path: &Path, data_path: &Path) -> anyhow::Result<Self> {
+        let control = open_pool(control_path).await?;
+
+        let data = if data_path == control_path {
+            control.clone()
+        } else {
+            open_pool(data_path).await?
+        };
 
         Ok(Self {
-            control: pool.clone(),
-            data: pool.clone(),
-            logs: pool,
+            control,
+            data: data.clone(),
+            logs: data,
         })
     }
 
     /// 建表。幂等，每次启动都可安全执行。
     pub async fn migrate(&self) -> anyhow::Result<()> {
         self.migrate_control().await?;
-        // 数据面与日志面的表结构在对应模块落地时补充：
-        // self.migrate_data().await?;
-        // self.migrate_logs().await?;
+        self.migrate_data().await?;
         Ok(())
     }
 
@@ -79,7 +81,24 @@ impl Store {
             sqlx::query(ddl)
                 .execute(&self.control)
                 .await
-                .with_context(|| format!("执行建表语句失败: {name}"))?;
+                .with_context(|| format!("执行控制面建表语句失败: {name}"))?;
+        }
+
+        Ok(())
+    }
+
+    /// 数据面表结构。
+    async fn migrate_data(&self) -> anyhow::Result<()> {
+        for (name, ddl) in [
+            ("api_keys", API_KEYS_DDL),
+            ("usage_records", USAGE_RECORDS_DDL),
+            ("models", MODELS_DDL),
+            ("idx_usage_key_time", USAGE_KEY_TIME_INDEX),
+        ] {
+            sqlx::query(ddl)
+                .execute(&self.data)
+                .await
+                .with_context(|| format!("执行数据面建表语句失败: {name}"))?;
         }
 
         Ok(())
@@ -162,3 +181,54 @@ const SESSIONS_ACCOUNT_INDEX: &str =
 /// 早期版本建的显式索引。`token_hash` 上的唯一约束已经提供了索引，
 /// 这个属于重复，清掉以免白占写入成本。
 const DROP_REDUNDANT_TOKEN_INDEX: &str = "DROP INDEX IF EXISTS idx_sessions_token";
+
+/// 密钥表。积分直接挂在密钥上。
+///
+/// 积分为四位小数，用整数存最小单位：**1 积分 = 10000**。
+/// 换算关系见 [`crate::model::credits`]。
+const API_KEYS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS api_keys (
+    id             TEXT    PRIMARY KEY,
+    name           TEXT    NOT NULL DEFAULT '',
+    key_hash       TEXT    NOT NULL UNIQUE,
+    key_prefix     TEXT    NOT NULL,
+    credits_scaled INTEGER NOT NULL,
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    allowed_models TEXT    NOT NULL DEFAULT '[]',
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    last_used_at   INTEGER
+)
+"#;
+
+/// 用量记录。
+///
+/// 倍率按记账当时的取值快照下来，事后调整倍率不会改写历史账单。
+const USAGE_RECORDS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS usage_records (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_id         TEXT    NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+    model          TEXT    NOT NULL,
+    raw_tokens     INTEGER NOT NULL,
+    multiplier_bp  INTEGER NOT NULL,
+    final_tokens   INTEGER NOT NULL,
+    credits_scaled INTEGER NOT NULL,
+    created_at     INTEGER NOT NULL
+)
+"#;
+
+/// 模型配置。
+///
+/// 本轮只建表预留：倍率参与计费，但模型的增删改查属于模型管理模块，尚未实现。
+const MODELS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS models (
+    name          TEXT    PRIMARY KEY,
+    multiplier_bp INTEGER NOT NULL DEFAULT 10000,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+)
+"#;
+
+const USAGE_KEY_TIME_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_usage_key_time ON usage_records(key_id, created_at DESC)";

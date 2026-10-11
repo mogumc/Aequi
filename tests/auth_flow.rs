@@ -38,7 +38,8 @@ impl TestApp {
         let dir = std::env::temp_dir().join(format!("aequi-test-{}", random::string(12)));
         std::fs::create_dir_all(&dir).expect("创建临时目录失败");
 
-        let store = db::Store::connect(&dir.join("test.db"))
+        // 与真实启动一致：控制面与数据面分开两个库文件。
+        let store = db::Store::connect(&dir.join("test.db"), &dir.join("test-data.db"))
             .await
             .expect("建库失败");
         store.migrate().await.expect("建表失败");

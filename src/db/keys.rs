@@ -1,0 +1,198 @@
+//! `api_keys` 表的读写。
+
+use sqlx::sqlite::SqliteRow;
+use sqlx::{Executor, Row, Sqlite, SqlitePool};
+
+use crate::model::ApiKey;
+
+const SQL_FIND_BY_ID: &str = "\
+SELECT id, name, key_hash, key_prefix, credits_scaled, enabled, allowed_models, \
+       created_at, updated_at, last_used_at \
+FROM api_keys WHERE id = ?";
+
+const SQL_FIND_BY_HASH: &str = "\
+SELECT id, name, key_hash, key_prefix, credits_scaled, enabled, allowed_models, \
+       created_at, updated_at, last_used_at \
+FROM api_keys WHERE key_hash = ?";
+
+const SQL_LIST: &str = "\
+SELECT id, name, key_hash, key_prefix, credits_scaled, enabled, allowed_models, \
+       created_at, updated_at, last_used_at \
+FROM api_keys ORDER BY created_at DESC";
+
+const SQL_INSERT: &str = "\
+INSERT INTO api_keys \
+(id, name, key_hash, key_prefix, credits_scaled, enabled, allowed_models, created_at, updated_at) \
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+const SQL_UPDATE_META: &str = "\
+UPDATE api_keys SET name = ?, enabled = ?, allowed_models = ?, updated_at = ? WHERE id = ?";
+
+const SQL_SET_CREDITS: &str =
+    "UPDATE api_keys SET credits_scaled = ?, updated_at = ? WHERE id = ?";
+
+/// 原子扣费：`credits_scaled >= ?` 保证不会透支，余额不足时一条都不会命中。
+///
+/// 用 `RETURNING` 一次拿到扣减后的余额，省掉「先查余额再更新」的竞态与额外往返。
+const SQL_CHARGE: &str = "\
+UPDATE api_keys SET credits_scaled = credits_scaled - ?, updated_at = ?, last_used_at = ? \
+WHERE id = ? AND enabled = 1 AND credits_scaled >= ? \
+RETURNING credits_scaled";
+
+const SQL_DELETE: &str = "DELETE FROM api_keys WHERE id = ?";
+
+/// 写入新密钥所需的字段。
+#[derive(Debug)]
+pub struct NewApiKey<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub key_hash: &'a str,
+    pub key_prefix: &'a str,
+    pub credits_scaled: i64,
+    pub enabled: bool,
+    pub allowed_models: &'a [String],
+    pub created_at: i64,
+}
+
+fn map_row(row: &SqliteRow) -> ApiKey {
+    ApiKey {
+        id: row.get("id"),
+        name: row.get("name"),
+        key_hash: row.get("key_hash"),
+        key_prefix: row.get("key_prefix"),
+        credits_scaled: row.get("credits_scaled"),
+        enabled: row.get::<i64, _>("enabled") != 0,
+        allowed_models: parse_models(row.get("allowed_models")),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        last_used_at: row.get("last_used_at"),
+    }
+}
+
+/// 解析模型白名单。
+///
+/// 格式错误时按「不限制」处理而不是报错——一条脏配置不该让整个密钥不可用，
+/// 但这属于异常情况，仍然留下警告。
+fn parse_models(raw: String) -> Vec<String> {
+    match serde_json::from_str::<Vec<String>>(&raw) {
+        Ok(models) => models,
+        Err(_) => {
+            tracing::warn!(value = %raw, "密钥的可用模型配置格式非法，按不限制处理");
+            Vec::new()
+        }
+    }
+}
+
+fn encode_models(models: &[String]) -> String {
+    serde_json::to_string(models).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// 按主键查找。
+pub async fn find_by_id(pool: &SqlitePool, id: &str) -> Result<Option<ApiKey>, sqlx::Error> {
+    let row = sqlx::query(SQL_FIND_BY_ID)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(map_row))
+}
+
+/// 按密钥散列查找（鉴权用）。
+pub async fn find_by_hash(pool: &SqlitePool, key_hash: &str) -> Result<Option<ApiKey>, sqlx::Error> {
+    let row = sqlx::query(SQL_FIND_BY_HASH)
+        .bind(key_hash)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(map_row))
+}
+
+/// 列出全部密钥，最近创建的排在前面。
+pub async fn list(pool: &SqlitePool) -> Result<Vec<ApiKey>, sqlx::Error> {
+    let rows = sqlx::query(SQL_LIST).fetch_all(pool).await?;
+    Ok(rows.iter().map(map_row).collect())
+}
+
+/// 创建密钥。
+pub async fn insert(pool: &SqlitePool, key: &NewApiKey<'_>) -> Result<(), sqlx::Error> {
+    sqlx::query(SQL_INSERT)
+        .bind(key.id)
+        .bind(key.name)
+        .bind(key.key_hash)
+        .bind(key.key_prefix)
+        .bind(key.credits_scaled)
+        .bind(i64::from(key.enabled))
+        .bind(encode_models(key.allowed_models))
+        .bind(key.created_at)
+        .bind(key.created_at)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// 更新备注名、启用状态与可用模型。
+///
+/// 积分不在这里改：它有自己的入口，避免和元信息搅在一起。
+pub async fn update_meta(
+    pool: &SqlitePool,
+    id: &str,
+    name: &str,
+    enabled: bool,
+    allowed_models: &[String],
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(SQL_UPDATE_META)
+        .bind(name)
+        .bind(i64::from(enabled))
+        .bind(encode_models(allowed_models))
+        .bind(now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// 直接设定余额（充值或人工校正）。
+pub async fn set_credits(
+    pool: &SqlitePool,
+    id: &str,
+    credits_scaled: i64,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(SQL_SET_CREDITS)
+        .bind(credits_scaled)
+        .bind(now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// 扣减余额。
+///
+/// 返回扣减后的余额；`None` 表示余额不足或密钥已停用，本次未扣除任何积分。
+/// 接受任意 Executor，便于和用量记录放进同一个事务。
+pub async fn charge<'e, E>(
+    executor: E,
+    id: &str,
+    amount_scaled: i64,
+    now: i64,
+) -> Result<Option<i64>, sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let row = sqlx::query(SQL_CHARGE)
+        .bind(amount_scaled)
+        .bind(now)
+        .bind(now)
+        .bind(id)
+        .bind(amount_scaled)
+        .fetch_optional(executor)
+        .await?;
+
+    Ok(row.map(|row| row.get("credits_scaled")))
+}
+
+/// 删除密钥。用量记录随外键级联清理。
+pub async fn delete(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(SQL_DELETE).bind(id).execute(pool).await?;
+    Ok(result.rows_affected() > 0)
+}
