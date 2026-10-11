@@ -106,8 +106,7 @@ pub async fn pause_keys(
     Path(id): Path<String>,
     Json(payload): Json<KeyIdsRequest>,
 ) -> Result<Json<MessageResponse>> {
-    let _ = id;
-    upstream::pause_keys(&state.store.data, &payload.ids).await?;
+    upstream::pause_keys(&state.store.data, &id, &payload.ids).await?;
     Ok(Json(MessageResponse::ok("已暂停")))
 }
 
@@ -117,8 +116,7 @@ pub async fn resume_keys(
     Path(id): Path<String>,
     Json(payload): Json<KeyIdsRequest>,
 ) -> Result<Json<MessageResponse>> {
-    let _ = id;
-    upstream::resume_keys(&state.store.data, &payload.ids).await?;
+    upstream::resume_keys(&state.store.data, &id, &payload.ids).await?;
     Ok(Json(MessageResponse::ok("已恢复")))
 }
 

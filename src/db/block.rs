@@ -205,9 +205,11 @@ pub async fn delete_keys(
 
 /// 改密钥状态（暂停 / 恢复 / 停用）。
 ///
+/// 带上 block_id 一起匹配：密钥只应通过它所属的块来操作。
 /// 恢复的同时清掉失败计数与错误信息——重新上岗就该干净地上岗。
 pub async fn set_key_status(
     pool: &SqlitePool,
+    block_id: &str,
     key_id: &str,
     status: KeyStatus,
     now: i64,
@@ -219,7 +221,7 @@ pub async fn set_key_status(
              cooldown_until = CASE WHEN ? = 'active' THEN NULL ELSE cooldown_until END, \
              last_error = CASE WHEN ? = 'active' THEN NULL ELSE last_error END, \
              updated_at = ? \
-         WHERE id = ?",
+         WHERE id = ? AND block_id = ?",
     )
     .bind(status.as_str())
     .bind(status.as_str())
@@ -227,6 +229,7 @@ pub async fn set_key_status(
     .bind(status.as_str())
     .bind(now)
     .bind(key_id)
+    .bind(block_id)
     .execute(pool)
     .await?;
     Ok(())

@@ -281,7 +281,14 @@ pub async fn add_keys(
     }
 
     let mut tx = pool.begin().await?;
-    db::block::insert_keys(&mut *tx, &entries, block_id, payload.weight, now).await?;
+    let result = db::block::insert_keys(&mut *tx, &entries, block_id, payload.weight, now).await;
+    if let Err(error) = &result {
+        // 同块内重复的密钥会让调度对同一把加倍用力，直接拒绝。
+        if db::block::is_unique_violation(error) {
+            return Err(Error::BadRequest("存在与本块已有密钥重复的条目".to_string()));
+        }
+    }
+    result?;
     tx.commit().await?;
 
     let mut views = Vec::with_capacity(entries.len());
@@ -308,17 +315,27 @@ pub async fn delete_keys(
 }
 
 /// 暂停一批密钥（手动）。
-pub async fn pause_keys(pool: &SqlitePool, ids: &[String]) -> Result<()> {
+pub async fn pause_keys(
+    pool: &SqlitePool,
+    block_id: &str,
+    ids: &[String],
+) -> Result<()> {
     for id in ids {
-        db::block::set_key_status(pool, id, KeyStatus::Paused, time::now_secs()).await?;
+        db::block::set_key_status(pool, block_id, id, KeyStatus::Paused, time::now_secs())
+            .await?;
     }
     Ok(())
 }
 
 /// 恢复一批密钥：清掉停用与失败计数，重新参与调度。
-pub async fn resume_keys(pool: &SqlitePool, ids: &[String]) -> Result<()> {
+pub async fn resume_keys(
+    pool: &SqlitePool,
+    block_id: &str,
+    ids: &[String],
+) -> Result<()> {
     for id in ids {
-        db::block::set_key_status(pool, id, KeyStatus::Active, time::now_secs()).await?;
+        db::block::set_key_status(pool, block_id, id, KeyStatus::Active, time::now_secs())
+            .await?;
     }
     Ok(())
 }
@@ -495,7 +512,14 @@ pub async fn report_rate_limited(pool: &SqlitePool, key: &UpstreamKey) {
 
 /// 停用一把密钥。
 async fn disable_key(pool: &SqlitePool, key: &UpstreamKey, detail: &str) -> Result<()> {
-    db::block::set_key_status(pool, &key.id, KeyStatus::Disabled, time::now_secs()).await?;
+    db::block::set_key_status(
+        pool,
+        &key.block_id,
+        &key.id,
+        KeyStatus::Disabled,
+        time::now_secs(),
+    )
+    .await?;
     let _ = detail;
     Ok(())
 }

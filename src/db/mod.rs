@@ -108,6 +108,8 @@ CREATE TABLE IF NOT EXISTS upstream_blocks (
 "#;
 
 /// 上游密钥。明文保存（要与上游通信就必须能取回来，散列没有意义）。
+///
+/// 同一块内密钥唯一：重复粘贴同一把不该变成双份调度。
 const UPSTREAM_KEYS_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS upstream_keys (
     id             TEXT    PRIMARY KEY,
@@ -120,7 +122,8 @@ CREATE TABLE IF NOT EXISTS upstream_keys (
     last_error     TEXT,
     last_used_at   INTEGER,
     created_at     INTEGER NOT NULL,
-    updated_at     INTEGER NOT NULL
+    updated_at     INTEGER NOT NULL,
+    UNIQUE(block_id, secret)
 )
 "#;
 
