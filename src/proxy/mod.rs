@@ -52,7 +52,7 @@ struct Failure {
 impl Failure {
     /// 无上下文的失败（还没选中块或密钥）。
     fn bare(error: Error) -> Self {
-        let user_message = error.to_string();
+        let user_message = sanitize_user_message(&error);
         Self {
             error,
             user_message,
@@ -61,13 +61,51 @@ impl Failure {
     }
 
     /// 带上下文的失败。
+    ///
+    /// `user_message` 由调用方按场景构造；内部错误的原文在这里再拦一道，
+    /// 数据库细节之类的东西不该出现在密钥能查到的那张表里。
     fn with_context(error: Error, user_message: String, context: Option<(String, String)>) -> Self {
+        let user_message = if matches!(error, Error::Internal(_) | Error::Database(_)) {
+            "服务暂时不可用，请稍后重试".to_string()
+        } else {
+            user_message
+        };
+
         Self {
             error,
             user_message,
             context,
         }
     }
+}
+
+/// 密钥侧允许看到的错误描述。
+///
+/// 参数类、限额类的错误本就是给用户看的，原样透传；
+/// 内部错误（数据库等）的原文不外泄，只给一句通用提示。
+fn sanitize_user_message(error: &Error) -> String {
+    match error {
+        Error::BadRequest(_)
+        | Error::NotFound(_)
+        | Error::Forbidden(_)
+        | Error::InsufficientCredits
+        | Error::UpstreamUnavailable(_) => error.to_string(),
+        _ => "服务暂时不可用，请稍后重试".to_string(),
+    }
+}
+
+/// 详细错误的最长保留长度。
+///
+/// 有些网关会把整个请求回显进错误体，不截断的话一条日志能撑到几 MB。
+const MAX_ERROR_DETAIL: usize = 2000;
+
+fn truncate_detail(detail: &str) -> String {
+    if detail.chars().count() <= MAX_ERROR_DETAIL {
+        return detail.to_string();
+    }
+
+    let truncated: String = detail.chars().take(MAX_ERROR_DETAIL).collect();
+    format!("{truncated}…（已截断）")
 }
 
 /// 编排一次对话请求，返回要交给用户的响应体。
@@ -432,7 +470,7 @@ impl<'a> LogDraft<'a> {
             ip: Some(self.ip.to_string()),
             user_agent: self.user_agent.map(str::to_string),
             status: "error".to_string(),
-            error_detail: Some(error.to_string()),
+            error_detail: Some(truncate_detail(&error.to_string())),
             duration_ms: self.started.elapsed().as_millis() as i64,
             prompt_tokens: self.usage.prompt_tokens,
             completion_tokens: self.usage.completion_tokens,
