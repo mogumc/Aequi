@@ -42,7 +42,9 @@ pub async fn require_auth(
 }
 
 /// 从请求头取出 Bearer 令牌。
-fn bearer_token(request: &Request) -> Option<String> {
+///
+/// 管理员令牌与密钥共用这一段解析，但各自走独立的校验流程。
+pub(crate) fn bearer_token(request: &Request) -> Option<String> {
     let value = request.headers().get(AUTHORIZATION)?.to_str().ok()?;
 
     // 前缀按 RFC 6750 大小写不敏感处理。

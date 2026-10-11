@@ -7,12 +7,15 @@
 //! | `/` | 跳转到面板 | 公开 |
 //! | `/health` | 健康检查 | 公开 |
 //! | `/api/auth/login`、`/api/auth/providers` | 登录相关 | 公开 |
-//! | `/api/*`（其余） | 业务接口 | 需登录 |
+//! | `/api/*`（管理员） | 账号、设备、OTP、设置、密钥管理 | 管理员令牌 |
+//! | `/api/key/*` | 密钥自助（只读） | 访问密钥 |
 //! | `/web/*` | 管理面板静态资源 | 公开（页面内自行守卫） |
 //!
-//! 新增模块时，在对应的分组里追加自己的路由即可：
-//! 需要认证的挂进 `protected`，公开的合并到最外层。
-//! 每个模块自己提供一个 `router()` 返回路由片段，这里只负责拼装。
+//! 两套认证各挂各的中间件，**互不越权**：管理员令牌进不了 `/api/key/*`，
+//! 访问密钥也进不了管理员接口。它们的数据更是分在两个数据库文件里。
+//!
+//! 新增模块时在对应分组里追加路由即可；每个模块提供自己的 `router()` 片段，
+//! 这里只负责拼装。
 
 use std::sync::Arc;
 
@@ -24,7 +27,9 @@ use axum::{middleware, Json, Router};
 use serde::Serialize;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::api::{auth, device, middleware as auth_middleware, otp, settings};
+use crate::api::{
+    auth, device, key_auth, key_portal, keys, middleware as auth_middleware, otp, settings,
+};
 use crate::db;
 use crate::error::Result;
 use crate::service::provider::ProviderInfo;
@@ -36,8 +41,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     // CORS 在启动时依据数据库里的设置固化；改动需重启。
     let cors = cors_layer(&state.settings().cors_origins);
 
-    // 需要登录才能访问的接口。
-    let protected = Router::new()
+    // 管理员接口：一律要求管理员令牌。
+    let admin = Router::new()
         .route("/auth/me", get(auth::me))
         .route("/auth/logout", post(auth::logout))
         .route("/devices", get(device::list).delete(device::revoke_others))
@@ -47,9 +52,25 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/otp/enable", post(otp::enable))
         .route("/otp/disable", post(otp::disable))
         .route("/settings", get(settings::get).patch(settings::update))
+        .route("/keys", get(keys::list).post(keys::create))
+        .route(
+            "/keys/{id}",
+            get(keys::detail).patch(keys::update).delete(keys::delete),
+        )
+        .route("/keys/{id}/credits", post(keys::set_credits))
+        .route("/keys/{id}/usage", get(keys::usage))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware::require_auth,
+        ));
+
+    // 密钥自助：另一套认证，只读，且只作用在自己身上。
+    let portal = Router::new()
+        .route("/key/me", get(key_portal::me))
+        .route("/key/usage", get(key_portal::usage))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            key_auth::require_key,
         ));
 
     Router::new()
@@ -57,7 +78,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/providers", get(auth::providers))
-        .nest("/api", protected)
+        .nest("/api", admin.merge(portal))
         .merge(web::router())
         .layer(cors)
         .with_state(state)
