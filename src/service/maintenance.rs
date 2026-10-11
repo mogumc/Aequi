@@ -33,6 +33,22 @@ pub fn spawn(state: Arc<AppState>) {
                 Ok(removed) => tracing::info!(removed, "已回收过期的会话"),
                 Err(error) => tracing::warn!(error = %error, "清理会话表失败"),
             }
+
+            // 日志保留期来自数据库设置，改设置立即影响下一轮清理。
+            let retention = state.settings().log_retention_days.clamp(1, 365);
+            let cutoff = now - retention * 86_400;
+
+            match db::proxy_log::purge_before(&state.store.data, cutoff).await {
+                Ok(0) => tracing::debug!("代理日志无需清理"),
+                Ok(removed) => tracing::info!(removed, retention, "已回收过期的代理日志"),
+                Err(error) => tracing::warn!(error = %error, "清理代理日志失败"),
+            }
+
+            match db::usage::purge_before(&state.store.data, cutoff).await {
+                Ok(0) => tracing::debug!("用量记录无需清理"),
+                Ok(removed) => tracing::info!(removed, retention, "已回收过期的用量记录"),
+                Err(error) => tracing::warn!(error = %error, "清理用量记录失败"),
+            }
         }
     });
 }
