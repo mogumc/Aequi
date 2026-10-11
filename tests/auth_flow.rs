@@ -530,7 +530,7 @@ async fn token_ttl_setting_governs_new_sessions() {
 }
 
 #[tokio::test]
-async fn revoked_session_is_invisible_and_frozen() {
+async fn deleted_session_is_gone_from_the_database() {
     let app = TestApp::new().await;
     app.seed_account().await;
 
@@ -544,34 +544,32 @@ async fn revoked_session_is_invisible_and_frozen() {
         .expect("刚登录的会话应当有效");
 
     assert!(
-        db::session::revoke(app.state.pool(), &session.id, session.account_id, now)
+        db::session::delete(app.state.pool(), &session.id, session.account_id)
             .await
             .unwrap(),
-        "首次撤销应当生效"
+        "首次删除应当生效"
     );
 
-    // 撤销之后：查不到、也刷不动 —— 否则失效会话能靠不断请求把自己“保活”
+    // 退出即删除：记录不该以任何形式留在库里
+    assert!(
+        db::session::find_by_id(app.state.pool(), &session.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "退出的会话应当被删除，而不是打标记留着"
+    );
     assert!(
         db::session::find_active_by_token(app.state.pool(), &hash, now)
             .await
             .unwrap()
             .is_none(),
-        "已撤销的会话不应被按令牌查到"
+        "已退出的会话不应被按令牌查到"
     );
     assert!(
         !db::session::touch(app.state.pool(), &session.id, now)
             .await
             .unwrap(),
-        "已撤销的会话不应被刷新"
-    );
-
-    // 原始查询仍能看到它，供后台展示历史设备
-    assert!(
-        db::session::find_by_id(app.state.pool(), &session.id)
-            .await
-            .unwrap()
-            .is_some(),
-        "管理接口仍应能看到这条历史记录"
+        "已退出的会话不应被刷新"
     );
 
     // 令牌立即失效
@@ -617,8 +615,8 @@ async fn expired_session_is_ignored_and_purged() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-    let removed = db::session::purge(app.state.pool(), now, now).await.unwrap();
-    assert_eq!(removed, 1, "过期会话应被清理");
+    let removed = db::session::purge(app.state.pool(), now).await.unwrap();
+    assert_eq!(removed, 1, "过期会话应被回收");
     assert!(
         db::session::find_by_id(app.state.pool(), &session.id)
             .await
@@ -628,53 +626,97 @@ async fn expired_session_is_ignored_and_purged() {
 }
 
 #[tokio::test]
-async fn purge_keeps_recently_revoked_and_active_sessions() {
+async fn purge_only_reclaims_expired_sessions() {
     let app = TestApp::new().await;
     app.seed_account().await;
 
-    let revoked_secret = app.login().await;
+    let expired_secret = app.login().await;
     let active_secret = app.login().await;
     let now = time::now_secs();
 
-    let revoked = db::session::find_active_by_token(
-        app.state.pool(),
-        &token::hash(&revoked_secret),
-        now,
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let expired =
+        db::session::find_active_by_token(app.state.pool(), &token::hash(&expired_secret), now)
+            .await
+            .unwrap()
+            .unwrap();
     let active =
         db::session::find_active_by_token(app.state.pool(), &token::hash(&active_secret), now)
             .await
             .unwrap()
             .unwrap();
 
-    // 100 秒前被撤销
+    // 把其中一个的过期时间拨到过去
+    set_session_expiry(app.state.pool(), &expired.id, now - 10).await;
+
+    let removed = db::session::purge(app.state.pool(), now).await.unwrap();
+    assert_eq!(removed, 1, "只应回收过期的那条");
     assert!(
-        db::session::revoke(app.state.pool(), &revoked.id, revoked.account_id, now - 100)
+        db::session::find_by_id(app.state.pool(), &expired.id)
             .await
             .unwrap()
+            .is_none()
     );
-
-    // 保留窗口盖得住撤销时间 → 先留着，后台还能看到最近退出的设备
-    let removed = db::session::purge(app.state.pool(), now, now - 200)
-        .await
-        .unwrap();
-    assert_eq!(removed, 0, "保留期内的已撤销会话不应被删除");
-
-    // 保留窗口早于撤销时间 → 只清掉已撤销的，在线会话不受影响
-    let removed = db::session::purge(app.state.pool(), now, now - 50)
-        .await
-        .unwrap();
-    assert_eq!(removed, 1, "超出保留期的已撤销会话应被删除");
     assert!(
         db::session::find_by_id(app.state.pool(), &active.id)
             .await
             .unwrap()
             .is_some(),
-        "在线会话不应被清理"
+        "在线会话不应被动到"
     );
+}
+
+#[tokio::test]
+async fn device_list_shows_token_prefix_and_drops_signed_out_devices() {
+    let app = TestApp::new().await;
+    app.seed_account().await;
+
+    let first = app.login().await;
+    let second = app.login().await;
+
+    let list = json_body(
+        app.router()
+            .oneshot(authorized(get("/api/devices"), &second))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let devices = list["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 2);
+
+    // 每条都带令牌前缀，且前缀确实是各自令牌的开头
+    let prefixes: Vec<&str> = devices
+        .iter()
+        .filter_map(|device| device["token_prefix"].as_str())
+        .collect();
+    assert_eq!(prefixes.len(), 2, "每条设备都应带令牌前缀");
+    assert!(prefixes.contains(&&first[..8]), "应能认出第一台设备");
+    assert!(prefixes.contains(&&second[..8]), "应能认出当前设备");
+
+    // 退出之后，那台设备从列表里消失，而不是变成一条「已失效」
+    let response = app
+        .router()
+        .oneshot(authorized(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/auth/logout")
+                .body(Body::empty())
+                .unwrap(),
+            &second,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let list = json_body(
+        app.router()
+            .oneshot(authorized(get("/api/devices"), &first))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let devices = list["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 1, "退出的设备不应再出现在列表里");
+    assert_eq!(devices[0]["token_prefix"], &first[..8]);
 }
 
 #[tokio::test]
