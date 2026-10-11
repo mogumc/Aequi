@@ -104,7 +104,7 @@ pub struct PasswordPayload {
 /// 修改密码的响应。
 #[derive(Debug, Serialize)]
 pub struct PasswordChangedResponse {
-    /// 被一并撤销的其它设备数量。
+    /// 被一并移出的其它设备数量。
     pub revoked_devices: u64,
 }
 

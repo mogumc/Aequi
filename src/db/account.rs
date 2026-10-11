@@ -113,7 +113,7 @@ where
 
 /// 更新密码哈希。
 ///
-/// 接受任意 Executor，便于和「撤销其它会话」放进同一个事务：
+/// 接受任意 Executor，便于和「清掉其它会话」放进同一个事务：
 /// 改密码跟踢设备必须一起生效，否则用户以为踢干净了其实没有。
 pub async fn update_password<'e, E>(
     executor: E,

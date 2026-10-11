@@ -96,6 +96,9 @@ pub async fn find_active_by_token(
 }
 
 /// 按会话 ID 查找。
+///
+/// 和本文件其它查询不同，这里**不过滤有效期**：它服务于「刚写入后回读」这类
+/// 需要拿到原始记录的场景。要判断一个令牌还能不能用，请用 [`find_active_by_token`]。
 pub async fn find_by_id(pool: &SqlitePool, id: &str) -> Result<Option<Session>, sqlx::Error> {
     let row = sqlx::query(SQL_FIND_BY_ID)
         .bind(id)
@@ -132,9 +135,9 @@ pub async fn touch(pool: &SqlitePool, id: &str, now: i64) -> Result<bool, sqlx::
     Ok(result.rows_affected() > 0)
 }
 
-/// 撤销指定会话——直接删除，不留退役记录。
+/// 删除指定会话，不留退役记录。
 ///
-/// 返回是否确实删掉了一行。重复撤销返回 `false`，由调用方决定算不算失败。
+/// 返回是否确实删掉了一行。重复删除返回 `false`，由调用方决定算不算失败。
 pub async fn delete<'e, E>(
     executor: E,
     id: &str,

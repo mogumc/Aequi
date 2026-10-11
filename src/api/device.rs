@@ -19,7 +19,7 @@ pub struct DeviceListResponse {
     pub devices: Vec<SessionView>,
 }
 
-/// 批量撤销结果。
+/// 批量移出结果。
 #[derive(Debug, Serialize)]
 pub struct RevokeOthersResponse {
     pub revoked: u64,
@@ -38,7 +38,7 @@ pub async fn list(
 
 /// `DELETE /api/devices/{id}`
 ///
-/// 撤销指定设备。撤销自己等价于退出登录。
+/// 移出指定设备。移出自己等价于退出登录。
 pub async fn revoke(
     State(state): State<Arc<AppState>>,
     Extension(context): Extension<AuthContext>,
@@ -50,7 +50,7 @@ pub async fn revoke(
 
 /// `DELETE /api/devices`
 ///
-/// 撤销除当前设备外的全部设备。
+/// 移出除当前设备外的全部设备。
 pub async fn revoke_others(
     State(state): State<Arc<AppState>>,
     Extension(context): Extension<AuthContext>,

@@ -25,7 +25,8 @@ pub async fn list(
 
 /// 移出一台设备。
 ///
-/// 记录直接删除而不是打标记，数据库里不留残余。
+/// 记录直接删除而不是打标记，数据库里不留残余。因此重复移出同一台会得到
+/// 「不存在」——它确实已经不在了，这个答案是对的。
 pub async fn revoke(pool: &SqlitePool, account_id: i64, session_id: &str) -> Result<()> {
     if !db::session::delete(pool, session_id, account_id).await? {
         return Err(Error::NotFound("该登录设备不存在".to_string()));

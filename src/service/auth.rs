@@ -213,8 +213,8 @@ pub async fn authenticate(pool: &SqlitePool, secret_token: &str) -> Result<(Acco
         .await?
         .ok_or_else(|| Error::Unauthorized("令牌无效或会话已失效".to_string()))?;
 
-    // 查到之后会话仍可能被并发撤销，刷新失败就按失效处理——
-    // 否则一个已被撤销的会话还能靠不断请求来「保活」。
+    // 查到之后会话仍可能在别处被删除或到期，刷新失败就按失效处理——
+    // 否则一个已经失效的会话还能靠不断请求来「保活」。
     if !db::session::touch(pool, &session.id, now).await? {
         return Err(Error::Unauthorized("该会话已失效".to_string()));
     }
@@ -254,9 +254,9 @@ pub async fn reset_password(pool: &SqlitePool, account_id: i64) -> Result<String
     Ok(new_password)
 }
 
-/// 修改密码，返回被撤销的其它设备数。
+/// 修改密码，返回被一并移出的其它设备数。
 ///
-/// 需要先验证当前密码，并撤销除本机以外的会话——多数人改密码正是因为怀疑泄露，
+/// 需要先验证当前密码，并移出除本机以外的会话——多数人改密码正是因为怀疑泄露，
 /// 只换口令却把旧会话留着，等于没改。
 pub async fn change_password(
     pool: &SqlitePool,
