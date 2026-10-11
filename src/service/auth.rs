@@ -157,6 +157,7 @@ pub async fn login(
         let secret_token = token::generate();
         let session_id = token::generate_session_id();
         let token_hash = token::hash(&secret_token);
+        let token_prefix = token::prefix(&secret_token);
 
         let result = db::session::insert(
             pool,
@@ -164,6 +165,7 @@ pub async fn login(
                 id: &session_id,
                 account_id: account.id,
                 token_hash: &token_hash,
+                token_prefix: &token_prefix,
                 login_type,
                 ip: ip.as_deref(),
                 user_agent: user_agent.as_deref(),
@@ -224,9 +226,9 @@ pub async fn authenticate(pool: &SqlitePool, secret_token: &str) -> Result<(Acco
     Ok((account, session))
 }
 
-/// 退出当前会话。
+/// 退出当前会话。记录直接删除，不留残余。
 pub async fn logout(pool: &SqlitePool, session_id: &str, account_id: i64) -> Result<()> {
-    db::session::revoke(pool, session_id, account_id, time::now_secs()).await?;
+    db::session::delete(pool, session_id, account_id).await?;
     Ok(())
 }
 
@@ -285,7 +287,7 @@ pub async fn change_password(
     let mut tx = pool.begin().await?;
 
     db::account::update_password(&mut *tx, account.id, &hash, now).await?;
-    let revoked = db::session::revoke_others(&mut *tx, account.id, current_session_id, now).await?;
+    let revoked = db::session::delete_others(&mut *tx, account.id, current_session_id).await?;
 
     tx.commit().await?;
 

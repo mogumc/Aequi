@@ -8,12 +8,21 @@ use crate::utils::random;
 const TOKEN_LEN: usize = 48;
 /// 会话 ID 长度（字符）。
 const SESSION_ID_LEN: usize = 16;
+/// 展示用前缀长度（字符）。
+const PREFIX_LEN: usize = 8;
 
 /// 生成一个新令牌。
 ///
 /// 明文只在登录响应里出现一次，之后系统只认散列。
 pub fn generate() -> String {
     random::string(TOKEN_LEN)
+}
+
+/// 取令牌的展示前缀。
+///
+/// 只用于在后台辨认「这是哪一次登录」，无法据此还原令牌。
+pub fn prefix(token: &str) -> String {
+    token.chars().take(PREFIX_LEN).collect()
 }
 
 /// 生成一个新会话 ID。

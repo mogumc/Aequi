@@ -154,18 +154,24 @@ CREATE TABLE IF NOT EXISTS accounts (
 
 /// `id` 是主键、`token_hash` 有唯一约束，两者都自带唯一索引，
 /// 鉴权与按 ID 查找不会退化成全表扫描；`account_id` 需要显式索引。
+///
+/// `token_prefix` 是令牌的前几位，只用于在后台辨认「这是哪一次登录」，
+/// 不参与鉴权——鉴权只认散列。
+///
+/// 表里只留**仍然有效**的会话：退出即删除，过期由后台任务回收，
+/// 不留退役记录。
 const SESSIONS_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions (
     id           TEXT    PRIMARY KEY,
     account_id   INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     token_hash   TEXT    NOT NULL UNIQUE,
+    token_prefix TEXT    NOT NULL,
     login_type   TEXT    NOT NULL,
     ip           TEXT,
     user_agent   TEXT,
     created_at   INTEGER NOT NULL,
     last_seen_at INTEGER NOT NULL,
-    expires_at   INTEGER NOT NULL,
-    revoked_at   INTEGER
+    expires_at   INTEGER NOT NULL
 )
 "#;
 

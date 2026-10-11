@@ -11,13 +11,10 @@ use crate::utils::time;
 use crate::AppState;
 
 /// 清理任务的执行间隔。
-const PURGE_INTERVAL: Duration = Duration::from_secs(3600);
-
-/// 已撤销会话的保留时长。
 ///
-/// 不立即删除，是为了让管理后台还能看到「最近退出的设备」；
-/// 过了这段时间再清掉，避免表被历史记录无限撑大。
-const REVOKED_RETENTION_SECONDS: i64 = 30 * 24 * 3600;
+/// 会话在退出时就已经删掉了，这里只负责回收**自然过期**的记录，
+/// 所以频率不需要高——每次都要拿写锁。
+const PURGE_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// 启动后台清理任务。
 ///
@@ -30,11 +27,10 @@ pub fn spawn(state: Arc<AppState>) {
             ticker.tick().await;
 
             let now = time::now_secs();
-            let revoked_before = now - REVOKED_RETENTION_SECONDS;
 
-            match db::session::purge(&state.store.control, now, revoked_before).await {
+            match db::session::purge(&state.store.control, now).await {
                 Ok(0) => tracing::debug!("会话表无需清理"),
-                Ok(removed) => tracing::info!(removed, "已清理失效的会话记录"),
+                Ok(removed) => tracing::info!(removed, "已回收过期的会话"),
                 Err(error) => tracing::warn!(error = %error, "清理会话表失败"),
             }
         }
