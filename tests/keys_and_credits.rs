@@ -107,12 +107,8 @@ impl TestApp {
             .to_string()
     }
 
-    /// 直接建一个业务层密钥对象（绕过 HTTP），同时返回明文。
-    async fn make_key(
-        &self,
-        credits_text: &str,
-        models: Vec<String>,
-    ) -> (aequi::model::ApiKey, String) {
+    /// 直接建一个业务层密钥对象（绕过 HTTP）。
+    async fn make_key(&self, credits_text: &str, models: Vec<String>) -> aequi::model::ApiKey {
         key_service::create(
             self.data(),
             KeyCreate {
@@ -174,7 +170,7 @@ async fn json_body(response: axum::response::Response) -> Value {
 }
 
 #[tokio::test]
-async fn created_key_can_authenticate_and_plaintext_is_never_listed() {
+async fn created_key_can_authenticate_and_admin_can_read_it_back() {
     let app = TestApp::new().await;
     app.seed_account().await;
     let admin_token = app.login().await;
@@ -182,7 +178,7 @@ async fn created_key_can_authenticate_and_plaintext_is_never_listed() {
 
     assert!(secret.starts_with("ak_"), "密钥应带可辨识前缀");
 
-    // 密钥能读到自己的信息
+    // 密钥能读到自己的信息；自助视图不回显明文
     let me = json_body(
         app.router()
             .oneshot(authorized(get("/api/key/me"), &secret))
@@ -192,8 +188,12 @@ async fn created_key_can_authenticate_and_plaintext_is_never_listed() {
     .await;
     assert_eq!(me["credits"], "10.0000");
     assert_eq!(me["enabled"], true);
+    assert!(
+        me.get("secret").is_none(),
+        "自助视图不该回显明文密钥，持有者本来就拿着它"
+    );
 
-    // 管理员列表里只有前缀，不出现明文
+    // 管理员随时能取回完整密钥，忘了可以来找
     let list = json_body(
         app.router()
             .oneshot(authorized(get("/api/keys"), &admin_token))
@@ -201,15 +201,22 @@ async fn created_key_can_authenticate_and_plaintext_is_never_listed() {
             .unwrap(),
     )
     .await;
-
-    assert!(
-        !list.to_string().contains(&secret),
-        "列表绝不应包含明文密钥"
-    );
+    assert_eq!(list["keys"][0]["secret"], secret.as_str(), "管理员应能取回明文");
     assert!(list["keys"][0]["key_prefix"]
         .as_str()
         .unwrap()
         .starts_with("ak_"));
+
+    // 单条详情同样带明文
+    let key_id = list["keys"][0]["id"].as_str().unwrap();
+    let detail = json_body(
+        app.router()
+            .oneshot(authorized(get(&format!("/api/keys/{key_id}")), &admin_token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(detail["secret"], secret.as_str());
 }
 
 #[tokio::test]
@@ -259,7 +266,7 @@ async fn the_two_auth_systems_do_not_overlap() {
 #[tokio::test]
 async fn charging_deducts_credits_and_records_usage() {
     let app = TestApp::new().await;
-    let (key, _secret) = app.make_key("1", Vec::new()).await;
+    let key = app.make_key("1", Vec::new()).await;
 
     // 10000 token、1.0 倍 → 恰好 1 积分
     let outcome = billing::charge(app.data(), &key, "demo-model", 10_000)
@@ -303,7 +310,7 @@ async fn model_multiplier_scales_the_bill() {
     .await
     .expect("写入模型失败");
 
-    let (key, _secret) = app.make_key("5", Vec::new()).await;
+    let key = app.make_key("5", Vec::new()).await;
 
     let outcome = billing::charge(app.data(), &key, "demo-double", 10_000)
         .await
@@ -329,7 +336,7 @@ async fn model_multiplier_scales_the_bill() {
 async fn model_whitelist_and_disabled_state_are_enforced() {
     let app = TestApp::new().await;
 
-    let (limited, _limited_secret) = app.make_key("10", vec!["demo-allowed".to_string()]).await;
+    let limited = app.make_key("10", vec!["demo-allowed".to_string()]).await;
     assert!(limited.allows_model("demo-allowed"));
     assert!(!limited.allows_model("demo-denied"));
 
@@ -339,7 +346,7 @@ async fn model_whitelist_and_disabled_state_are_enforced() {
     assert!(matches!(error, Error::Forbidden(_)));
 
     // 白名单为空表示不限制
-    let (open, open_secret) = app.make_key("10", Vec::new()).await;
+    let open = app.make_key("10", Vec::new()).await;
     assert!(open.allows_model("anything"));
     assert!(billing::charge(app.data(), &open, "anything", 100)
         .await
@@ -357,7 +364,7 @@ async fn model_whitelist_and_disabled_state_are_enforced() {
     .await
     .unwrap();
 
-    let error = key_service::authenticate(app.data(), &open_secret)
+    let error = key_service::authenticate(app.data(), &open.secret)
         .await
         .expect_err("已停用的密钥应当被拒");
     assert!(matches!(error, Error::Forbidden(_)));
@@ -505,7 +512,7 @@ async fn admin_can_top_up_and_limits_are_sane() {
 #[tokio::test]
 async fn charging_a_disabled_key_reports_forbidden_not_insufficient() {
     let app = TestApp::new().await;
-    let (key, _secret) = app.make_key("10", Vec::new()).await;
+    let key = app.make_key("10", Vec::new()).await;
 
     // 管理员把它停用，但调用方手里还是停用前的快照
     key_service::update(
@@ -533,7 +540,7 @@ async fn charging_a_disabled_key_reports_forbidden_not_insufficient() {
     assert_eq!(credits::format_credits(current.credits_scaled), "10.0000");
 
     // 确实余额不足时，仍然是 402
-    let (poor, _poor_secret) = app.make_key("0.0001", Vec::new()).await;
+    let poor = app.make_key("0.0001", Vec::new()).await;
     let error = billing::charge(app.data(), &poor, "demo-model", 100)
         .await
         .expect_err("余额不足应当报错");
@@ -544,7 +551,7 @@ async fn charging_a_disabled_key_reports_forbidden_not_insufficient() {
 #[tokio::test]
 async fn deleting_a_key_cascades_its_usage_records() {
     let app = TestApp::new().await;
-    let (key, _secret) = app.make_key("10", Vec::new()).await;
+    let key = app.make_key("10", Vec::new()).await;
 
     billing::charge(app.data(), &key, "demo-model", 5_000)
         .await
@@ -573,7 +580,7 @@ async fn deleting_a_key_cascades_its_usage_records() {
 #[tokio::test]
 async fn usage_limit_is_clamped_by_the_data_layer() {
     let app = TestApp::new().await;
-    let (key, _secret) = app.make_key("10", Vec::new()).await;
+    let key = app.make_key("10", Vec::new()).await;
 
     for _ in 0..3 {
         billing::charge(app.data(), &key, "demo-model", 1)

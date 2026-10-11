@@ -11,13 +11,13 @@ use axum::Json;
 use crate::api::key_auth::KeyContext;
 use crate::api::{UsageListResponse, UsageQuery};
 use crate::error::Result;
-use crate::model::KeyView;
+use crate::model::KeySelfView;
 use crate::service::keys;
 use crate::AppState;
 
 /// `GET /api/key/me`
-pub async fn me(Extension(context): Extension<KeyContext>) -> Json<KeyView> {
-    Json(KeyView::from(&context.key))
+pub async fn me(Extension(context): Extension<KeyContext>) -> Json<KeySelfView> {
+    Json(KeySelfView::from(&context.key))
 }
 
 /// `GET /api/key/usage`

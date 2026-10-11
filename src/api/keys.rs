@@ -15,15 +15,6 @@ use crate::model::{KeyCreate, KeyCreditsUpdate, KeyUpdate, KeyView};
 use crate::service::keys;
 use crate::AppState;
 
-/// 创建密钥的响应。
-///
-/// `secret` 是完整密钥，**只会在这里出现这一次**，之后库里只有散列。
-#[derive(Debug, Serialize)]
-pub struct KeyCreatedResponse {
-    pub key: KeyView,
-    pub secret: String,
-}
-
 /// 密钥列表响应。
 #[derive(Debug, Serialize)]
 pub struct KeyListResponse {
@@ -40,18 +31,18 @@ pub async fn list(State(state): State<Arc<AppState>>) -> Result<Json<KeyListResp
 }
 
 /// `POST /api/keys`
+///
+/// 返回值里就带着完整密钥。后端不再有「只显示一次」的限制——
+/// 后续所有请求数据都绑定在这串密钥上，忘了就找不回来，所以允许随时查看。
 pub async fn create(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<KeyCreate>,
-) -> Result<Json<KeyCreatedResponse>> {
-    let (key, secret) = keys::create(&state.store.data, payload).await?;
+) -> Result<Json<KeyView>> {
+    let key = keys::create(&state.store.data, payload).await?;
 
     tracing::info!(key_prefix = %key.key_prefix, name = %key.name, "已创建访问密钥");
 
-    Ok(Json(KeyCreatedResponse {
-        key: KeyView::from(&key),
-        secret,
-    }))
+    Ok(Json(KeyView::from(&key)))
 }
 
 /// `GET /api/keys/{id}`

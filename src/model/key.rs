@@ -4,14 +4,17 @@ use crate::model::credits;
 
 /// 一个访问密钥。积分直接挂在它身上。
 ///
-/// 明文密钥只在创建时返回一次，库里只留散列与展示用前缀。
+/// 密钥以**明文**保存，管理员可随时在后台查看与复制。
+/// 这么设计是因为后续所有请求数据都绑定在密钥上，一旦忘记就无从挽回；
+/// 代价是数据库文件本身即等同于一份凭证集合——这与「把库文件当最高权限资产」
+/// 的部署前提是一致的。
 #[derive(Debug, Clone)]
 pub struct ApiKey {
     pub id: String,
     pub name: String,
-    /// 密钥的 SHA-256 散列。
-    pub key_hash: String,
-    /// 展示用前缀，便于在列表里辨认是哪一把。
+    /// 完整密钥。
+    pub secret: String,
+    /// 展示用前缀，便于在列表里一眼辨认。
     pub key_prefix: String,
     /// 剩余积分，整数最小单位（1 积分 = 10000）。
     pub credits_scaled: i64,
@@ -32,12 +35,15 @@ impl ApiKey {
     }
 }
 
-/// 密钥的管理视图。不含散列。
+/// 密钥的管理视图。
+///
+/// 这是唯一会返回明文密钥的地方，只有管理员接口使用。
 #[derive(Debug, Clone, Serialize)]
 pub struct KeyView {
     pub id: String,
     pub name: String,
-    /// 展示用前缀；完整密钥不会再次出现。
+    /// 完整密钥。前端默认打码，按需展开显示。
+    pub secret: String,
     pub key_prefix: String,
     /// 剩余积分，四位小数字符串。
     pub credits: String,
@@ -55,6 +61,7 @@ impl From<&ApiKey> for KeyView {
         Self {
             id: key.id.clone(),
             name: key.name.clone(),
+            secret: key.secret.clone(),
             key_prefix: key.key_prefix.clone(),
             credits: credits::format_credits(key.credits_scaled),
             credits_scaled: key.credits_scaled,
@@ -62,6 +69,37 @@ impl From<&ApiKey> for KeyView {
             allowed_models: key.allowed_models.clone(),
             created_at: key.created_at,
             updated_at: key.updated_at,
+            last_used_at: key.last_used_at,
+        }
+    }
+}
+
+/// 密钥的自助视图。
+///
+/// 刻意不含明文：持有者本来就拿着它，回显没有意义，
+/// 也免得在自助页的响应里多留一份凭证副本。
+#[derive(Debug, Clone, Serialize)]
+pub struct KeySelfView {
+    pub name: String,
+    pub key_prefix: String,
+    pub credits: String,
+    pub credits_scaled: i64,
+    pub enabled: bool,
+    pub allowed_models: Vec<String>,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+}
+
+impl From<&ApiKey> for KeySelfView {
+    fn from(key: &ApiKey) -> Self {
+        Self {
+            name: key.name.clone(),
+            key_prefix: key.key_prefix.clone(),
+            credits: credits::format_credits(key.credits_scaled),
+            credits_scaled: key.credits_scaled,
+            enabled: key.enabled,
+            allowed_models: key.allowed_models.clone(),
+            created_at: key.created_at,
             last_used_at: key.last_used_at,
         }
     }

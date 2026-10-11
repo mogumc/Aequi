@@ -9,7 +9,6 @@ use crate::db;
 use crate::db::keys::NewApiKey;
 use crate::error::{Error, Result};
 use crate::model::{credits, ApiKey, KeyCreate, KeyUpdate, UsageRecord, UsageSummary};
-use crate::service::token;
 use crate::utils::{random, time};
 
 /// 密钥前缀长度，含 `ak_`。
@@ -24,18 +23,13 @@ pub fn generate() -> String {
     format!("ak_{}", random::string(SECRET_LEN))
 }
 
-/// 计算密钥散列。库里只存散列，不存明文。
-pub fn hash(key: &str) -> String {
-    token::hash(key)
-}
-
 /// 展示用前缀，便于在列表里辨认。
 fn prefix_of(key: &str) -> String {
     key.chars().take(PREFIX_LEN).collect()
 }
 
-/// 创建密钥，返回记录与明文。
-pub async fn create(pool: &SqlitePool, payload: KeyCreate) -> Result<(ApiKey, String)> {
+/// 创建密钥。
+pub async fn create(pool: &SqlitePool, payload: KeyCreate) -> Result<ApiKey> {
     let plaintext = generate();
     let id = random::string(ID_LEN);
 
@@ -44,14 +38,12 @@ pub async fn create(pool: &SqlitePool, payload: KeyCreate) -> Result<(ApiKey, St
         None => 0,
     };
 
-    let key_hash = hash(&plaintext);
-
     db::keys::insert(
         pool,
         &NewApiKey {
             id: &id,
             name: payload.name.trim(),
-            key_hash: &key_hash,
+            secret: &plaintext,
             key_prefix: &prefix_of(&plaintext),
             credits_scaled,
             enabled: true,
@@ -61,7 +53,7 @@ pub async fn create(pool: &SqlitePool, payload: KeyCreate) -> Result<(ApiKey, St
     )
     .await?;
 
-    Ok((get(pool, &id).await?, plaintext))
+    get(pool, &id).await
 }
 
 /// 按 ID 取密钥。
@@ -127,7 +119,7 @@ pub async fn delete(pool: &SqlitePool, id: &str) -> Result<()> {
 /// 这里只读不写：密钥的「使用」以产生计费请求为准，
 /// 单纯查询自己的信息不该刷新最近使用时间。
 pub async fn authenticate(pool: &SqlitePool, plaintext: &str) -> Result<ApiKey> {
-    let key = db::keys::find_by_hash(pool, &hash(plaintext))
+    let key = db::keys::find_by_secret(pool, plaintext)
         .await?
         .ok_or_else(|| Error::Unauthorized("密钥无效".to_string()))?;
 

@@ -6,23 +6,23 @@ use sqlx::{Executor, Row, Sqlite, SqlitePool};
 use crate::model::ApiKey;
 
 const SQL_FIND_BY_ID: &str = "\
-SELECT id, name, key_hash, key_prefix, credits_scaled, enabled, allowed_models, \
+SELECT id, name, secret, key_prefix, credits_scaled, enabled, allowed_models, \
        created_at, updated_at, last_used_at \
 FROM api_keys WHERE id = ?";
 
-const SQL_FIND_BY_HASH: &str = "\
-SELECT id, name, key_hash, key_prefix, credits_scaled, enabled, allowed_models, \
+const SQL_FIND_BY_SECRET: &str = "\
+SELECT id, name, secret, key_prefix, credits_scaled, enabled, allowed_models, \
        created_at, updated_at, last_used_at \
-FROM api_keys WHERE key_hash = ?";
+FROM api_keys WHERE secret = ?";
 
 const SQL_LIST: &str = "\
-SELECT id, name, key_hash, key_prefix, credits_scaled, enabled, allowed_models, \
+SELECT id, name, secret, key_prefix, credits_scaled, enabled, allowed_models, \
        created_at, updated_at, last_used_at \
 FROM api_keys ORDER BY created_at DESC";
 
 const SQL_INSERT: &str = "\
 INSERT INTO api_keys \
-(id, name, key_hash, key_prefix, credits_scaled, enabled, allowed_models, created_at, updated_at) \
+(id, name, secret, key_prefix, credits_scaled, enabled, allowed_models, created_at, updated_at) \
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 const SQL_UPDATE_META: &str = "\
@@ -46,7 +46,7 @@ const SQL_DELETE: &str = "DELETE FROM api_keys WHERE id = ?";
 pub struct NewApiKey<'a> {
     pub id: &'a str,
     pub name: &'a str,
-    pub key_hash: &'a str,
+    pub secret: &'a str,
     pub key_prefix: &'a str,
     pub credits_scaled: i64,
     pub enabled: bool,
@@ -58,7 +58,7 @@ fn map_row(row: &SqliteRow) -> ApiKey {
     ApiKey {
         id: row.get("id"),
         name: row.get("name"),
-        key_hash: row.get("key_hash"),
+        secret: row.get("secret"),
         key_prefix: row.get("key_prefix"),
         credits_scaled: row.get("credits_scaled"),
         enabled: row.get::<i64, _>("enabled") != 0,
@@ -97,9 +97,9 @@ pub async fn find_by_id(pool: &SqlitePool, id: &str) -> Result<Option<ApiKey>, s
 }
 
 /// 按密钥散列查找（鉴权用）。
-pub async fn find_by_hash(pool: &SqlitePool, key_hash: &str) -> Result<Option<ApiKey>, sqlx::Error> {
-    let row = sqlx::query(SQL_FIND_BY_HASH)
-        .bind(key_hash)
+pub async fn find_by_secret(pool: &SqlitePool, secret: &str) -> Result<Option<ApiKey>, sqlx::Error> {
+    let row = sqlx::query(SQL_FIND_BY_SECRET)
+        .bind(secret)
         .fetch_optional(pool)
         .await?;
     Ok(row.as_ref().map(map_row))
@@ -113,14 +113,14 @@ pub async fn list(pool: &SqlitePool) -> Result<Vec<ApiKey>, sqlx::Error> {
 
 /// 创建密钥。
 ///
-/// `id` 与 `key_hash` 都是随机值且有唯一约束。碰撞概率可忽略，处理方式刻意与登录不同：
+/// `id` 与 `secret` 都是随机值且有唯一约束。碰撞概率可忽略，处理方式刻意与登录不同：
 /// 建密钥是低频的人工操作，真撞上会直接抛出约束冲突、管理员重试一次即可；
 /// 而登录是高频自动路径，撞车失败对用户就是「莫名其妙的错误」，所以那里做了自动重试。
 pub async fn insert(pool: &SqlitePool, key: &NewApiKey<'_>) -> Result<(), sqlx::Error> {
     sqlx::query(SQL_INSERT)
         .bind(key.id)
         .bind(key.name)
-        .bind(key.key_hash)
+        .bind(key.secret)
         .bind(key.key_prefix)
         .bind(key.credits_scaled)
         .bind(i64::from(key.enabled))
