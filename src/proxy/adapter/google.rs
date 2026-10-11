@@ -220,6 +220,21 @@ impl Adapter for GoogleAdapter {
         }
     }
 
+    /// Google 返回的是 `{ "models": [{ "name": "models/gemini-2.0-flash", ... }] }`，
+    /// 名字带 `models/` 前缀，要剥掉才是调用时用的模型名。
+    fn parse_models(&self, body: &Value) -> Vec<String> {
+        body.get("models")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("name").and_then(Value::as_str))
+                    .map(|name| name.strip_prefix("models/").unwrap_or(name).to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn parse_probe(&self, status: u16, body: &Value) -> ProbeOutcome {
         ProbeOutcome::from_status(status, || {
             body.pointer("/error/message")

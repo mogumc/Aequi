@@ -200,6 +200,16 @@
 | `POST` | `/api/blocks/{id}/keys/resume` | 批量恢复：`{ ids }`（同时清零失败计数） |
 | `POST` | `/api/blocks/{id}/keys/{key_id}/test` | 测试单把密钥（不耗 token），结果同步落库 |
 | `POST` | `/api/blocks/{id}/test` | **整块连通性测试**（见下） |
+| `POST` | `/api/blocks/{id}/models/fetch` | **从上游拉取可用模型列表**（见下） |
+
+**拉取上游模型**（`POST /api/blocks/{id}/models/fetch`）返回 `{ "models": ["..."] }`。
+它复用的就是密钥探测那条请求——各家的「列模型」接口本来就是探测密钥用的出口，
+所以不会出现「探测通过但拉不到模型」的偏差。响应形状各家不同，服务端统一收敛：
+OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `models/` 前缀。
+
+失败都给出可读原因：块内没有可用密钥报 400，上游拒绝或不可达报 5xx。
+**上游不一定提供这个接口，返回的列表也可能不全**——所以前端保留了手动添加模型名，
+拉取是主路径而不是唯一入口。
 
 块创建/更新：
 

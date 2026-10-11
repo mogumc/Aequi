@@ -136,6 +136,68 @@ fn validate_models(models: &[ModelEntry]) -> Result<()> {
     Ok(())
 }
 
+/// 用块自己的出口与密钥去上游拉一次可用模型列表。
+///
+/// 复用的就是密钥探测那条请求——它本来就是各家的「列模型」接口，
+/// 所以探测与拉取共用一个出口，不会出现「探测通过但拉不到模型」的偏差。
+pub async fn fetch_models(
+    pool: &SqlitePool,
+    state: &UpstreamState,
+    id: &str,
+) -> Result<Vec<String>> {
+    let block = get_block(pool, id).await?;
+
+    let keys = db::block::list_keys(pool, id).await?;
+    let key = keys
+        .iter()
+        .find(|key| matches!(key.status, KeyStatus::Active))
+        .ok_or_else(|| Error::BadRequest("该块还没有可用的上游密钥".to_string()))?;
+
+    let adapter = adapter_for(block.api_format);
+    let client = state.client(&block)?;
+    let request = proxy::prepare_request(
+        &client,
+        &block,
+        &adapter.build_probe(),
+        adapter.auth_style(),
+        &key.secret,
+    );
+
+    let response = request
+        .send()
+        .await
+        .map_err(|error| Error::UpstreamUnavailable(format!("拉取模型失败: {error}")))?;
+
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| Error::UpstreamUnavailable(format!("上游响应不是 JSON: {error}")))?;
+
+    if !status.is_success() {
+        let detail = body
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("上游拒绝了这次请求");
+        return Err(Error::UpstreamUnavailable(format!(
+            "拉取模型失败（HTTP {status}）：{detail}"
+        )));
+    }
+
+    let mut names = adapter.parse_models(&body);
+    names.retain(|name| !name.trim().is_empty());
+    names.sort();
+    names.dedup();
+
+    if names.is_empty() {
+        return Err(Error::UpstreamUnavailable(
+            "上游没有返回任何模型".to_string(),
+        ));
+    }
+
+    Ok(names)
+}
+
 /// 创建块。
 pub async fn create_block(pool: &SqlitePool, payload: BlockCreate) -> Result<UpstreamBlock> {
     let id = payload.id.trim().to_string();

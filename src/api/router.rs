@@ -73,6 +73,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/blocks/{id}/keys/resume", post(blocks::resume_keys))
         .route("/blocks/{id}/keys/{key_id}/test", post(blocks::test_key))
         .route("/blocks/{id}/test", post(blocks::test_block))
+        .route("/blocks/{id}/models/fetch", post(blocks::fetch_models))
         .route("/logs", get(logs::list))
         .route("/stats", get(stats::overview))
         .route_layer(middleware::from_fn_with_state(

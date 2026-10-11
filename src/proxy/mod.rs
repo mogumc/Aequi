@@ -689,7 +689,10 @@ async fn dispatch(
 }
 
 /// 组装发往上游的请求（路径、认证头、各家额外头）。
-fn prepare_request(
+///
+/// 对块外也可见：管理面的「拉取上游模型」用的是同一个探测请求，
+/// 认证规则不该在那里再抄一遍。
+pub(crate) fn prepare_request(
     client: &reqwest::Client,
     block: &UpstreamBlock,
     request: &UpstreamRequest,

@@ -105,6 +105,23 @@ pub trait Adapter: Send + Sync {
 
     /// 依据探测响应判断密钥状态。
     fn parse_probe(&self, status: u16, body: &Value) -> ProbeOutcome;
+
+    /// 从列模型响应里提取模型名。
+    ///
+    /// 探测请求走的就是列模型接口，所以同一份响应顺手就能给出可用模型列表。
+    /// 默认按 OpenAI / Anthropic 的形状解析（`data[].id`）；Google 的形状不同，自行覆写。
+    fn parse_models(&self, body: &Value) -> Vec<String> {
+        body.get("data")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("id").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// 按格式取对应的 adapter。

@@ -21,6 +21,13 @@ pub struct BlockListResponse {
     pub blocks: Vec<BlockView>,
 }
 
+/// 从上游拉取的模型列表。
+#[derive(Debug, Serialize)]
+pub struct FetchedModelsResponse {
+    /// 上游报出来的模型名，已排序去重。
+    pub models: Vec<String>,
+}
+
 /// 密钥列表响应。
 #[derive(Debug, Serialize)]
 pub struct KeyListResponse {
@@ -142,6 +149,21 @@ pub async fn test_key(
 /// `POST /api/blocks/{id}/test`
 ///
 /// 整块连通性测试：逐把测试块内全部密钥，返回每把的结果与汇总。
+/// `POST /api/blocks/{id}/models/fetch`
+///
+/// 用块自己的出口与密钥去上游拉一份可用模型，供前端勾选加入。
+/// 上游没有列模型接口、或返回的列表不全时，前端仍可手动添加。
+pub async fn fetch_models(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<FetchedModelsResponse>> {
+    let models = upstream::fetch_models(&state.store.data, &state.upstream, &id).await?;
+
+    tracing::info!(block = %id, count = models.len(), "已从上游拉取模型列表");
+
+    Ok(Json(FetchedModelsResponse { models }))
+}
+
 pub async fn test_block(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
