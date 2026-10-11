@@ -21,6 +21,7 @@
 //! 不做本地时区换算——混用会直接导致过期判断错乱。
 
 pub mod account;
+pub mod block;
 pub mod keys;
 pub mod models;
 pub mod session;
@@ -90,6 +91,43 @@ pub async fn migrate_control(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 上游块。一个块只使用一种 API 格式，密钥的调度以块为范围。
+const UPSTREAM_BLOCKS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS upstream_blocks (
+    id           TEXT    PRIMARY KEY,
+    name         TEXT    NOT NULL DEFAULT '',
+    api_format   TEXT    NOT NULL,
+    weight       INTEGER NOT NULL DEFAULT 1,
+    base_url     TEXT    NOT NULL,
+    proxy        TEXT,
+    models       TEXT    NOT NULL DEFAULT '[]',
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
+)
+"#;
+
+/// 上游密钥。明文保存（要与上游通信就必须能取回来，散列没有意义）。
+const UPSTREAM_KEYS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS upstream_keys (
+    id             TEXT    PRIMARY KEY,
+    block_id       TEXT    NOT NULL REFERENCES upstream_blocks(id) ON DELETE CASCADE,
+    secret         TEXT    NOT NULL,
+    status         TEXT    NOT NULL DEFAULT 'active',
+    weight         INTEGER NOT NULL DEFAULT 1,
+    failure_count  INTEGER NOT NULL DEFAULT 0,
+    cooldown_until INTEGER,
+    last_error     TEXT,
+    last_used_at   INTEGER,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL
+)
+"#;
+
+/// 块内查密钥用。
+const UPSTREAM_KEYS_BLOCK_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_upstream_keys_block ON upstream_keys(block_id)";
+
 /// 建数据面表结构。
 pub async fn migrate_data(pool: &SqlitePool) -> anyhow::Result<()> {
     for (name, ddl) in [
@@ -97,6 +135,9 @@ pub async fn migrate_data(pool: &SqlitePool) -> anyhow::Result<()> {
         ("usage_records", USAGE_RECORDS_DDL),
         ("models", MODELS_DDL),
         ("idx_usage_key_time", USAGE_KEY_TIME_INDEX),
+        ("upstream_blocks", UPSTREAM_BLOCKS_DDL),
+        ("upstream_keys", UPSTREAM_KEYS_DDL),
+        ("idx_upstream_keys_block", UPSTREAM_KEYS_BLOCK_INDEX),
     ] {
         sqlx::query(ddl)
             .execute(pool)

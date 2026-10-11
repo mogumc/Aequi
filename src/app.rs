@@ -8,6 +8,7 @@ use sqlx::SqlitePool;
 use crate::config::Settings;
 use crate::db::Store;
 use crate::service::provider::ProviderRegistry;
+use crate::service::upstream::UpstreamState;
 
 /// 全局共享状态，以 `Arc<AppState>` 的形式注入各 handler。
 pub struct AppState {
@@ -19,6 +20,8 @@ pub struct AppState {
     pub store: Store,
     /// 已接入的第三方登录方式。当前为空。
     pub providers: ProviderRegistry,
+    /// 上游调度的运行时状态：轮询累积值与每块的 HTTP 客户端。
+    pub upstream: UpstreamState,
     started_at: Instant,
 }
 
@@ -33,6 +36,7 @@ impl AppState {
             settings: RwLock::new(settings),
             store,
             providers,
+            upstream: UpstreamState::default(),
             started_at: Instant::now(),
         }
     }
