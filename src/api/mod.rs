@@ -11,6 +11,7 @@ pub mod middleware;
 pub mod otp;
 pub mod proxy_api;
 pub mod settings;
+pub mod stats;
 mod router;
 
 use serde::{Deserialize, Serialize};

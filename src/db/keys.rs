@@ -20,6 +20,23 @@ SELECT id, name, secret, key_prefix, credits_scaled, enabled, allowed_models, \
        created_at, updated_at, last_used_at \
 FROM api_keys ORDER BY created_at DESC";
 
+/// 分页查询；`search` 非空时按名称或密钥前缀模糊匹配。
+const SQL_LIST_PAGED: &str = "\
+SELECT id, name, secret, key_prefix, credits_scaled, enabled, allowed_models, \
+       created_at, updated_at, last_used_at \
+FROM api_keys \
+WHERE (? IS NULL OR name LIKE '%' || ? || '%' OR key_prefix LIKE '%' || ? || '%') \
+ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?";
+
+/// 与分页查询同口径的匹配总数。
+const SQL_COUNT_PAGED: &str = "\
+SELECT COUNT(*) FROM api_keys \
+WHERE (? IS NULL OR name LIKE '%' || ? || '%' OR key_prefix LIKE '%' || ? || '%')";
+
+/// 密钥总数与启用数。
+const SQL_COUNT_ENABLED: &str = "\
+SELECT COUNT(*) AS total, COALESCE(SUM(enabled), 0) AS enabled FROM api_keys";
+
 const SQL_INSERT: &str = "\
 INSERT INTO api_keys \
 (id, name, secret, key_prefix, credits_scaled, enabled, allowed_models, created_at, updated_at) \
@@ -109,6 +126,44 @@ pub async fn find_by_secret(pool: &SqlitePool, secret: &str) -> Result<Option<Ap
 pub async fn list(pool: &SqlitePool) -> Result<Vec<ApiKey>, sqlx::Error> {
     let rows = sqlx::query(SQL_LIST).fetch_all(pool).await?;
     Ok(rows.iter().map(map_row).collect())
+}
+
+/// 分页列出密钥，最近的排在前面。
+pub async fn list_paged(
+    pool: &SqlitePool,
+    search: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ApiKey>, sqlx::Error> {
+    let rows = sqlx::query(SQL_LIST_PAGED)
+        .bind(search)
+        .bind(search)
+        .bind(search)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.iter().map(map_row).collect())
+}
+
+/// 与 [`list_paged`] 同口径的匹配总数。
+pub async fn count_paged(pool: &SqlitePool, search: Option<&str>) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query(SQL_COUNT_PAGED)
+        .bind(search)
+        .bind(search)
+        .bind(search)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.get(0))
+}
+
+/// 密钥总数与启用数。
+pub async fn count_enabled(pool: &SqlitePool) -> Result<crate::model::ResourceCount, sqlx::Error> {
+    let row = sqlx::query(SQL_COUNT_ENABLED).fetch_one(pool).await?;
+    Ok(crate::model::ResourceCount {
+        total: row.get("total"),
+        enabled: row.get("enabled"),
+    })
 }
 
 /// 创建密钥。

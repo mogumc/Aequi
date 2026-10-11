@@ -19,6 +19,20 @@ SELECT id, created_at, access_key_id, block_id, upstream_key_id, model, ip, user
        status, error_detail, duration_ms, prompt_tokens, completion_tokens, cache_tokens, estimated, stream, credits_scaled \
 FROM proxy_logs ORDER BY created_at DESC, id DESC LIMIT ?";
 
+/// 带筛选的列表。每个条件都是 `(? IS NULL OR ...)`——传 NULL 即不限制，
+/// 这样一条固定 SQL 能覆盖全部组合，不必拼接字符串。
+const SQL_LIST_FILTERED: &str = "\
+SELECT id, created_at, access_key_id, block_id, upstream_key_id, model, ip, user_agent, \
+       status, error_detail, duration_ms, prompt_tokens, completion_tokens, cache_tokens, estimated, stream, credits_scaled \
+FROM proxy_logs \
+WHERE (? IS NULL OR created_at >= ?) \
+  AND (? IS NULL OR created_at <= ?) \
+  AND (? IS NULL OR status = ?) \
+  AND (? IS NULL OR access_key_id = ?) \
+  AND (? IS NULL OR model = ?) \
+  AND (? IS NULL OR block_id = ?) \
+ORDER BY created_at DESC, id DESC LIMIT ?";
+
 const SQL_PURGE: &str = "DELETE FROM proxy_logs WHERE created_at <= ?";
 
 /// 单次查询能返回的最大日志条数。
@@ -76,6 +90,46 @@ pub async fn insert(pool: &SqlitePool, log: &NewProxyLog) -> Result<(), sqlx::Er
 pub async fn list(pool: &SqlitePool, limit: i64) -> Result<Vec<ProxyLog>, sqlx::Error> {
     let rows = sqlx::query(SQL_LIST)
         .bind(limit.clamp(1, MAX_LOG_LIMIT))
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.iter().map(map_row).collect())
+}
+
+/// 日志筛选条件。字段为 `None` 表示该维度不限制。
+#[derive(Debug, Default, Clone)]
+pub struct LogFilter {
+    /// 起始时间（含），Unix 秒。
+    pub since: Option<i64>,
+    /// 截止时间（含），Unix 秒。
+    pub until: Option<i64>,
+    /// `success` 或 `error`。
+    pub status: Option<String>,
+    /// 访问密钥 id。
+    pub access_key_id: Option<String>,
+    pub model: Option<String>,
+    pub block_id: Option<String>,
+    pub limit: i64,
+}
+
+/// 按条件筛选日志，最近的排在前面。
+pub async fn list_filtered(
+    pool: &SqlitePool,
+    filter: &LogFilter,
+) -> Result<Vec<ProxyLog>, sqlx::Error> {
+    let rows = sqlx::query(SQL_LIST_FILTERED)
+        .bind(filter.since)
+        .bind(filter.since)
+        .bind(filter.until)
+        .bind(filter.until)
+        .bind(filter.status.as_deref())
+        .bind(filter.status.as_deref())
+        .bind(filter.access_key_id.as_deref())
+        .bind(filter.access_key_id.as_deref())
+        .bind(filter.model.as_deref())
+        .bind(filter.model.as_deref())
+        .bind(filter.block_id.as_deref())
+        .bind(filter.block_id.as_deref())
+        .bind(filter.limit.clamp(1, MAX_LOG_LIMIT))
         .fetch_all(pool)
         .await?;
     Ok(rows.iter().map(map_row).collect())

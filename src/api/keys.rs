@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::Json;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::api::{MessageResponse, UsageListResponse, UsageQuery};
 use crate::error::Result;
@@ -19,14 +19,41 @@ use crate::AppState;
 #[derive(Debug, Serialize)]
 pub struct KeyListResponse {
     pub keys: Vec<KeyView>,
+    /// 与筛选条件匹配的总数（不受分页影响）。
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+}
+
+/// 列表查询参数。
+#[derive(Debug, Default, Deserialize)]
+pub struct KeyListQuery {
+    /// 页码，从 1 开始。
+    pub page: Option<i64>,
+    /// 每页条数，收敛到 1-100。
+    pub page_size: Option<i64>,
+    /// 按名称或密钥前缀搜索。
+    pub search: Option<String>,
 }
 
 /// `GET /api/keys`
-pub async fn list(State(state): State<Arc<AppState>>) -> Result<Json<KeyListResponse>> {
-    let keys = keys::list(&state.store.data).await?;
+pub async fn list(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<KeyListQuery>,
+) -> Result<Json<KeyListResponse>> {
+    let search = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let page = keys::list_page(&state.store.data, search, query.page, query.page_size).await?;
 
     Ok(Json(KeyListResponse {
-        keys: keys.iter().map(Into::into).collect(),
+        keys: page.keys.iter().map(Into::into).collect(),
+        total: page.total,
+        page: page.page,
+        page_size: page.page_size,
     }))
 }
 

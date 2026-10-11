@@ -10,25 +10,45 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::db;
+use crate::db::proxy_log::LogFilter;
 use crate::error::Result;
 use crate::model::ProxyLogView;
 use crate::AppState;
 
-/// 日志查询参数。
-#[derive(Debug, Deserialize)]
+/// 日志查询参数。除 `limit` 外都可省略，省略即该维度不筛选。
+#[derive(Debug, Default, Deserialize)]
 pub struct LogQuery {
-    #[serde(default = "default_limit")]
-    pub limit: i64,
-}
-
-fn default_limit() -> i64 {
-    100
+    pub limit: Option<i64>,
+    /// 起始时间（含），Unix 秒。
+    pub since: Option<i64>,
+    /// 截止时间（含），Unix 秒。
+    pub until: Option<i64>,
+    /// `success` 或 `error`。
+    pub status: Option<String>,
+    /// 访问密钥 id。
+    pub key_id: Option<String>,
+    pub model: Option<String>,
+    pub block_id: Option<String>,
 }
 
 impl LogQuery {
-    /// 收敛到数据层允许的区间。
-    pub fn limit(&self) -> i64 {
-        self.limit.clamp(1, db::proxy_log::MAX_LOG_LIMIT)
+    /// 收敛成数据层的筛选条件。
+    fn into_filter(self) -> LogFilter {
+        let clean = |value: Option<String>| {
+            value
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty())
+        };
+
+        LogFilter {
+            since: self.since,
+            until: self.until,
+            status: clean(self.status),
+            access_key_id: clean(self.key_id),
+            model: clean(self.model),
+            block_id: clean(self.block_id),
+            limit: self.limit.unwrap_or(100),
+        }
     }
 }
 
@@ -43,7 +63,7 @@ pub async fn list(
     State(state): State<Arc<AppState>>,
     Query(query): Query<LogQuery>,
 ) -> Result<Json<LogListResponse>> {
-    let logs = db::proxy_log::list(&state.store.data, query.limit()).await?;
+    let logs = db::proxy_log::list_filtered(&state.store.data, &query.into_filter()).await?;
 
     Ok(Json(LogListResponse {
         logs: logs.iter().map(Into::into).collect(),

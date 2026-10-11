@@ -29,7 +29,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::api::{
     auth, blocks, device, key_auth, key_portal, keys, logs, middleware as auth_middleware, otp,
-    proxy_api, settings,
+    proxy_api, settings, stats,
 };
 use crate::db;
 use crate::error::Result;
@@ -72,7 +72,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/blocks/{id}/keys/pause", post(blocks::pause_keys))
         .route("/blocks/{id}/keys/resume", post(blocks::resume_keys))
         .route("/blocks/{id}/keys/{key_id}/test", post(blocks::test_key))
+        .route("/blocks/{id}/test", post(blocks::test_block))
         .route("/logs", get(logs::list))
+        .route("/stats", get(stats::overview))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware::require_auth,

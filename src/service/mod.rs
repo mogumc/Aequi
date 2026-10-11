@@ -15,6 +15,7 @@ pub mod otp;
 pub mod password;
 pub mod provider;
 pub mod settings;
+pub mod stats;
 pub mod token;
 pub mod totp;
 pub mod upstream;

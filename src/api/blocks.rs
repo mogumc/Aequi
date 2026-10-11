@@ -9,7 +9,8 @@ use serde::Serialize;
 use crate::api::MessageResponse;
 use crate::error::Result;
 use crate::model::{
-    BlockCreate, BlockUpdate, BlockView, KeyIdsRequest, UpstreamKeyCreate, UpstreamKeyView,
+    BlockCreate, BlockTestResult, BlockUpdate, BlockView, KeyIdsRequest, UpstreamKeyCreate,
+    UpstreamKeyView,
 };
 use crate::service::upstream;
 use crate::AppState;
@@ -136,4 +137,16 @@ pub async fn test_key(
             Ok(Json(MessageResponse::ok(format!("暂时不可用：{detail}"))))
         }
     }
+}
+
+/// `POST /api/blocks/{id}/test`
+///
+/// 整块连通性测试：逐把测试块内全部密钥，返回每把的结果与汇总。
+pub async fn test_block(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<BlockTestResult>> {
+    Ok(Json(
+        upstream::test_block(&state.store.data, &state.upstream, &id).await?,
+    ))
 }

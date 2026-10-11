@@ -240,3 +240,25 @@ fn default_weight() -> u32 {
 pub struct KeyIdsRequest {
     pub ids: Vec<String>,
 }
+
+/// 块内单把密钥的测试结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct KeyTestResult {
+    pub key_id: String,
+    /// 密钥前缀，便于辨认；不回传完整密钥。
+    pub secret_prefix: String,
+    /// `valid` | `invalid` | `transient`
+    pub outcome: &'static str,
+    pub detail: Option<String>,
+}
+
+/// 整块连通性测试的结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct BlockTestResult {
+    pub block_id: String,
+    pub tested: usize,
+    pub valid: usize,
+    pub invalid: usize,
+    pub transient: usize,
+    pub results: Vec<KeyTestResult>,
+}

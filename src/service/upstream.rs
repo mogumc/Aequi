@@ -524,6 +524,57 @@ async fn disable_key(pool: &SqlitePool, key: &UpstreamKey, detail: &str) -> Resu
     Ok(())
 }
 
+/// 整块连通性测试：逐把测试块内全部密钥。
+///
+/// 结果口径与单把测试一致（有效则清零失败计数、无效则停用），
+/// 串行执行——块内密钥数量有限，并发打上游反而容易被限流。
+pub async fn test_block(
+    pool: &SqlitePool,
+    state: &UpstreamState,
+    block_id: &str,
+) -> Result<crate::model::BlockTestResult> {
+    let keys = db::block::list_keys(pool, block_id).await?;
+
+    let mut results = Vec::with_capacity(keys.len());
+    let (mut valid, mut invalid, mut transient) = (0, 0, 0);
+
+    for key in &keys {
+        let outcome = test_key(pool, state, block_id, &key.id).await?;
+
+        let (label, detail) = match outcome {
+            ProbeOutcome::Valid => {
+                valid += 1;
+                ("valid", None)
+            }
+            ProbeOutcome::Invalid(detail) => {
+                invalid += 1;
+                ("invalid", Some(detail))
+            }
+            ProbeOutcome::Transient(detail) => {
+                transient += 1;
+                ("transient", Some(detail))
+            }
+        };
+
+        results.push(crate::model::KeyTestResult {
+            key_id: key.id.clone(),
+            // 只回前缀：整块测试的结果可能被贴进工单，完整密钥没必要外带。
+            secret_prefix: key.secret.chars().take(6).collect(),
+            outcome: label,
+            detail,
+        });
+    }
+
+    Ok(crate::model::BlockTestResult {
+        block_id: block_id.to_string(),
+        tested: results.len(),
+        valid,
+        invalid,
+        transient,
+        results,
+    })
+}
+
 /// 密钥的对外视图。
 fn view_key(key: &UpstreamKey) -> UpstreamKeyView {
     UpstreamKeyView {

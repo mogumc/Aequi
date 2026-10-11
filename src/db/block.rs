@@ -110,6 +110,10 @@ SELECT id, block_id, secret, status, weight, failure_count, cooldown_until, last
 last_used_at, created_at, updated_at \
 FROM upstream_keys WHERE block_id = ? AND id = ?";
 
+/// 块总数与启用数。
+const SQL_COUNT_ENABLED: &str = "\
+SELECT COUNT(*) AS total, COALESCE(SUM(enabled), 0) AS enabled FROM upstream_blocks";
+
 /// 按 ID 查块。
 pub async fn find_block(pool: &SqlitePool, id: &str) -> Result<Option<UpstreamBlock>, sqlx::Error> {
     let row = sqlx::query(SQL_FIND_BLOCK)
@@ -285,4 +289,13 @@ pub fn is_unique_violation(error: &sqlx::Error) -> bool {
         sqlx::Error::Database(database)
             if database.kind() == sqlx::error::ErrorKind::UniqueViolation
     )
+}
+
+/// 块总数与启用数。
+pub async fn count_enabled(pool: &SqlitePool) -> Result<crate::model::ResourceCount, sqlx::Error> {
+    let row = sqlx::query(SQL_COUNT_ENABLED).fetch_one(pool).await?;
+    Ok(crate::model::ResourceCount {
+        total: row.get("total"),
+        enabled: row.get("enabled"),
+    })
 }

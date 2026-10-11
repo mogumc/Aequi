@@ -68,6 +68,42 @@ pub async fn list(pool: &SqlitePool) -> Result<Vec<ApiKey>> {
     Ok(db::keys::list(pool).await?)
 }
 
+/// 分页查询的默认页大小与上限。
+const DEFAULT_PAGE_SIZE: i64 = 20;
+const MAX_PAGE_SIZE: i64 = 100;
+
+/// 单页密钥。
+#[derive(Debug, Clone)]
+pub struct KeyPage {
+    pub keys: Vec<ApiKey>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+}
+
+/// 分页列出密钥，可按名称或密钥前缀搜索。
+///
+/// `page` 从 1 开始；页大小收敛到 `1..=MAX_PAGE_SIZE`，无论调用方传什么。
+pub async fn list_page(
+    pool: &SqlitePool,
+    search: Option<&str>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+) -> Result<KeyPage> {
+    let page_size = page_size
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let page = page.unwrap_or(1).max(1);
+    let offset = (page - 1) * page_size;
+
+    Ok(KeyPage {
+        keys: db::keys::list_paged(pool, search, page_size, offset).await?,
+        total: db::keys::count_paged(pool, search).await?,
+        page,
+        page_size,
+    })
+}
+
 /// 更新元信息。未提交的字段保持原值。
 pub async fn update(pool: &SqlitePool, id: &str, patch: KeyUpdate) -> Result<ApiKey> {
     let current = get(pool, id).await?;

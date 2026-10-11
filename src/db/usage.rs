@@ -36,6 +36,26 @@ FROM usage_records WHERE key_id = ?";
 /// 回收给定时间之前的记录，返回删除的行数。
 const SQL_PURGE: &str = "DELETE FROM usage_records WHERE created_at <= ?";
 
+/// 从给定时间起的用量汇总。
+const SQL_TOTALS: &str = "\
+SELECT COUNT(*)                            AS requests, \
+       COALESCE(SUM(status = 'error'), 0)  AS failed, \
+       COALESCE(SUM(prompt_tokens), 0)     AS prompt_tokens, \
+       COALESCE(SUM(completion_tokens), 0) AS completion_tokens, \
+       COALESCE(SUM(cache_tokens), 0)      AS cache_tokens, \
+       COALESCE(SUM(credits_scaled), 0)    AS credits_scaled \
+FROM usage_records WHERE created_at >= ?";
+
+/// 按天聚合（按本地时区切天）。
+const SQL_TREND: &str = "\
+SELECT date(created_at, 'unixepoch', 'localtime') AS day, \
+       COUNT(*)                                   AS requests, \
+       COALESCE(SUM(status = 'error'), 0)         AS failed, \
+       COALESCE(SUM(raw_tokens), 0)               AS tokens, \
+       COALESCE(SUM(credits_scaled), 0)           AS credits_scaled \
+FROM usage_records WHERE created_at >= ? \
+GROUP BY day ORDER BY day";
+
 /// 写入一条成功用量记录所需的字段。
 #[derive(Debug)]
 pub struct NewUsage<'a> {
@@ -161,4 +181,46 @@ pub async fn summary(pool: &SqlitePool, key_id: &str) -> Result<UsageSummary, sq
 pub async fn purge_before(pool: &SqlitePool, cutoff: i64) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(SQL_PURGE).bind(cutoff).execute(pool).await?;
     Ok(result.rows_affected())
+}
+
+/// 从 `since`（含）起的用量汇总。
+pub async fn totals_since(
+    pool: &SqlitePool,
+    since: i64,
+) -> Result<crate::model::StatsCounters, sqlx::Error> {
+    let row = sqlx::query(SQL_TOTALS).bind(since).fetch_one(pool).await?;
+    let credits_scaled = row.get("credits_scaled");
+
+    Ok(crate::model::StatsCounters {
+        requests: row.get("requests"),
+        failed: row.get("failed"),
+        prompt_tokens: row.get("prompt_tokens"),
+        completion_tokens: row.get("completion_tokens"),
+        cache_tokens: row.get("cache_tokens"),
+        credits: crate::model::credits::format_credits(credits_scaled),
+        credits_scaled,
+    })
+}
+
+/// 从 `since`（含）起的按天聚合，按日期升序。
+pub async fn trend_since(
+    pool: &SqlitePool,
+    since: i64,
+) -> Result<Vec<crate::model::StatsPoint>, sqlx::Error> {
+    let rows = sqlx::query(SQL_TREND).bind(since).fetch_all(pool).await?;
+
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let credits_scaled = row.get("credits_scaled");
+            crate::model::StatsPoint {
+                date: row.get("day"),
+                requests: row.get("requests"),
+                failed: row.get("failed"),
+                tokens: row.get("tokens"),
+                credits: crate::model::credits::format_credits(credits_scaled),
+                credits_scaled,
+            }
+        })
+        .collect())
 }
