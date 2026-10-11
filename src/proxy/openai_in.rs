@@ -13,6 +13,14 @@ use super::scheme::{
 
 /// 解析用户发来的对话请求。
 pub fn parse_request(body: &Value) -> Result<ChatRequest> {
+    // 流式（SSE）尚未支持：显式拒绝比静默返回非流式更诚实——
+    // 期待 SSE 的客户端拿到 JSON 只会解析失败，还以为是网络问题。
+    if body.get("stream").and_then(Value::as_bool) == Some(true) {
+        return Err(Error::BadRequest(
+            "暂不支持流式响应（stream=true），请去掉该字段".to_string(),
+        ));
+    }
+
     let model = body
         .get("model")
         .and_then(Value::as_str)
@@ -215,5 +223,58 @@ fn finish_reason_name(reason: FinishReason) -> &'static str {
         FinishReason::ToolCalls => "tool_calls",
         FinishReason::ContentFilter => "content_filter",
         FinishReason::Unknown => "stop",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimal_request_parses() {
+        let body = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "你好" }]
+        });
+
+        let request = parse_request(&body).unwrap();
+        assert_eq!(request.model, "gpt-x");
+        assert_eq!(request.messages.len(), 1);
+        assert!(request.tools.is_empty());
+    }
+
+    #[test]
+    fn stream_true_is_rejected_explicitly() {
+        let body = json!({
+            "model": "gpt-x",
+            "stream": true,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+
+        let error = parse_request(&body).unwrap_err();
+        assert!(matches!(error, Error::BadRequest(_)), "stream=true 应得到明确的 400 而不是静默忽略");
+    }
+
+    #[test]
+    fn stream_false_is_fine() {
+        let body = json!({
+            "model": "gpt-x",
+            "stream": false,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+
+        assert!(parse_request(&body).is_ok());
+    }
+
+    #[test]
+    fn missing_model_or_messages_is_rejected() {
+        let no_model = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        assert!(parse_request(&no_model).is_err());
+
+        let no_messages = json!({ "model": "gpt-x" });
+        assert!(parse_request(&no_messages).is_err());
+
+        let empty_messages = json!({ "model": "gpt-x", "messages": [] });
+        assert!(parse_request(&empty_messages).is_err());
     }
 }
