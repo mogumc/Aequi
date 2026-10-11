@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{DATA_DATABASE_PATH_ENV, DATABASE_PATH_ENV, DEFAULT_DATABASE_FILE, non_empty_env};
+use super::{DATA_DATABASE_PATH_ENV, DATABASE_PATH_ENV, DEFAULT_DATABASE_FILE, LISTEN_ENV, non_empty_env};
 
 /// 启动引导参数。
 #[derive(Debug, Clone)]
@@ -17,6 +17,9 @@ pub struct Bootstrap {
     /// 与控制面分开存放，两套体系在文件层面就不共享读写，
     /// 密钥侧的任何查询都碰不到管理员数据。
     pub data_database: PathBuf,
+    /// 监听地址。设置后**优先于** settings 表里的 `server.listen`——
+    /// 显式给环境变量表达的就是「这次启动听这里」，例如端口被占时换端口。
+    pub listen: Option<String>,
 }
 
 impl Bootstrap {
@@ -36,6 +39,7 @@ impl Bootstrap {
         Self {
             database,
             data_database,
+            listen: non_empty_env(LISTEN_ENV),
         }
     }
 

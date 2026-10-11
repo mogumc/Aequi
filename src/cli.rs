@@ -46,6 +46,7 @@ pub fn print_help() {
 环境变量:
   AEQUI_DATABASE_PATH        控制面数据库路径，默认 aequi.db
   AEQUI_DATA_DATABASE_PATH   数据面数据库路径，默认 aequi-data.db
+  AEQUI_LISTEN               监听地址，设置后优先于后台设置里的 server.listen
   AEQUI_ADMIN_USERNAME       初始账号用户名，仅首次启动生效
   AEQUI_ADMIN_PASSWORD       初始账号密码，仅首次启动生效
   RUST_LOG                   日志级别，默认 info"

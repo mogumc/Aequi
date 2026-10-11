@@ -8,8 +8,10 @@
 //! 只有首次启动（数据库文件尚不存在）才接受环境变量形式的初始账号密码；
 //! 后台设置一律以数据库为准，没有配置文件。
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
+use anyhow::Context;
 use aequi::cli::{self, Command};
 use aequi::config::{ADMIN_PASSWORD_ENV, Bootstrap};
 use aequi::service::auth::InitialCredentials;
@@ -52,7 +54,17 @@ async fn serve() -> anyhow::Result<()> {
     store.migrate().await?;
 
     // 首次启动导入默认设置，之后一律以数据库为准。
-    let settings = service::settings::ensure(&store.control).await?;
+    let mut settings = service::settings::ensure(&store.control).await?;
+    if let Some(listen) = &bootstrap.listen {
+        // 显式给环境变量表达的就是「这次启动听这里」，优先于库里的设置。
+        // 解析失败直接报错退出，不能静默回退到库里的值——那会让人以为
+        // 环境变量生效了。
+        let addr: SocketAddr = listen
+            .parse()
+            .with_context(|| format!("AEQUI_LISTEN 无效: {listen}"))?;
+        settings.listen = addr;
+        tracing::info!(listen = %addr, "监听地址已由 AEQUI_LISTEN 覆盖");
+    }
     tracing::info!(listen = %settings.listen, "后台设置已载入");
 
     match service::auth::initialize_account(&store.control, is_first_run).await? {

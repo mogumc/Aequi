@@ -25,6 +25,8 @@ pub const DATA_DATABASE_PATH_ENV: &str = "AEQUI_DATA_DATABASE_PATH";
 pub const ADMIN_USERNAME_ENV: &str = "AEQUI_ADMIN_USERNAME";
 /// 初始账号密码的环境变量，**仅在首次启动时读取**。
 pub const ADMIN_PASSWORD_ENV: &str = "AEQUI_ADMIN_PASSWORD";
+/// 监听地址的环境变量。设置后优先于后台设置里的 `server.listen`。
+pub const LISTEN_ENV: &str = "AEQUI_LISTEN";
 /// 默认数据库文件名，位于进程工作目录下。
 pub const DEFAULT_DATABASE_FILE: &str = "aequi.db";
 
