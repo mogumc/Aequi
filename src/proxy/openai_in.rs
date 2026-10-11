@@ -170,9 +170,14 @@ fn parse_tools(value: Option<&Value>) -> Vec<ToolDefinition> {
     items
         .iter()
         .filter_map(|item| {
-            let function = item.get("function")?;
+            // 两种形状都接受：OpenAI 的包装式（定义收在 function 子对象里）
+            // 与扁平式（name/description/parameters 直接在条目上——Anthropic
+            // 与不少新客户端的写法）。此前只认包装式，扁平形状的工具条目
+            // 会被静默丢光，模型收不到任何工具，调用全部退化成正文文本。
+            let function = item.get("function").unwrap_or(item);
+            let name = function.get("name").and_then(Value::as_str)?;
             Some(ToolDefinition {
-                name: function.get("name").and_then(Value::as_str)?.to_string(),
+                name: name.to_string(),
                 description: function
                     .get("description")
                     .and_then(Value::as_str)
@@ -330,6 +335,41 @@ mod tests {
         assert_eq!(request.model, "gpt-x");
         assert_eq!(request.messages.len(), 1);
         assert!(request.tools.is_empty());
+    }
+
+    #[test]
+    fn tools_parse_in_both_wrapped_and_flat_shapes() {
+        // OpenAI 包装式（function 子对象）与扁平式（定义直接在条目上）都接受。
+        let body = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "wrapped_tool",
+                        "description": "包装式",
+                        "parameters": { "type": "object", "properties": {} }
+                    }
+                },
+                {
+                    "type": "function",
+                    "name": "flat_tool",
+                    "description": "扁平式",
+                    "parameters": { "type": "object", "properties": {} }
+                },
+                { "name": "minimal_tool" }
+            ]
+        });
+
+        let request = parse_request(&body).unwrap();
+        assert_eq!(request.tools.len(), 3, "两种形状都不能丢");
+        assert_eq!(request.tools[0].name, "wrapped_tool");
+        assert_eq!(request.tools[1].name, "flat_tool");
+        assert_eq!(request.tools[2].name, "minimal_tool");
+        assert_eq!(request.tools[0].description.as_deref(), Some("包装式"));
+        assert_eq!(request.tools[1].description.as_deref(), Some("扁平式"));
+        assert!(request.tools[1].parameters["type"] == "object");
     }
 
     #[test]
