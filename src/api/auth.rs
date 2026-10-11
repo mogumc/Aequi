@@ -8,7 +8,7 @@ use axum::http::{header, HeaderMap};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::api::middleware::AuthContext;
+use crate::api::middleware::{resolve_client_ip, AuthContext};
 use crate::api::MessageResponse;
 use crate::error::{Error, Result};
 use crate::model::AccountView;
@@ -157,36 +157,4 @@ pub async fn change_username(
     .await?;
 
     Ok(Json(AccountView::from(&account)))
-}
-
-/// 解析客户端地址。
-///
-/// 只有开启了 `server.trust_proxy` 才采信转发头。直连场景下 `X-Forwarded-For`
-/// 完全由客户端掌控，无条件采信等于让登录记录里的 IP 可以随便伪造。
-fn resolve_client_ip(headers: &HeaderMap, addr: SocketAddr, trust_proxy: bool) -> String {
-    if trust_proxy {
-        if let Some(forwarded) = forwarded_ip(headers) {
-            return forwarded;
-        }
-    }
-
-    addr.ip().to_string()
-}
-
-/// 从转发头里取最左边那一跳（即原始客户端）。
-fn forwarded_ip(headers: &HeaderMap) -> Option<String> {
-    let value = headers
-        .get("x-forwarded-for")
-        .or_else(|| headers.get("x-real-ip"))?
-        .to_str()
-        .ok()?;
-
-    // 形如「客户端, 代理1, 代理2」，取第一段。
-    let first = value.split(',').next()?.trim();
-
-    if first.is_empty() {
-        None
-    } else {
-        Some(first.to_string())
-    }
 }

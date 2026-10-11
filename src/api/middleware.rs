@@ -3,10 +3,11 @@
 //! 校验通过后把账号与会话放进请求扩展，后续 handler 直接取用，
 //! 不必重复查询数据库。
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
-use axum::http::header::AUTHORIZATION;
+use axum::http::{header::AUTHORIZATION, HeaderMap};
 use axum::middleware::Next;
 use axum::response::Response;
 
@@ -14,6 +15,36 @@ use crate::error::{Error, Result};
 use crate::model::{Account, Session};
 use crate::service::auth;
 use crate::AppState;
+
+/// 解析客户端 IP。
+///
+/// 只有开启了 `server.trust_proxy` 才采信转发头。直连场景下 `X-Forwarded-For`
+/// 完全由客户端掌控，无条件采信等于让日志里的 IP 可以随便伪造。
+pub(crate) fn resolve_client_ip(
+    headers: &HeaderMap,
+    addr: SocketAddr,
+    trust_proxy: bool,
+) -> String {
+    if trust_proxy {
+        if let Some(forwarded) = forwarded_ip(headers) {
+            return forwarded;
+        }
+    }
+
+    addr.ip().to_string()
+}
+
+fn forwarded_ip(headers: &HeaderMap) -> Option<String> {
+    let value = headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))?
+        .to_str()
+        .ok()?;
+
+    // 形如「客户端, 代理1, 代理2」，取第一段。
+    let first = value.split(',').next()?.trim();
+    (!first.is_empty()).then(|| first.to_string())
+}
 
 /// 一次请求的认证上下文。
 #[derive(Debug, Clone)]

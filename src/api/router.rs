@@ -28,7 +28,7 @@ use serde::Serialize;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::api::{
-    auth, blocks, device, key_auth, key_portal, keys, middleware as auth_middleware, otp,
+    auth, blocks, device, key_auth, key_portal, keys, logs, middleware as auth_middleware, otp,
     proxy_api, settings,
 };
 use crate::db;
@@ -72,6 +72,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/blocks/{id}/keys/pause", post(blocks::pause_keys))
         .route("/blocks/{id}/keys/resume", post(blocks::resume_keys))
         .route("/blocks/{id}/keys/{key_id}/test", post(blocks::test_key))
+        .route("/logs", get(logs::list))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware::require_auth,
