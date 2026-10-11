@@ -1,12 +1,14 @@
 //! HTTP 接口层。
 
 pub mod auth;
+pub mod blocks;
 pub mod device;
 pub mod key_auth;
 pub mod key_portal;
 pub mod keys;
 pub mod middleware;
 pub mod otp;
+pub mod proxy_api;
 pub mod settings;
 mod router;
 

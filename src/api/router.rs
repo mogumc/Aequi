@@ -28,7 +28,8 @@ use serde::Serialize;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::api::{
-    auth, device, key_auth, key_portal, keys, middleware as auth_middleware, otp, settings,
+    auth, blocks, device, key_auth, key_portal, keys, middleware as auth_middleware, otp,
+    proxy_api, settings,
 };
 use crate::db;
 use crate::error::Result;
@@ -61,6 +62,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/keys/{id}/credits", post(keys::set_credits))
         .route("/keys/{id}/usage", get(keys::usage))
+        .route("/blocks", get(blocks::list).post(blocks::create))
+        .route(
+            "/blocks/{id}",
+            get(blocks::detail).patch(blocks::update).delete(blocks::delete),
+        )
+        .route("/blocks/{id}/keys", get(blocks::list_keys).post(blocks::add_keys))
+        .route("/blocks/{id}/keys/remove", post(blocks::remove_keys))
+        .route("/blocks/{id}/keys/pause", post(blocks::pause_keys))
+        .route("/blocks/{id}/keys/resume", post(blocks::resume_keys))
+        .route("/blocks/{id}/keys/{key_id}/test", post(blocks::test_key))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware::require_auth,
@@ -75,12 +86,21 @@ pub fn router(state: Arc<AppState>) -> Router {
             key_auth::require_key,
         ));
 
+    // 代理入口：对外协议只有 OpenAI 的一种，同样用访问密钥认证。
+    let gateway = Router::new()
+        .route("/chat/completions", post(proxy_api::chat_completions))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            key_auth::require_key,
+        ));
+
     Router::new()
         .route("/", get(panel_redirect))
         .route("/health", get(health))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/providers", get(auth::providers))
         .nest("/api", admin.merge(portal))
+        .nest("/v1", gateway)
         .merge(web::router())
         .layer(cors)
         .with_state(state)
