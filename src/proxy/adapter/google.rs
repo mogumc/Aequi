@@ -425,24 +425,6 @@ fn build_body(request: &ChatRequest, model: &str, stream: bool) -> Value {
         }
     }
 
-    // 约束兜底：input 第一条若是 function_call（前置 user turn 缺失的极端
-    // 情形，如客户端历史不完整），在最前面补一个 user_input turn，保证
-    // 「call 必须紧跟 user 或 function_result」永远成立。
-    if input
-        .first()
-        .and_then(|item| item.get("type"))
-        .and_then(Value::as_str)
-        == Some("function_call")
-    {
-        input.insert(
-            0,
-            json!({
-                "type": "user_input",
-                "content": [{"type": "text", "text": "(续)"}],
-            }),
-        );
-    }
-
     let mut body = json!({
         "model": model,
         "input": input,
