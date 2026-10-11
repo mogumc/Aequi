@@ -27,6 +27,10 @@ pub enum Error {
     #[error("动态验证码不正确")]
     InvalidTotp,
 
+    /// 密钥余额不足以支付本次调用。
+    #[error("积分不足")]
+    InsufficientCredits,
+
     #[error("{0}")]
     NotFound(String),
 
@@ -50,6 +54,8 @@ impl Error {
             | Error::TotpRequired
             | Error::InvalidTotp => StatusCode::UNAUTHORIZED,
             Error::Forbidden(_) => StatusCode::FORBIDDEN,
+            // 402 比 403 更贴切：不是没权限，是余额不够。
+            Error::InsufficientCredits => StatusCode::PAYMENT_REQUIRED,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Database(_) | Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -64,6 +70,7 @@ impl Error {
             Error::TotpRequired => "totp_required",
             Error::InvalidTotp => "invalid_totp",
             Error::Forbidden(_) => "forbidden",
+            Error::InsufficientCredits => "insufficient_credits",
             Error::NotFound(_) => "not_found",
             Error::Database(_) => "database_error",
             Error::Internal(_) => "internal_error",
