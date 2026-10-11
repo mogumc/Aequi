@@ -542,7 +542,7 @@ pub async fn chat_completion_stream(
                 tracing::warn!(error = %log_error, "写入失败用量记录失败");
             }
             // 给客户端的是不含内部细节的短句；原始载荷进日志供排障。
-            yield Ok(error_frame("上游没有返回任何内容"));
+            yield Ok(error_frame("上游提前结束了响应且没有返回任何内容，请重试"));
             return;
         }
 

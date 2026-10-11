@@ -27,7 +27,11 @@ const FAILURE_THRESHOLD: u32 = 3;
 /// 429 退避时长（秒）。
 const RATE_LIMIT_COOLDOWN: i64 = 30;
 /// 发往上游的请求超时。
+/// 整个请求（含读流）的总时长上限。思考型模型输出慢，给足余量。
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(120);
+/// 连接池空闲超时。池里放太久的连接可能已被服务端静默关闭，
+/// 复用到它就会表现为「响应读到一半流就没了」且概率性出现。
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 上游的运行时状态：轮询累积值与每块的 HTTP 客户端。
 #[derive(Default)]
@@ -91,7 +95,9 @@ impl UpstreamState {
             return Ok(client);
         }
 
-        let mut builder = reqwest::Client::builder().timeout(UPSTREAM_TIMEOUT);
+        let mut builder = reqwest::Client::builder()
+            .timeout(UPSTREAM_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT);
         if let Some(proxy) = &block.proxy {
             let proxy = reqwest::Proxy::all(proxy)
                 .map_err(|error| Error::UpstreamUnavailable(format!("代理配置无效: {error}")))?;
