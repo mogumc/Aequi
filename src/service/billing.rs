@@ -78,11 +78,13 @@ pub async fn charge(
 
     let mut tx = pool.begin().await?;
 
-    // 扣费语句自带余额判断，余额不足时一条都不会命中；
-    // 此时事务没有任何改动，直接返回错误即可回滚。
-    let remaining_scaled = db::keys::charge(&mut *tx, &key.id, credits_scaled, now)
-        .await?
-        .ok_or(Error::InsufficientCredits)?;
+    // 扣费语句自带余额与启用状态判断，不满足时一条都不会命中。
+    // 此时事务没有任何改动，回滚即可——但必须把「已停用」和「余额不足」
+    // 区分开，否则调用方拿到的错误会指向完全错误的方向。
+    let Some(remaining_scaled) = db::keys::charge(&mut *tx, &key.id, credits_scaled, now).await?
+    else {
+        return Err(classify_charge_failure(pool, &key.id).await);
+    };
 
     db::usage::insert(
         &mut *tx,
@@ -119,4 +121,17 @@ fn ensure_usable(key: &ApiKey, model: &str) -> Result<()> {
         return Err(Error::Forbidden(format!("该密钥无权使用模型 {model}")));
     }
     Ok(())
+}
+
+/// 扣费未命中时回查一次密钥状态，给出准确的失败原因。
+///
+/// 传进来的 `key` 可能是稍早读到的快照，期间管理员完全可能刚把它停用或删除，
+/// 所以这里以库里的当前状态为准。
+async fn classify_charge_failure(pool: &SqlitePool, key_id: &str) -> Error {
+    match db::keys::find_by_id(pool, key_id).await {
+        Ok(Some(current)) if !current.enabled => Error::Forbidden("该密钥已被停用".to_string()),
+        Ok(Some(_)) => Error::InsufficientCredits,
+        Ok(None) => Error::NotFound("密钥不存在".to_string()),
+        Err(error) => error.into(),
+    }
 }
