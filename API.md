@@ -233,7 +233,10 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
 }
 ```
 
-- `api_format`：`openai` | `google` | `anthropic`。
+- `api_format`：`openai` | `google` | `anthropic`。`google` 走 v1beta **Interactions API**
+  （`POST /v1beta/interactions`，带 `api-revision` 版本头），流式与非流式同一个端点，
+  区别在 body 的 `stream` 字段；工具调用受严格限制——输入里不允许出现
+  `function_call`/`function_result`，工具结果会以 `[Tool {name} result]` 文本折回 `user_input`。
 - **`id` 只允许小写字母、数字、点、下划线、连字符**（≤ 64 字符）。它会被当作
   请求里模型名的前缀（`块id/模型名`），含 `/` 或空格会直接破坏那条解析规则。
 - `models[]`：本块对外接受的模型；`forward` 缺省表示同名转发；

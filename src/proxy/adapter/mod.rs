@@ -298,33 +298,31 @@ mod tests {
     }
 
     #[test]
-    fn google_puts_model_in_the_path_and_system_in_instruction() {
-        let outgoing = adapter_for(ApiFormat::Google).build_chat(&sample_request(), "gemini");
+    fn google_uses_interactions_endpoint_with_system_instruction() {
+        let outgoing = adapter_for(ApiFormat::Google).build_chat(&sample_request(), "gemini-3.5");
         let body = outgoing.body.as_ref().unwrap();
 
-        assert_eq!(outgoing.path, "/v1beta/models/gemini:generateContent");
-        assert_eq!(
-            body["systemInstruction"]["parts"][0]["text"],
-            "你是助手"
-        );
+        // Interactions API：固定端点，模型进 body，system 折成 system_instruction。
+        assert_eq!(outgoing.path, "/v1beta/interactions");
+        assert_eq!(body["model"], "gemini-3.5");
+        assert_eq!(body["system_instruction"], "你是助手");
+        assert_eq!(body["store"], false);
 
-        let contents = body["contents"].as_array().unwrap();
-        assert_eq!(contents.len(), 1);
-        assert_eq!(contents[0]["role"], "user");
-        assert_eq!(contents[0]["parts"][0]["text"], "你好");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "user_input");
+        assert_eq!(input[0]["content"][0]["text"], "你好");
     }
 
     #[test]
     fn google_usage_fields_are_renamed() {
         let body = json!({
-            "candidates": [{
-                "content": { "parts": [{ "text": "嗯" }] },
-                "finishReason": "STOP"
-            }],
-            "usageMetadata": {
-                "promptTokenCount": 6,
-                "candidatesTokenCount": 2,
-                "totalTokenCount": 8
+            "status": "completed",
+            "steps": [{ "type": "model_output", "content": [{ "type": "text", "text": "嗯" }] }],
+            "usage": {
+                "total_input_tokens": 6,
+                "total_output_tokens": 2,
+                "total_tokens": 8
             }
         });
 

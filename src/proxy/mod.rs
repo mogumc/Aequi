@@ -316,9 +316,30 @@ pub async fn chat_completion_stream(
                     continue;
                 }
 
-                return Err(Error::UpstreamUnavailable(format!(
-                    "上游返回 {status} {detail}"
-                )));
+                // 400 这类参数错误重试也不会好，直接报错。但必须落日志：
+                // 否则排障时只能看到 tracing 输出，请求流水里查无此请求。
+                let message = format!("上游返回 {status} {detail}");
+                write_log(
+                    pool,
+                    base_log(&key, &ip, user_agent.as_deref(), started)
+                        .model(request.model.clone())
+                        .streaming()
+                        .failed(&Error::UpstreamUnavailable(message.clone())),
+                )
+                .await;
+                if let Err(log_error) = crate::db::usage::insert_error(
+                    pool,
+                    &key.id,
+                    &request.model,
+                    &message,
+                    true,
+                    time::now_secs(),
+                )
+                .await
+                {
+                    tracing::warn!(error = %log_error, "写入失败用量记录失败");
+                }
+                return Err(Error::UpstreamUnavailable(message));
             }
             Err(error) => {
                 let user_message = error.to_string();
@@ -371,6 +392,8 @@ pub async fn chat_completion_stream(
         let mut text_acc = String::new();
         let mut usage_acc = Usage::default();
         let mut finished = false;
+        // 上游是否真的产出过内容（文本或工具调用）。
+        let mut produced = false;
         let mut sse = std::pin::pin!(payload_stream);
 
         // 流内只读名字，拷一份所有权（生命周期长于本函数）。
@@ -421,6 +444,12 @@ pub async fn chat_completion_stream(
                 }
             };
 
+            // `[DONE]` 是 OpenAI 风格的流结束哨兵，不是载荷——各家解析器都不该
+            // 见到它。在这里统一截住，省得每个 adapter 各自处理一遍。
+            if payload.trim() == "[DONE]" {
+                continue;
+            }
+
             let events = match adapter.parse_stream_event(&payload) {
                 Ok(events) => events,
                 Err(error) => {
@@ -452,6 +481,9 @@ pub async fn chat_completion_stream(
             for event in events {
                 match event {
                     StreamEvent::Delta { text, tool_calls } => {
+                        if !text.is_empty() || !tool_calls.is_empty() {
+                            produced = true;
+                        }
                         text_acc.push_str(&text);
                         yield frame(openai_in::render_stream_delta(
                             &id, created, &model, &text, &tool_calls,
@@ -469,6 +501,37 @@ pub async fn chat_completion_stream(
                     StreamEvent::End => {}
                 }
             }
+        }
+
+        // 整个流没有任何实际产出（无用量、无文本、无工具调用）时按失败处理，
+        // 不估算也不计费——上游可能返回了 200 加一段错误事件，那不是服务，是故障。
+        // 之前这里会按请求体估出一笔 token 照样扣费，失败也收钱。
+        if !produced && usage_acc.total_tokens == 0 {
+            let message = "上游没有返回任何内容".to_string();
+            write_log(
+                pool,
+                base_log(&key, &ip, user_agent.as_deref(), started)
+                    .model(request.model.clone())
+                    .block(&block_id)
+                    .upstream_key(&upstream_key_id)
+                    .streaming()
+                    .failed(&Error::UpstreamUnavailable(message.clone())),
+            )
+            .await;
+            if let Err(log_error) = crate::db::usage::insert_error(
+                pool,
+                &key.id,
+                &model,
+                &message,
+                true,
+                time::now_secs(),
+            )
+            .await
+            {
+                tracing::warn!(error = %log_error, "写入失败用量记录失败");
+            }
+            yield Ok(error_frame(&message));
+            return;
         }
 
         // 上游没发结束原因就补一个 Stop，避免客户端把流挂起。
