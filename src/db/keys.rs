@@ -112,6 +112,10 @@ pub async fn list(pool: &SqlitePool) -> Result<Vec<ApiKey>, sqlx::Error> {
 }
 
 /// 创建密钥。
+///
+/// `id` 与 `key_hash` 都是随机值且有唯一约束。碰撞概率可忽略，处理方式刻意与登录不同：
+/// 建密钥是低频的人工操作，真撞上会直接抛出约束冲突、管理员重试一次即可；
+/// 而登录是高频自动路径，撞车失败对用户就是「莫名其妙的错误」，所以那里做了自动重试。
 pub async fn insert(pool: &SqlitePool, key: &NewApiKey<'_>) -> Result<(), sqlx::Error> {
     sqlx::query(SQL_INSERT)
         .bind(key.id)

@@ -67,7 +67,15 @@ pub async fn insert(
     Ok(())
 }
 
+/// 单次查询能返回的最大记录数。
+///
+/// 放在数据层是为了给所有调用方兜底：SQLite 的 `LIMIT -1` 表示**不设上限**，
+/// 直接把参数透传下去，一个负数就能把整张表拉出来。
+pub const MAX_USAGE_LIMIT: i64 = 500;
+
 /// 列出某密钥的用量记录，最近的排在前面。
+///
+/// `limit` 会被收敛到 `1..=MAX_USAGE_LIMIT`，无论调用方传什么。
 pub async fn list_by_key(
     pool: &SqlitePool,
     key_id: &str,
@@ -75,7 +83,7 @@ pub async fn list_by_key(
 ) -> Result<Vec<UsageRecord>, sqlx::Error> {
     let rows = sqlx::query(SQL_LIST_BY_KEY)
         .bind(key_id)
-        .bind(limit)
+        .bind(limit.clamp(1, MAX_USAGE_LIMIT))
         .fetch_all(pool)
         .await?;
     Ok(rows.iter().map(map_row).collect())

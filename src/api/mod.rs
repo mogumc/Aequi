@@ -42,9 +42,11 @@ fn default_usage_limit() -> i64 {
 }
 
 impl UsageQuery {
-    /// 收敛到合理区间，避免一次把整张表拉出来。
+    /// 收敛到数据层允许的区间，避免一次把整张表拉出来。
+    ///
+    /// 上限复用数据层的常量，两处不会各写各的。
     pub fn limit(&self) -> i64 {
-        self.limit.clamp(1, 500)
+        self.limit.clamp(1, crate::db::usage::MAX_USAGE_LIMIT)
     }
 }
 
