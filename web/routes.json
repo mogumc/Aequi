@@ -1,0 +1,20 @@
+[
+  {
+    "path": "/"
+  },
+  {
+    "path": "/keys"
+  },
+  {
+    "path": "/upstreams"
+  },
+  {
+    "path": "/logs"
+  },
+  {
+    "path": "/settings"
+  },
+  {
+    "path": "/login"
+  }
+]
