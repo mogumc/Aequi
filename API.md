@@ -314,6 +314,27 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
 
 ## 代理接口
 
+入口只认 OpenAI 格式，全部用访问密钥认证（`Authorization: Bearer ak_...`）。
+
+### `GET /v1/models`
+
+供下游客户端（OpenAI SDK 等）列可用模型。返回的是**该密钥实际能调的**模型：
+所有**启用中**的块里配置的模型（去重），再按密钥白名单收敛；白名单为空即不限制。
+
+```json
+{ "object": "list", "data": [{ "id": "gpt-4o", "object": "model", "created": 1791720000, "owned_by": "aequi" }] }
+```
+
+两个要点：
+
+- 停用的块不参与调度，它的模型也就不会出现。
+- 白名单里可能残留**已经从所有块删掉**的模型名——那种名字本来就调不到，
+  不会出现在这里。所以这里的列表始终是「块里有的 ∩ 白名单允许的」。
+
+上游是否提供列模型接口与本接口无关：这里的列表来自**块配置**，
+不是每次去问上游（那既慢又不稳）。块里的模型可以用
+`POST /api/blocks/{id}/models/fetch` 从上游拉取，也可以手动添加。
+
 ### `POST /v1/chat/completions`
 
 对外协议**只有 OpenAI 一种**；上游格式由所在块的 `api_format` 决定，内部转换。

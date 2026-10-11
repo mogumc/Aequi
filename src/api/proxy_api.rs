@@ -17,7 +17,40 @@ use crate::api::key_auth::KeyContext;
 use crate::api::middleware::resolve_client_ip;
 use crate::error::Result;
 use crate::proxy;
+use crate::service::upstream;
+use crate::utils::time;
 use crate::AppState;
+
+/// `GET /v1/models`
+///
+/// 下游客户端（OpenAI SDK 之类）靠它列可用模型。返回的是**这个密钥实际能调的**
+/// 模型：块里配置的全部模型，再按密钥白名单收敛；白名单为空即不限制。
+pub async fn list_models(
+    Extension(context): Extension<KeyContext>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>> {
+    let models = upstream::available_models(&state.store.data).await?;
+    let models = upstream::filter_by_whitelist(models, &context.key);
+
+    // 各家客户端对 created / owned_by 的处理不一，但 OpenAI 的形状里带着，
+    // 缺了会让部分 SDK 解析失败，所以补齐。
+    let created = time::now_secs();
+    let data: Vec<Value> = models
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "id": name,
+                "object": "model",
+                "created": created,
+                "owned_by": "aequi",
+            })
+        })
+        .collect();
+
+    Ok(Json(
+        serde_json::json!({ "object": "list", "data": data }),
+    ))
+}
 
 /// `POST /v1/chat/completions`
 ///

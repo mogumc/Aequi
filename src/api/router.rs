@@ -92,6 +92,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     // 代理入口：对外协议只有 OpenAI 的一种，同样用访问密钥认证。
     let gateway = Router::new()
+        .route("/models", get(proxy_api::list_models))
         .route("/chat/completions", post(proxy_api::chat_completions))
         .route(
             "/images/generations",

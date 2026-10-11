@@ -15,7 +15,7 @@ use sqlx::SqlitePool;
 use crate::db;
 use crate::error::{Error, Result};
 use crate::model::{
-    BlockCreate, BlockUpdate, BlockView, KeyStatus, ModelEntry, UpstreamBlock, UpstreamKey,
+    ApiKey, BlockCreate, BlockUpdate, BlockView, KeyStatus, ModelEntry, UpstreamBlock, UpstreamKey,
     UpstreamKeyCreate, UpstreamKeyView,
 };
 use crate::proxy;
@@ -134,6 +134,39 @@ fn validate_models(models: &[ModelEntry]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 当前对外可用的模型名（各块模型去重、排序）。
+///
+/// 只统计**启用**的块：停用的块不参与调度，它的模型也就调不到。
+pub async fn available_models(pool: &SqlitePool) -> Result<Vec<String>> {
+    let blocks = db::block::list_blocks(pool).await?;
+
+    let mut names = Vec::new();
+    for block in blocks.iter().filter(|block| block.enabled) {
+        for model in &block.models {
+            names.push(model.name.clone());
+        }
+    }
+
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+/// 按密钥白名单收敛可用模型。
+///
+/// 白名单为空表示不限制；非空时只留下白名单里确实存在的那些——
+/// 白名单里的名字可能已经从所有块里删掉了，那种名字调不到，不该报给下游。
+pub fn filter_by_whitelist(models: Vec<String>, key: &ApiKey) -> Vec<String> {
+    if key.allowed_models.is_empty() {
+        return models;
+    }
+
+    models
+        .into_iter()
+        .filter(|name| key.allows_model(name))
+        .collect()
 }
 
 /// 用块自己的出口与密钥去上游拉一次可用模型列表。
