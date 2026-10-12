@@ -238,18 +238,37 @@ pub async fn set_credits(
     Ok(())
 }
 
+/// 读取当前余额。
+///
+/// 透支结算时用它确定实际扣款额（= 全部剩余）；接受任意 Executor，
+/// 与扣费、清零在同一个事务里读，不受并发写干扰。
+pub async fn credits_of<'e, E>(executor: E, id: &str) -> Result<i64, sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let value: i64 =
+        sqlx::query_scalar("SELECT credits_scaled FROM api_keys WHERE id = ?")
+            .bind(id)
+            .fetch_one(executor)
+            .await?;
+    Ok(value)
+}
+
 /// 把余额清零。
 ///
-/// 结算发现余额不足时调用：那笔消费的上游成本已经发生且收不回账，
-/// 剩余的小额零头也一并作废——否则余额永远停在正数，入口的
-/// `credits_scaled <= 0` 检查形同虚设，任何消耗大于余额的密钥都能
-/// 无限免费调用。清零之后必须充值才能再次发起请求。
-pub async fn zero_credits(pool: &SqlitePool, id: &str, now: i64) -> Result<(), sqlx::Error> {
+/// 结算发现余额不足时调用：按透支处理——这笔照常记账、客户端照常拿到
+/// 响应，但剩余积分全部扣光。不清零的话余额永远停在正数，入口的
+/// `credits_scaled <= 0` 检查形同虚设，任何消耗大于余额的密钥都能无限
+/// 免费调用。清零之后必须充值才能再次发起请求。
+pub async fn zero_credits<'e, E>(executor: E, id: &str, now: i64) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     sqlx::query(SQL_SET_CREDITS)
         .bind(0)
         .bind(now)
         .bind(id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(())
 }

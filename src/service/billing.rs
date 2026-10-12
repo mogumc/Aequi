@@ -52,24 +52,38 @@ pub async fn charge(
 
     // 无限额度的密钥不走余额判定：只更新使用时间，消耗照记进用量表。
     // 有限额度的走原子扣费——语句自带余额与启用状态判断，
-    // 不满足时一条都不会命中，此时事务没有任何改动，回滚即可；
-    // 但必须把「已停用」和「余额不足」区分开，
-    // 否则调用方拿到的错误会指向完全错误的方向。
-    let Some(remaining_scaled) = (if key.unlimited {
-        db::keys::touch(&mut *tx, &key.id, now).await?
+    // 不满足时一条都不会命中。未命中有两种原因，处理不同：
+    // - 密钥被停用/删除：事务回滚，按原口径报错（不记账）；
+    // - 余额不足：按透支结算——实际扣款为全部剩余积分（用量记录里
+    //   如实记这个数），余额直接归零；用量照记、响应照常返回。
+    //   结算完余额为 0，入口检查自然拦住后续调用，漏损上限一单。
+    //   清零与扣费在同一个事务里，不存在跨连接抢锁的问题。
+    let charged_scaled;
+    let remaining_scaled;
+    if key.unlimited {
+        remaining_scaled = db::keys::touch(&mut *tx, &key.id, now).await?.unwrap_or(0);
+        charged_scaled = credits_scaled;
     } else {
-        db::keys::charge(&mut *tx, &key.id, credits_scaled, now).await?
-    }) else {
-        let failure = classify_charge_failure(pool, &key.id).await;
-        // 余额不足的那笔消费收不回账，剩余零头也一并作废（清零）——
-        // 否则余额永远停在正数，入口检查形同虚设，任何消耗大于余额的
-        // 密钥都能无限免费调用。清零后必须充值才能再次发起请求。
-        if matches!(failure, Error::InsufficientCredits) {
-            if let Err(error) = db::keys::zero_credits(pool, &key.id, now).await {
-                tracing::warn!(key_id = %key.id, error = %error, "余额不足清零失败");
+        match db::keys::charge(&mut *tx, &key.id, credits_scaled, now).await? {
+            Some(remaining) => {
+                remaining_scaled = remaining;
+                charged_scaled = credits_scaled;
+            }
+            None => {
+                let leftover = match db::keys::credits_of(&mut *tx, &key.id).await {
+                    Ok(value) => value.max(0),
+                    Err(_) => return Err(classify_charge_failure(pool, &key.id).await),
+                };
+                if leftover >= credits_scaled {
+                    // 余额其实付得起——未命中的真正原因是密钥被停用/删除，
+                    // 按原口径报错，不做透支结算。
+                    return Err(classify_charge_failure(pool, &key.id).await);
+                }
+                db::keys::zero_credits(&mut *tx, &key.id, now).await?;
+                remaining_scaled = 0;
+                charged_scaled = leftover;
             }
         }
-        return Err(failure);
     };
 
     db::usage::insert(
@@ -85,7 +99,7 @@ pub async fn charge(
             stream,
             multiplier_bp,
             final_tokens,
-            credits_scaled,
+            credits_scaled: charged_scaled,
             created_at: now,
         },
     )
@@ -98,7 +112,7 @@ pub async fn charge(
         usage,
         multiplier_bp,
         final_tokens,
-        credits_scaled,
+        credits_scaled: charged_scaled,
         remaining_scaled,
     })
 }

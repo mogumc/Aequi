@@ -78,27 +78,37 @@ pub fn parse_credits(text: &str) -> Option<i64> {
     Some(if negative { -value } else { value })
 }
 
-/// 把万分比格式化成四位小数，例如 `15000` → `"1.5000"`。
+/// 把万分比格式化成两位小数（0.01 精度），例如 `15000` → `"1.50"`。
+///
+/// 倍率精度是 0.01（见 [`parse_multiplier`]），历史数据里更细的位数
+/// 会被就地取整到两位——展示不需要比约定更精确。
 pub fn format_multiplier(bp: i64) -> String {
     let whole = bp / MULTIPLIER_SCALE;
-    let fraction = (bp % MULTIPLIER_SCALE).abs();
+    let fraction = ((bp % MULTIPLIER_SCALE).abs() as f64 / 100.0).round() as i64;
 
-    format!("{whole}.{fraction:04}")
+    format!("{whole}.{fraction:02}")
 }
 
-/// 解析倍率字符串（四位小数以内）为万分比整数。
+/// 解析倍率字符串为万分比整数。
 ///
-/// 直接复用积分的解析：1 积分的刻度是 10000，万分比的刻度也是 10000，
-/// 两者量纲一致——这不是巧合，是同一套四位小数约定。
+/// 倍率精度为 **0.01**：只接受两位以内小数，即万分比必须是 100 的倍数。
+/// 更细的输入（如 `1.005`）直接拒绝——精度是刻意收窄的约定，不是巧合。
 /// 倍率不允许为负，非法输入返回 `None`。
 pub fn parse_multiplier(text: &str) -> Option<i64> {
     let scaled = parse_credits(text)?;
-    (scaled >= 0).then_some(scaled)
+    (scaled >= 0 && scaled % 100 == 0).then_some(scaled)
 }
 
 /// 按倍率折算后的 token 量。
+///
+/// 零头**向上取整**：计费不因抹零被打磨——截断可被低倍率 + 小请求反复
+/// 利用，每次少收不足一个最小单位却可无限累积；进位单次误差 ≤ 1 个
+/// 最小单位（0.0001 积分），对用户无感。`usage.total_tokens` 非负
+/// （入口已拒绝负数），因此这里的除法只对非负数生效。
 pub fn final_tokens(raw_tokens: i64, multiplier_bp: i64) -> i64 {
-    clamp(i128::from(raw_tokens) * i128::from(multiplier_bp) / i128::from(MULTIPLIER_SCALE))
+    let product = i128::from(raw_tokens) * i128::from(multiplier_bp);
+    let rounded_up = (product + i128::from(MULTIPLIER_SCALE) - 1) / i128::from(MULTIPLIER_SCALE);
+    clamp(rounded_up)
 }
 
 /// 本次调用应扣减的积分（最小单位）。
@@ -154,9 +164,30 @@ mod tests {
     }
 
     #[test]
-    fn final_tokens_are_rounded_down() {
-        assert_eq!(final_tokens(333, 15_000), 499);
+    fn final_tokens_are_rounded_up() {
+        // 333 × 1.5 = 499.5 → 500：零头进位，计费不因抹零被打磨。
+        assert_eq!(final_tokens(333, 15_000), 500);
         assert_eq!(final_tokens(10_000, 10_000), 10_000);
+        // 1 token 在 0.01 倍下 = 0.0001 积分，恰好一个最小单位。
+        assert_eq!(final_tokens(1, 100), 1);
+    }
+
+    #[test]
+    fn multiplier_precision_is_two_decimals() {
+        assert_eq!(parse_multiplier("1.05"), Some(10_500));
+        assert_eq!(parse_multiplier("0.01"), Some(100));
+        assert_eq!(parse_multiplier("2"), Some(20_000));
+        // 超过两位小数直接拒绝——精度是刻意的约定。
+        assert_eq!(parse_multiplier("1.005"), None);
+        assert_eq!(parse_multiplier("1.0001"), None);
+        assert_eq!(parse_multiplier("-1"), None);
+    }
+
+    #[test]
+    fn multiplier_formatting() {
+        assert_eq!(format_multiplier(10_000), "1.00");
+        assert_eq!(format_multiplier(15_000), "1.50");
+        assert_eq!(format_multiplier(8_000), "0.80");
     }
 
     #[test]
@@ -181,13 +212,6 @@ mod tests {
         assert_eq!(parse_credits("   "), None);
         assert_eq!(parse_credits("-"), None, "只有符号不算数字");
         assert_eq!(parse_credits("."), None, "只有小数点不算数字");
-    }
-
-    #[test]
-    fn multiplier_formatting() {
-        assert_eq!(format_multiplier(10_000), "1.0000");
-        assert_eq!(format_multiplier(15_000), "1.5000");
-        assert_eq!(format_multiplier(8_000), "0.8000");
     }
 
     #[test]
