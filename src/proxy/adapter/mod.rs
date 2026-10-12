@@ -24,6 +24,39 @@ pub struct UpstreamRequest {
     pub body: Option<Value>,
 }
 
+impl UpstreamRequest {
+    /// OpenAI 流式注入 `stream_options.include_usage`——上游只有带着这个
+    /// 字段才会在流末尾回 usage chunk，没有它就只能估算计费。这是 OpenAI
+    /// 官方字段，但个别兼容网关不认识；因此默认注入 + 400 时剥离重试。
+    /// 与旧版一致：客户端显式给过 `include_usage: false` 也会被覆盖成 true。
+    pub fn inject_stream_usage(&mut self) {
+        let Some(body) = &mut self.body else {
+            return;
+        };
+        let Some(object) = body.as_object_mut() else {
+            return;
+        };
+        if object.get("stream").and_then(Value::as_bool) != Some(true) {
+            return;
+        }
+        let options = object
+            .entry("stream_options")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(options) = options.as_object_mut() {
+            options.insert("include_usage".to_string(), Value::Bool(true));
+        }
+    }
+
+    /// 剥离注入的 `stream_options`（上游用 400 拒绝该字段时的降级重试）。
+    pub fn strip_stream_usage(&mut self) {
+        if let Some(body) = &mut self.body {
+            if let Some(object) = body.as_object_mut() {
+                object.remove("stream_options");
+            }
+        }
+    }
+}
+
 /// 密钥在请求里的位置。各家放法不同，由 adapter 自报。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthStyle {

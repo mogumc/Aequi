@@ -43,7 +43,7 @@ async fn serve() -> anyhow::Result<()> {
     utils::logging::init();
 
     tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = aequi::version(),
         database = %bootstrap.database.display(),
         data_database = %bootstrap.data_database.display(),
         first_run = is_first_run,

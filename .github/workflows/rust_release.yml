@@ -94,6 +94,8 @@ jobs:
       - name: Build Optimized Binary
         shell: bash
         run: |
+          # 发布 tag 注入二进制（build.rs → AEQUI_VERSION），/health 与启动日志展示它
+          export AEQUI_VERSION="${{ github.event.inputs.tag_name || github.ref_name }}"
           export RUSTFLAGS="${{ matrix.rustflags }} -C codegen-units=1 -C llvm-args=-inline-threshold=500"
           if [ "${{ matrix.use_cross }}" = "true" ]; then
             cross build --release --target ${{ matrix.target }}

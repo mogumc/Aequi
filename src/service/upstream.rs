@@ -40,6 +40,9 @@ pub struct UpstreamState {
     currents: Mutex<HashMap<String, i64>>,
     /// 每块一个客户端，连接池跨请求复用；块配置变更时失效。
     clients: Mutex<HashMap<String, reqwest::Client>>,
+    /// 被「不认识 stream_options」的上游拉黑的块：对这些块不再注入
+    /// include_usage。进程内记录，重启后重新试探——降级是自动的。
+    no_usage_inject: Mutex<HashMap<String, ()>>,
 }
 
 impl UpstreamState {
@@ -82,6 +85,26 @@ impl UpstreamState {
         if let Ok(mut currents) = self.currents.lock() {
             for id in ids {
                 currents.remove(id);
+            }
+        }
+    }
+
+    /// 该块是否允许注入 `stream_options.include_usage`。
+    pub fn usage_inject_allowed(&self, block_id: &str) -> bool {
+        !self
+            .no_usage_inject
+            .lock()
+            .is_ok_and(|set| set.contains_key(block_id))
+    }
+
+    /// 上游用 400 拒绝了注入字段：拉黑该块，之后剥离注入重试。
+    pub fn disable_usage_inject(&self, block_id: &str) {
+        if let Ok(mut set) = self.no_usage_inject.lock() {
+            if set.insert(block_id.to_string(), ()).is_none() {
+                tracing::warn!(
+                    block = %block_id,
+                    "上游不认识 stream_options，已停止对该块注入 include_usage"
+                );
             }
         }
     }
@@ -197,6 +220,43 @@ pub async fn available_models(pool: &SqlitePool, key: &ApiKey) -> Result<Vec<Str
     }
 
     Ok(short.into_iter().chain(full).collect())
+}
+
+/// 密钥侧自助视图里的一条模型路由：某启用块内的某模型及其计费倍率。
+///
+/// 脱敏边界：只暴露调用时本来就公开的东西——块 id（调用前缀）、模型名、
+/// 倍率。转发名发往上游才有意义，上游出口与密钥则完全不出这个视图。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KeyModelRoute {
+    pub block_id: String,
+    pub model: String,
+    /// 计费倍率，两位小数字符串（0.01 精度）。
+    pub multiplier: String,
+}
+
+/// 该密钥可用的模型路由（块/模型 对），只含**启用块**，按模型名、
+/// 再按块 id 排序。与 [`available_models`] 同一套白名单过滤口径
+/// （[`crate::model::ApiKey::allows_capability`]），但保留结构化倍率——
+/// `/v1/models` 那份是给 OpenAI SDK 的纯名字列表，这里才是给面板看的。
+pub async fn key_model_routes(pool: &SqlitePool, key: &ApiKey) -> Result<Vec<KeyModelRoute>> {
+    let blocks = db::block::list_blocks(pool).await?;
+    let mut routes = Vec::new();
+
+    for block in blocks.iter().filter(|block| block.enabled) {
+        for model in &block.models {
+            if !key.allows_capability(&block.id, &model.name) {
+                continue;
+            }
+            routes.push(KeyModelRoute {
+                block_id: block.id.clone(),
+                model: model.name.clone(),
+                multiplier: crate::model::credits::format_multiplier(model.multiplier_bp),
+            });
+        }
+    }
+
+    routes.sort_by(|a, b| a.model.cmp(&b.model).then_with(|| a.block_id.cmp(&b.block_id)));
+    Ok(routes)
 }
 
 /// 用块自己的出口与密钥去上游拉一次可用模型列表。

@@ -263,7 +263,7 @@ pub async fn chat_completion_stream(
     let mut multiplier_bp = credits::DEFAULT_MULTIPLIER_BP;
     let mut last_failure = None;
 
-    for _ in 0..MAX_ATTEMPTS {
+    'attempt: for _ in 0..MAX_ATTEMPTS {
         let block =
             match upstream::select_block(pool, &state.upstream, &key, &request.model, only).await {
                 Ok(block) => block,
@@ -275,96 +275,120 @@ pub async fn chat_completion_stream(
         };
 
         let adapter = adapter_for(block.api_format);
-        let outgoing = adapter.build_chat_stream(&request, &block.target_model(&request.model));
+        let mut outgoing = adapter.build_chat_stream(&request, &block.target_model(&request.model));
+        // OpenAI 系流式必须带 stream_options.include_usage 上游才会在流末尾
+        // 回 usage chunk，否则只能估算计费。默认注入；上游不认识这个字段时
+        // 会 400，此时拉黑该块并剥离重试（自动降级，替代旧版的配置白名单）。
+        if block.api_format == crate::model::ApiFormat::Openai
+            && state.upstream.usage_inject_allowed(&block.id)
+        {
+            outgoing.inject_stream_usage();
+        }
         let client = state.upstream.client(&block)?;
 
         let context = Some((block.id.clone(), upstream_key.id.clone()));
 
-        match send_stream(
-            &client,
-            &block,
-            &outgoing,
-            adapter.auth_style(),
-            &upstream_key.secret,
-        )
-        .await
-        {
-            Ok(response) if response.status().is_success() => {
-                multiplier_bp = block.multiplier_bp(&request.model);
-                upstream = Some(response);
-                chosen = Some((block.id, upstream_key.id, block.api_format));
-                break;
-            }
-            Ok(response) => {
-                let status = response.status().as_u16();
-                let detail = response
-                    .text()
-                    .await
-                    .ok()
-                    .and_then(|text| {
-                        serde_json::from_str::<Value>(&text).ok().and_then(|value| {
-                            value
-                                .pointer("/error/message")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        })
-                    })
-                    .unwrap_or_default();
-
-                if status == 429 {
-                    upstream::report_rate_limited(pool, &upstream_key).await;
-                    last_failure = Some(Failure::with_context(
-                        Error::UpstreamUnavailable("上游限流".to_string()),
-                        "上游限流".to_string(),
-                        context,
-                    ));
-                    continue;
+        // 发送当前尝试；注入字段被上游 400 拒绝时剥离后原样重发一次
+        //（'send 循环），不消耗重试名额。
+        'send: loop {
+            match send_stream(
+                &client,
+                &block,
+                &outgoing,
+                adapter.auth_style(),
+                &upstream_key.secret,
+            )
+            .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    multiplier_bp = block.multiplier_bp(&request.model);
+                    upstream = Some(response);
+                    chosen = Some((block.id, upstream_key.id, block.api_format));
+                    break;
                 }
-                if status == 401 || status == 403 || status >= 500 {
-                    upstream::report_failure(
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    let detail = response
+                        .text()
+                        .await
+                        .ok()
+                        .and_then(|text| {
+                            serde_json::from_str::<Value>(&text).ok().and_then(|value| {
+                                value
+                                    .pointer("/error/message")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            })
+                        })
+                        .unwrap_or_default();
+
+                    // 上游用 400 拒绝了注入字段：拉黑该块，剥离后重发。
+                    if status == 400
+                        && (detail.contains("stream_options")
+                            || detail.contains("include_usage"))
+                    {
+                        state.upstream.disable_usage_inject(&block.id);
+                        outgoing.strip_stream_usage();
+                        continue 'send;
+                    }
+
+                    if status == 429 {
+                        upstream::report_rate_limited(pool, &upstream_key).await;
+                        last_failure = Some(Failure::with_context(
+                            Error::UpstreamUnavailable("上游限流".to_string()),
+                            "上游限流".to_string(),
+                            context,
+                        ));
+                        continue 'attempt;
+                    }
+                    if status == 401 || status == 403 || status >= 500 {
+                        upstream::report_failure(
+                            pool,
+                            &upstream_key,
+                            &format!("上游返回 {status} {detail}"),
+                        )
+                        .await;
+                        last_failure = Some(Failure::with_context(
+                            Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
+                            format!("上游响应异常: 返回 {status}"),
+                            context,
+                        ));
+                        continue 'attempt;
+                    }
+
+                    // 400 这类参数错误重试也不会好，直接报错。但必须落日志：
+                    // 否则排障时只能看到 tracing 输出，请求流水里查无此请求。
+                    // 上游对参数的说明可能回显敏感内容，用户端只看状态码。
+                    let message = format!("上游返回 {status} {detail}");
+                    write_log(
                         pool,
-                        &upstream_key,
-                        &format!("上游返回 {status} {detail}"),
+                        base_log(&key, &ip, user_agent.as_deref(), started)
+                            .model(request.model.clone())
+                            .streaming()
+                            .failed(&Error::UpstreamUnavailable(message.clone())),
                     )
                     .await;
-                    last_failure = Some(Failure::with_context(
-                        Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
-                        format!("上游返回 {status}"),
-                        context,
-                    ));
-                    continue;
+                    if let Err(log_error) = crate::db::usage::insert_error(
+                        pool,
+                        &key.id,
+                        &request.model,
+                        &format!("上游响应异常: 返回 {status}"),
+                        true,
+                        time::now_secs(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %log_error, "写入失败用量记录失败");
+                    }
+                    return Err(Error::UpstreamUnavailable(message));
                 }
-
-                // 400 这类参数错误重试也不会好，直接报错。但必须落日志：
-                // 否则排障时只能看到 tracing 输出，请求流水里查无此请求。
-                // 上游对参数的说明可能回显敏感内容，用户端只看状态码。
-                let message = format!("上游返回 {status} {detail}");
-                write_log(
-                    pool,
-                    base_log(&key, &ip, user_agent.as_deref(), started)
-                        .model(request.model.clone())
-                        .streaming()
-                        .failed(&Error::UpstreamUnavailable(message.clone())),
-                )
-                .await;
-                if let Err(log_error) = crate::db::usage::insert_error(
-                    pool,
-                    &key.id,
-                    &request.model,
-                    &format!("上游响应异常: 返回 {status}"),
-                    true,
-                    time::now_secs(),
-                )
-                .await
-                {
-                    tracing::warn!(error = %log_error, "写入失败用量记录失败");
+                Err(error) => {
+                    let user_message = sanitize_user_message(&error);
+                    upstream::report_failure(pool, &upstream_key, &error.to_string()).await;
+                    last_failure = Some(Failure::with_context(error, user_message, context));
+                    // 网络层失败：换一把密钥进入下一轮 attempt。
+                    continue 'attempt;
                 }
-                return Err(Error::UpstreamUnavailable(message));
-            }
-            Err(error) => {
-                let user_message = sanitize_user_message(&error);
-                upstream::report_failure(pool, &upstream_key, &error.to_string()).await;
-                last_failure = Some(Failure::with_context(error, user_message, context));
             }
         }
     }

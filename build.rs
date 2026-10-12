@@ -19,10 +19,18 @@ fn main() {
     if !Path::new(WEB_DIST).exists() {
         std::fs::create_dir_all(WEB_DIST).expect("创建前端产物目录失败");
         println!(
-            "cargo:warning={WEB_DIST} 不存在，已创建空目录；请到 dev-web 目录执行 npm install && npm run build 生成前端资源"
+            "cargo:warning={WEB_DIST} 不存在，已创建空目录；请到 Aequi-web 目录执行 npm install && npm run build 生成前端资源"
         );
     }
 
     // 前端产物变化后需要重新嵌入。
     println!("cargo:rerun-if-changed={WEB_DIST}");
+
+    // CI 打包时注入发布版本号（如 v1.2.3），运行时由 `version()` 优先取用；
+    // 没有该变量（本地构建）就不注入，运行时回退 Cargo.toml 的包版本。
+    // rerun-if-env-changed 保证换 tag 重新打包时本 crate 会重编译。
+    println!("cargo:rerun-if-env-changed=AEQUI_VERSION");
+    if let Ok(version) = std::env::var("AEQUI_VERSION") {
+        println!("cargo:rustc-env=AEQUI_VERSION={version}");
+    }
 }

@@ -90,6 +90,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let portal = Router::new()
         .route("/key/me", get(key_portal::me))
         .route("/key/usage", get(key_portal::usage))
+        .route("/key/models", get(key_portal::models))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             key_auth::require_key,
@@ -140,7 +141,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Result<Json<HealthRespons
 
     Ok(Json(HealthResponse {
         status: "ok",
-        version: env!("CARGO_PKG_VERSION"),
+        version: crate::version(),
         uptime_seconds: state.uptime().as_secs(),
         account_configured,
         providers: state.providers.list(),
