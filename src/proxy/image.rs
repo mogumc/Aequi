@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::model::ApiKey;
 use crate::proxy::adapter::{AuthStyle, UpstreamRequest};
 use crate::proxy::scheme::Usage;
-use crate::proxy::{Failure, MAX_ATTEMPTS, base_log, estimate, write_log};
+use crate::proxy::{Failure, MAX_ATTEMPTS, base_log, estimate, sanitize_user_message, write_log};
 use crate::service::{billing, upstream};
 use crate::utils::time;
 
@@ -163,7 +163,7 @@ async fn dispatch(
             Ok(key) => key,
             Err(error) => {
                 let context = Some((block.id.clone(), String::new()));
-                let user_message = error.to_string();
+                let user_message = sanitize_user_message(&error);
                 return Err(Failure::with_context(error, user_message, context));
             }
         };
@@ -180,7 +180,8 @@ async fn dispatch(
             Ok(client) => client,
             Err(error) => {
                 let context = Some((block.id.clone(), upstream_key.id.clone()));
-                let user_message = error.to_string();
+                // 代理地址之类的出口细节不进用户能查到的表。
+                let user_message = sanitize_user_message(&error);
                 return Err(Failure::with_context(error, user_message, context));
             }
         };
@@ -220,7 +221,7 @@ async fn dispatch(
                     .await;
                     last_failure = Some(Failure::with_context(
                         Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
-                        format!("上游返回 {status}"),
+                        format!("上游响应异常: 返回 {status}"),
                         context,
                     ));
                     continue;
@@ -234,7 +235,7 @@ async fn dispatch(
                     let message = format!("上游返回 {status} {detail}");
                     return Err(Failure::with_context(
                         Error::UpstreamUnavailable(message.clone()),
-                        message,
+                        format!("上游响应异常: 返回 {status}"),
                         context,
                     ));
                 }
@@ -244,8 +245,8 @@ async fn dispatch(
                     Some(data) => data,
                     None => {
                         let error = Error::UpstreamUnavailable("上游响应里没有 data".to_string());
-                        let user_message = error.to_string();
-                        upstream::report_failure(pool, &upstream_key, &user_message).await;
+                        let user_message = sanitize_user_message(&error);
+                        upstream::report_failure(pool, &upstream_key, &error.to_string()).await;
                         last_failure = Some(Failure::with_context(error, user_message, context));
                         continue;
                     }
@@ -276,7 +277,7 @@ async fn dispatch(
                 {
                     Ok(charge) => charge,
                     Err(error) => {
-                        let user_message = error.to_string();
+                        let user_message = sanitize_user_message(&error);
                         return Err(Failure::with_context(error, user_message, context));
                     }
                 };
@@ -301,8 +302,9 @@ async fn dispatch(
                 });
             }
             Err(error) => {
-                let user_message = error.to_string();
-                upstream::report_failure(pool, &upstream_key, &user_message).await;
+                // reqwest 的报错可能带 URL，不进用户能查到的表。
+                let user_message = sanitize_user_message(&error);
+                upstream::report_failure(pool, &upstream_key, &error.to_string()).await;
                 last_failure = Some(Failure::with_context(error, user_message, context));
             }
         }

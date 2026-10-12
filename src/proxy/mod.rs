@@ -87,14 +87,17 @@ impl Failure {
 /// 密钥侧允许看到的错误描述。
 ///
 /// 参数类、限额类的错误本就是给用户看的，原样透传；
-/// 内部错误（数据库等）的原文不外泄，只给一句通用提示。
+/// 上游错误（[`Error::UpstreamUnavailable`]）只给一句固定文案——上游的
+/// 原话可能回显请求内容、账号信息或网关内部细节，只进管理员的日志；
+/// 在手有上游状态码的调用点用「上游响应异常: 返回 {status}」更有排障价值；
+/// 内部错误（数据库等）同样只给一句通用提示。
 fn sanitize_user_message(error: &Error) -> String {
     match error {
         Error::BadRequest(_)
         | Error::NotFound(_)
         | Error::Forbidden(_)
-        | Error::InsufficientCredits
-        | Error::UpstreamUnavailable(_) => error.to_string(),
+        | Error::InsufficientCredits => error.to_string(),
+        Error::UpstreamUnavailable(_) => "上游响应异常".to_string(),
         _ => "服务暂时不可用，请稍后重试".to_string(),
     }
 }
@@ -334,6 +337,7 @@ pub async fn chat_completion_stream(
 
                 // 400 这类参数错误重试也不会好，直接报错。但必须落日志：
                 // 否则排障时只能看到 tracing 输出，请求流水里查无此请求。
+                // 上游对参数的说明可能回显敏感内容，用户端只看状态码。
                 let message = format!("上游返回 {status} {detail}");
                 write_log(
                     pool,
@@ -347,7 +351,7 @@ pub async fn chat_completion_stream(
                     pool,
                     &key.id,
                     &request.model,
-                    &message,
+                    &format!("上游响应异常: 返回 {status}"),
                     true,
                     time::now_secs(),
                 )
@@ -358,8 +362,8 @@ pub async fn chat_completion_stream(
                 return Err(Error::UpstreamUnavailable(message));
             }
             Err(error) => {
-                let user_message = error.to_string();
-                upstream::report_failure(pool, &upstream_key, &user_message).await;
+                let user_message = sanitize_user_message(&error);
+                upstream::report_failure(pool, &upstream_key, &error.to_string()).await;
                 last_failure = Some(Failure::with_context(error, user_message, context));
             }
         }
@@ -438,20 +442,21 @@ pub async fn chat_completion_stream(
                 Ok(payload) => payload,
                 Err(error) => {
                     // 上游流中断：与其它中途错误一致，以内联错误帧收尾并落日志。
-                    let message = error.to_string();
+                    // 客户端与用户端记录都只给脱敏文案。
+                    let user_message = sanitize_user_message(&error);
                     write_log(
                         pool,
                         base_log(&key, &ip, user_agent.as_deref(), started)
                             .model(request.model.clone())
                             .streaming()
-                            .failed(&Error::UpstreamUnavailable(message.clone())),
+                            .failed(&error),
                     )
                     .await;
                     if let Err(log_error) = crate::db::usage::insert_error(
                         pool,
                         &key.id,
                         &model,
-                        &message,
+                        &user_message,
                         true,
                         time::now_secs(),
                     )
@@ -459,7 +464,7 @@ pub async fn chat_completion_stream(
                     {
                         tracing::warn!(error = %log_error, "写入失败用量记录失败");
                     }
-                    yield Ok(error_frame(&message));
+                    yield Ok(error_frame(&user_message));
                     return;
                 }
             };
@@ -474,6 +479,7 @@ pub async fn chat_completion_stream(
             let events = match adapter.parse_stream_event(&payload) {
                 Ok(events) => events,
                 Err(error) => {
+                    let user_message = sanitize_user_message(&error);
                     write_log(
                         pool,
                         base_log(&key, &ip, user_agent.as_deref(), started)
@@ -486,7 +492,7 @@ pub async fn chat_completion_stream(
                         pool,
                         &key.id,
                         &model,
-                        &error.to_string(),
+                        &user_message,
                         true,
                         time::now_secs(),
                     )
@@ -494,7 +500,7 @@ pub async fn chat_completion_stream(
                     {
                         tracing::warn!(error = %log_error, "写入失败用量记录失败");
                     }
-                    yield Ok(error_frame(&error.to_string()));
+                    yield Ok(error_frame(&user_message));
                     return;
                 }
             };
@@ -556,11 +562,10 @@ pub async fn chat_completion_stream(
         if !produced {
             let detail = match &last_payload {
                 Some(payload) => format!(
-                    "上游没有返回任何可识别的内容，最后一条原始载荷: {payload}"
+                    "上游没有返回任何可识别的内容，最后一条原始载荷: {payload}（请检查块的 API 格式是否与上游匹配）"
                 ),
                 None => "上游没有返回任何内容".to_string(),
             };
-            let message = format!("{detail}（请检查块的 API 格式是否与上游匹配）");
             write_log(
                 pool,
                 base_log(&key, &ip, user_agent.as_deref(), started)
@@ -575,7 +580,7 @@ pub async fn chat_completion_stream(
                 pool,
                 &key.id,
                 &model,
-                &message,
+                "上游响应异常: 上游没有返回任何内容",
                 true,
                 time::now_secs(),
             )
@@ -634,6 +639,7 @@ pub async fn chat_completion_stream(
                 yield Ok(b"data: [DONE]\n\n".to_vec());
             }
             Err(error) => {
+                let user_message = sanitize_user_message(&error);
                 write_log(
                     pool,
                     base_log(&key, &ip, user_agent.as_deref(), started)
@@ -646,7 +652,7 @@ pub async fn chat_completion_stream(
                     pool,
                     &key.id,
                     &model,
-                    &error.to_string(),
+                    &user_message,
                     true,
                     time::now_secs(),
                 )
@@ -654,7 +660,7 @@ pub async fn chat_completion_stream(
                 {
                     tracing::warn!(error = %log_error, "写入失败用量记录失败");
                 }
-                yield Ok(error_frame(&error.to_string()));
+                yield Ok(error_frame(&user_message));
             }
         }
     };
@@ -687,7 +693,7 @@ async fn dispatch(
             Ok(key) => key,
             Err(error) => {
                 let context = Some((block.id.clone(), String::new()));
-                let user_message = error.to_string();
+                let user_message = sanitize_user_message(&error);
                 return Err(Failure::with_context(error, user_message, context));
             }
         };
@@ -698,7 +704,8 @@ async fn dispatch(
             Ok(client) => client,
             Err(error) => {
                 let context = Some((block.id.clone(), upstream_key.id.clone()));
-                let user_message = error.to_string();
+                // 代理地址之类的出口细节不进用户能查到的表。
+                let user_message = sanitize_user_message(&error);
                 return Err(Failure::with_context(error, user_message, context));
             }
         };
@@ -741,7 +748,7 @@ async fn dispatch(
                     .await;
                     last_failure = Some(Failure::with_context(
                         Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
-                        format!("上游返回 {status}"),
+                        format!("上游响应异常: 返回 {status}"),
                         context,
                     ));
                     continue;
@@ -749,7 +756,8 @@ async fn dispatch(
 
                 if !(200..300).contains(&status) {
                     // 请求本身的问题（参数、模型名等），换密钥也不会好。
-                    // 上游对参数的说明对用户排障有用，保留。
+                    // 上游的说明只进管理员日志；用户端同样只看状态码，
+                    // 不排除上游在错误体里回显敏感内容的可能。
                     let detail = response_body
                         .pointer("/error/message")
                         .and_then(Value::as_str)
@@ -757,7 +765,7 @@ async fn dispatch(
                     let message = format!("上游返回 {status} {detail}");
                     return Err(Failure::with_context(
                         Error::UpstreamUnavailable(message.clone()),
-                        message,
+                        format!("上游响应异常: 返回 {status}"),
                         context,
                     ));
                 }
@@ -767,8 +775,8 @@ async fn dispatch(
                     Err(error) => {
                         // 200 却解析不出内容，多半是上游网关吐了故障页——
                         // 这属于上游的问题，记一次失败并换一把再试。
-                        let user_message = error.to_string();
-                        upstream::report_failure(pool, &upstream_key, &user_message).await;
+                        let user_message = sanitize_user_message(&error);
+                        upstream::report_failure(pool, &upstream_key, &error.to_string()).await;
                         last_failure = Some(Failure::with_context(error, user_message, context));
                         continue;
                     }
@@ -795,7 +803,7 @@ async fn dispatch(
                 {
                     Ok(charge) => charge,
                     Err(error) => {
-                        let user_message = error.to_string();
+                        let user_message = sanitize_user_message(&error);
                         return Err(Failure::with_context(error, user_message, context));
                     }
                 };
@@ -818,9 +826,10 @@ async fn dispatch(
                 });
             }
             Err(error) => {
-                // 网络层面的失败同样换一把再试。
-                let user_message = error.to_string();
-                upstream::report_failure(pool, &upstream_key, &user_message).await;
+                // 网络层面的失败同样换一把再试；reqwest 的报错可能带 URL，
+                // 不进用户能查到的表。
+                let user_message = sanitize_user_message(&error);
+                upstream::report_failure(pool, &upstream_key, &error.to_string()).await;
                 last_failure = Some(Failure::with_context(error, user_message, context));
             }
         }

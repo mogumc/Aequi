@@ -321,7 +321,7 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
 }
 ```
 
-失败请求同样出现在 `records` 里（`status: "error"`、token 与积分为 0、`error` 为一句脱敏描述——上游原话与内部细节只在管理员的 `/api/logs` 里）。
+失败请求同样出现在 `records` 里（`status: "error"`、token 与积分为 0、`error` 为一句脱敏描述：上游错误只给「上游响应异常」或「上游响应异常: 返回 {status}」，不包含上游报错原文；原话与内部细节只在管理员的 `/api/logs` 里）。
 
 ---
 
