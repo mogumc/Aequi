@@ -105,10 +105,30 @@ pub fn parse_multiplier(text: &str) -> Option<i64> {
 /// 利用，每次少收不足一个最小单位却可无限累积；进位单次误差 ≤ 1 个
 /// 最小单位（0.0001 积分），对用户无感。`usage.total_tokens` 非负
 /// （入口已拒绝负数），因此这里的除法只对非负数生效。
+///
+/// # 保底：用过就至少收一个最小单位
+///
+/// 低倍率配小请求时，四舍五入会算出 0——上游照样收了钱，账上却查不到。
+/// 所以**只要这次真的消耗过 token**（`raw_tokens > 0`）且倍率非零，
+/// 结果就保底 1 个最小单位（0.0001 积分）。
+///
+/// 区分两种「0」：
+/// - **真的没用**：`raw_tokens == 0`，没消耗就不该收，保底不适用；
+/// - **倍率为 0**：管理员显式把这个模型设成免费（校验只拦负数），
+///   那是定价意图，不是计算误差，同样不适用保底。
+///
+/// 否则「免费模型」会被保底成每次收 0.0001 积分，管理员设的 0 倍形同虚设。
 pub fn final_tokens(raw_tokens: i64, multiplier_bp: i64) -> i64 {
     let product = i128::from(raw_tokens) * i128::from(multiplier_bp);
     let rounded_up = (product + i128::from(MULTIPLIER_SCALE) - 1) / i128::from(MULTIPLIER_SCALE);
-    clamp(rounded_up)
+    let value = clamp(rounded_up);
+
+    // 只有「确实消耗过 + 倍率非零」才保底：见上方说明的两种例外。
+    if value == 0 && raw_tokens > 0 && multiplier_bp > 0 {
+        1
+    } else {
+        value
+    }
 }
 
 /// 本次调用应扣减的积分（最小单位）。
@@ -170,6 +190,41 @@ mod tests {
         assert_eq!(final_tokens(10_000, 10_000), 10_000);
         // 1 token 在 0.01 倍下 = 0.0001 积分，恰好一个最小单位。
         assert_eq!(final_tokens(1, 100), 1);
+    }
+
+    #[test]
+    fn low_multiplier_small_request_falls_back_to_one_unit() {
+        // 低倍率 + 小请求会算出 0，但上游照样收了钱——保底 1 个最小单位。
+        // 0.01 倍（100）下 50 token 只有 0.5 单位，进位后仍是 1；
+        // 更小的组合才会真的落到 0，这里显式构造一个。
+        assert_eq!(final_tokens(1, 1), 1, "最小倍率也至少收一个单位");
+        assert_eq!(format_credits(final_tokens(1, 1)), "0.0001");
+        assert_eq!(final_tokens(5, 1), 1);
+    }
+
+    #[test]
+    fn genuine_zero_is_not_charged() {
+        // 真的没用：一个 token 都没消耗，不该收钱。
+        assert_eq!(final_tokens(0, DEFAULT_MULTIPLIER_BP), 0);
+        assert_eq!(final_tokens(0, 100), 0);
+        assert_eq!(final_tokens(0, 0), 0);
+    }
+
+    #[test]
+    fn zero_multiplier_is_a_pricing_intent_not_a_rounding_error() {
+        // 管理员显式把模型设成免费（校验只拦负数，0 是合法的）。
+        // 这是定价意图，不能被保底抬成 0.0001 积分——否则 0 倍形同虚设。
+        assert_eq!(final_tokens(10_000, 0), 0, "0 倍率必须保持免费");
+        assert_eq!(final_tokens(1_000_000, 0), 0);
+    }
+
+    #[test]
+    fn normal_rates_are_untouched_by_the_floor() {
+        // 保底只影响「算出 0」那一种情况，常规计费一个都不能变。
+        assert_eq!(final_tokens(10_000, DEFAULT_MULTIPLIER_BP), 10_000);
+        assert_eq!(final_tokens(333, 15_000), 500);
+        assert_eq!(final_tokens(1, 100), 1);
+        assert_eq!(final_tokens(1500, 10_000), 1500);
     }
 
     #[test]

@@ -119,7 +119,39 @@ fn truncate_detail(detail: &str) -> String {
 /// 编排一次对话请求，返回要交给用户的响应体。
 ///
 /// 无论成败都会落两轨日志；日志写入失败只留警告，不拖垮业务请求。
+///
+/// 整个编排跑在一个**脱离的 spawn 任务**里，调用方只负责等它的结果。
+/// 原因是客户端断开时 axum 会直接丢弃 handler 的 future——如果记账写在
+/// 这个 future 里，上游已经把 token 生成出来了，这笔钱却不会有人付账，
+/// 日志里也查无此请求。`tokio::spawn` 的任务不随 JoinHandle 被丢弃而取消，
+/// 所以无论客户端怎么跑路，账都一定落下来。
 pub async fn chat_completion(
+    state: &Arc<AppState>,
+    key: &ApiKey,
+    body: &Value,
+    ip: &str,
+    user_agent: Option<&str>,
+    header_block: Option<&str>,
+) -> Result<Value> {
+    let state = Arc::clone(state);
+    let key = key.clone();
+    let body = body.clone();
+    let ip = ip.to_string();
+    let user_agent = user_agent.map(str::to_string);
+    let header_block = header_block.map(str::to_string);
+
+    let handle = tokio::spawn(async move {
+        chat_completion_inner(&state, &key, &body, &ip, user_agent.as_deref(), header_block.as_deref())
+            .await
+    });
+
+    handle
+        .await
+        .map_err(|error| Error::Internal(anyhow::anyhow!("对话请求任务异常: {error}")))?
+}
+
+/// [`chat_completion`] 的实际编排体，跑在脱离的任务里。
+async fn chat_completion_inner(
     state: &Arc<AppState>,
     key: &ApiKey,
     body: &Value,
@@ -430,7 +462,19 @@ pub async fn chat_completion_stream(
 
     let payload_stream = sse::sse_data_stream(response.bytes_stream());
 
-    let output = async_stream::stream! {
+    // 计费与日志跑在一个**独立任务**里，不挂在响应流的生命周期上。
+    //
+    // 这是「客户端中途断开也要算账」的关键：客户端一断，持有接收端的一方
+    // 被销毁，下面每次发送随即失败——但这个任务本身不会被销毁，它跳出
+    // 转发循环后照常走到收尾，把中断前已产出的内容按估算计费并落日志。
+    // 反过来，账也就不会漏：流式请求一旦发出，上游就开始消耗额度，
+    // 这笔消耗由我们自己向上游付，不该因为客户端改主意就白送。
+    //
+    // 中断前一个字都没产出时，收尾的 `!produced` 分支照旧按失败处理，
+    // 不估算也不计费——那种情况上游也没真正开始生成。
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Vec<u8>, std::io::Error>>(32);
+
+    tokio::spawn(async move {
         let pool = &state.store.data;
         let mut text_acc = String::new();
         // 推理内容单独累计：估算用量时与正文一起算（思考 token 也是输出
@@ -443,9 +487,11 @@ pub async fn chat_completion_stream(
         // 是否收到过工具调用的分片增量——决定收尾快照是否需要补发。
         let mut tools_seen = false;
         // 最后一条原始载荷：一条内容都没有时，它是排障的唯一线索
-        // （最常见的原因是块格式与上游不匹配，解析器什么都提不出来）。
+        //（最常见的原因是块格式与上游不匹配，解析器什么都提不出来）。
         let mut last_payload: Option<String> = None;
         let mut sse = std::pin::pin!(payload_stream);
+        // 客户端是否在流中途离开。转发到此为止，账照算。
+        let mut client_gone = false;
 
         // 流内只读名字，拷一份所有权（生命周期长于本函数）。
         let model = request.model.clone();
@@ -462,9 +508,13 @@ pub async fn chat_completion_stream(
             .into_bytes()
         };
 
-        yield frame(openai_in::render_stream_role(&id, created, &model));
+        // 开头那一帧发不出去就没什么可算的（上游尚未产出任何内容）。
+        if tx.send(frame(openai_in::render_stream_role(&id, created, &model))).await.is_err() {
+            return;
+        }
 
-        while let Some(item) = sse.next().await {
+        // 主循环。客户端断开时跳出转发，落到下方收尾照常记账。
+        'upstream: while let Some(item) = sse.next().await {
             let payload = match item {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -475,6 +525,8 @@ pub async fn chat_completion_stream(
                         pool,
                         base_log(&key, &ip, user_agent.as_deref(), started)
                             .model(request.model.clone())
+                            .block(&block_id)
+                            .upstream_key(&upstream_key_id)
                             .streaming()
                             .failed(&error),
                     )
@@ -491,8 +543,14 @@ pub async fn chat_completion_stream(
                     {
                         tracing::warn!(error = %log_error, "写入失败用量记录失败");
                     }
-                    yield Ok(error_frame(&user_message));
-                    return;
+                    // 客户端已经走了就别费劲发错误帧，但仍要把已产出的
+                    // 内容按估算记上去——上游那部分额度是真花掉了的。
+                    if !produced {
+                        let _ = tx.send(Ok(error_frame(&user_message))).await;
+                        return;
+                    }
+                    client_gone = true;
+                    break 'upstream;
                 }
             };
 
@@ -511,6 +569,8 @@ pub async fn chat_completion_stream(
                         pool,
                         base_log(&key, &ip, user_agent.as_deref(), started)
                             .model(request.model.clone())
+                            .block(&block_id)
+                            .upstream_key(&upstream_key_id)
                             .streaming()
                             .failed(&error),
                     )
@@ -527,8 +587,12 @@ pub async fn chat_completion_stream(
                     {
                         tracing::warn!(error = %log_error, "写入失败用量记录失败");
                     }
-                    yield Ok(error_frame(&user_message));
-                    return;
+                    if !produced {
+                        let _ = tx.send(Ok(error_frame(&user_message))).await;
+                        return;
+                    }
+                    client_gone = true;
+                    break 'upstream;
                 }
             };
 
@@ -547,21 +611,35 @@ pub async fn chat_completion_stream(
                         }
                         text_acc.push_str(&text);
                         reasoning_acc.push_str(&reasoning);
-                        yield frame(openai_in::render_stream_delta(
-                            &id,
-                            created,
-                            &model,
-                            &reasoning,
-                            &text,
-                            &tool_calls,
-                        ));
+                        if tx
+                            .send(frame(openai_in::render_stream_delta(
+                                &id,
+                                created,
+                                &model,
+                                &reasoning,
+                                &text,
+                                &tool_calls,
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            client_gone = true;
+                            break 'upstream;
+                        }
                     }
                     StreamEvent::Finish { finish_reason } => {
                         if !finished {
                             finished = true;
-                            yield frame(openai_in::render_stream_finish(
-                                &id, created, &model, finish_reason,
-                            ));
+                            if tx
+                                .send(frame(openai_in::render_stream_finish(
+                                    &id, created, &model, finish_reason,
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                client_gone = true;
+                                break 'upstream;
+                            }
                         }
                     }
                     StreamEvent::Snapshot { tool_calls } => {
@@ -581,14 +659,21 @@ pub async fn chat_completion_stream(
                                     arguments_fragment: Some(call.arguments.clone()),
                                 })
                                 .collect::<Vec<_>>();
-                            yield frame(openai_in::render_stream_delta(
-                                &id,
-                                created,
-                                &model,
-                                "",
-                                "",
-                                &deltas,
-                            ));
+                            if tx
+                                .send(frame(openai_in::render_stream_delta(
+                                    &id,
+                                    created,
+                                    &model,
+                                    "",
+                                    "",
+                                    &deltas,
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                client_gone = true;
+                                break 'upstream;
+                            }
                         }
                     }
                     StreamEvent::Usage(usage) => merge_usage(&mut usage_acc, usage),
@@ -631,30 +716,42 @@ pub async fn chat_completion_stream(
                 tracing::warn!(error = %log_error, "写入失败用量记录失败");
             }
             // 给客户端的是不含内部细节的短句；原始载荷进日志供排障。
-            yield Ok(error_frame("上游提前结束了响应且没有返回任何内容，请重试"));
+            let _ = tx
+                .send(Ok(error_frame("上游提前结束了响应且没有返回任何内容，请重试")))
+                .await;
             return;
         }
 
         // 上游没发结束原因就补一个 Stop，避免客户端把流挂起。
-        if !finished {
-            yield frame(openai_in::render_stream_finish(
-                &id, created, &model, FinishReason::Stop,
-            ));
+        // 客户端已经断开时这一步没有意义，也发不出去。
+        if !finished && !client_gone {
+            let _ = tx
+                .send(frame(openai_in::render_stream_finish(
+                    &id, created, &model, FinishReason::Stop,
+                )))
+                .await;
         }
 
-        // 计费：上游报的用量聚合；没报就按聚合出来的文本估算。
+        // 计费：上游报的用量聚合；缺哪一项就用本地估算补哪一项。
         // 思考也是输出成本——估算路径把推理与正文拼在一起算，
         // 与上游 usage 里 completion 已含 reasoning 的口径一致。
-        let mut usage = usage_acc;
-        if usage.total_tokens == 0 {
-            let output = format!("{reasoning_acc}{text_acc}");
-            usage = estimate::estimate_usage(&request, &output);
-        } else {
-            usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
-        }
+        //
+        // 客户端中途断开走到这里时，上游多半没能发出 usage（usage 一般在
+        // 流的末尾），于是走补齐：已产出的文本一个字都不会少算。
+        let output = format!("{reasoning_acc}{text_acc}");
+        let usage = estimate::complete_usage(
+            usage_acc.prompt_tokens,
+            usage_acc.completion_tokens,
+            usage_acc.total_tokens,
+            usage_acc.cache_tokens,
+            &request,
+            &output,
+        );
 
         match billing::charge(pool, &key, &block_id, &model, usage, multiplier_bp, true).await {
             Ok(charge) => {
+                // 客户端中途断开要看得见：账照扣，但日志里注明原因，
+                // 否则管理员看到一条成功记录却对不上客户端的体验。
                 write_log(
                     pool,
                     base_log(&key, &ip, user_agent.as_deref(), started)
@@ -662,6 +759,7 @@ pub async fn chat_completion_stream(
                         .block(&block_id)
                         .upstream_key(&upstream_key_id)
                         .streaming()
+                        .client_gone(client_gone)
                         .succeeded(charge.usage, charge.credits_scaled)
                         .to_success_log(),
                 )
@@ -675,13 +773,19 @@ pub async fn chat_completion_stream(
                     credits = %charge.credits_scaled,
                     duration_ms = started.elapsed().as_millis() as u64,
                     stream = true,
+                    client_gone,
                     "对话请求完成"
                 );
 
-                yield frame(openai_in::render_stream_usage(
-                    &id, created, &model, charge.usage,
-                ));
-                yield Ok(b"data: [DONE]\n\n".to_vec());
+                // 客户端已断开，usage 帧与 [DONE] 都无处可送。
+                if !client_gone {
+                    let _ = tx
+                        .send(frame(openai_in::render_stream_usage(
+                            &id, created, &model, charge.usage,
+                        )))
+                        .await;
+                    let _ = tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await;
+                }
             }
             Err(error) => {
                 let user_message = sanitize_user_message(&error);
@@ -689,6 +793,8 @@ pub async fn chat_completion_stream(
                     pool,
                     base_log(&key, &ip, user_agent.as_deref(), started)
                         .model(request.model.clone())
+                        .block(&block_id)
+                        .upstream_key(&upstream_key_id)
                         .streaming()
                         .failed_with_context(&error, Some((block_id, upstream_key_id))),
                 )
@@ -705,12 +811,14 @@ pub async fn chat_completion_stream(
                 {
                     tracing::warn!(error = %log_error, "写入失败用量记录失败");
                 }
-                yield Ok(error_frame(&user_message));
+                if !client_gone {
+                    let _ = tx.send(Ok(error_frame(&user_message))).await;
+                }
             }
         }
-    };
+    });
 
-    Ok(output)
+    Ok(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
 /// 挑块、挑密钥、发送、解析、计费。
@@ -828,13 +936,17 @@ async fn dispatch(
                 };
                 upstream::report_success(pool, &upstream_key.id).await;
 
-                // 上游没报用量就用本地估算补齐，记账不能被钻空子。
-                // 估算口径含推理文本——思考模型的思考部分不是免费的。
-                let usage = if response.usage.total_tokens == 0 {
-                    estimate::estimate_usage(request, &response.output_for_estimate())
-                } else {
-                    response.usage
-                };
+                // 上游没报用量、或只报了一半，就用本地估算补齐缺的那项，
+                // 记账不能被钻空子。估算口径含推理文本——思考模型的思考
+                // 部分不是免费的。
+                let usage = estimate::complete_usage(
+                    response.usage.prompt_tokens,
+                    response.usage.completion_tokens,
+                    response.usage.total_tokens,
+                    response.usage.cache_tokens,
+                    request,
+                    &response.output_for_estimate(),
+                );
 
                 let charge = match billing::charge(
                     pool,
@@ -971,6 +1083,7 @@ fn base_log<'a>(
         usage: crate::proxy::scheme::Usage::default(),
         credits_scaled: 0,
         stream: false,
+        client_gone: false,
     }
 }
 
@@ -986,12 +1099,20 @@ struct LogDraft<'a> {
     usage: crate::proxy::scheme::Usage,
     credits_scaled: i64,
     stream: bool,
+    /// 客户端在流中途断开：账照扣，日志里要能看出原因。
+    client_gone: bool,
 }
 
 impl<'a> LogDraft<'a> {
     /// 标记为流式请求。
     fn streaming(mut self) -> Self {
         self.stream = true;
+        self
+    }
+
+    /// 标记为客户端中途断开。
+    fn client_gone(mut self, client_gone: bool) -> Self {
+        self.client_gone = client_gone;
         self
     }
 
@@ -1049,6 +1170,14 @@ impl<'a> LogDraft<'a> {
 
     /// 成功。
     fn to_success_log(&self) -> NewProxyLog {
+        // 客户端中断的流仍是成功账（上游确实出了 token），但错误列要留个
+        // 记号，否则管理员看到成功记录却对不上客户端那边的体验。
+        let error_detail = if self.client_gone {
+            Some("客户端在流中途断开；已产出部分按估算计费".to_string())
+        } else {
+            None
+        };
+
         NewProxyLog {
             access_key_id: self.key.id.clone(),
             block_id: self.block_id.clone(),
@@ -1057,7 +1186,7 @@ impl<'a> LogDraft<'a> {
             ip: Some(self.ip.to_string()),
             user_agent: self.user_agent.map(str::to_string),
             status: "success".to_string(),
-            error_detail: None,
+            error_detail,
             duration_ms: self.started.elapsed().as_millis() as i64,
             prompt_tokens: self.usage.prompt_tokens,
             completion_tokens: self.usage.completion_tokens,
