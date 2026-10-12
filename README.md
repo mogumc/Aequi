@@ -1,404 +1,84 @@
-<p align="center">
-  <img src="/icon.png" alt="HeartWith" width="150"/>
-</p>
+# Aequi
 
-<h1 align="center">Aequi</h1>
+带积分计费的 OpenAI 兼容代理网关。上游按「块」组织调度，密钥挂积分对外提供服务。
 
-<p align="center">
-  高性能 OpenAI 格式 API 透明代理，Rust + Tokio 编写。支持多上游多密钥负载均衡、智能故障转移、计费管理、管理后台和实时监控。
-</p>
+## 特性
 
-<p align="center">
-  <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License"/>
-  <img src="https://img.shields.io/badge/Rust-2021-orange" alt="Rust"/>
-</p>
+- **OpenAI 兼容入口**：`/v1/chat/completions`（对话）与 `/v1/images/generations`（生图），多模态与工具调用支持
+- **多格式上游**：每个块绑定一种上游格式（OpenAI / Google / Anthropic），内部经标准模型双向转换，新增格式只需加一个 adapter
+- **平滑加权轮询**：按模型选块、块内选密钥，权重 + 顺序打散流量
+- **密钥生命周期自治**：成功清零失败计数、429 自动退避 30 秒、连续失败 3 次自动停用；可暂停 / 恢复 / 测试（测试不耗 token）
+- **积分计费**：1 积分 = 10000 最小单位 = 10000 token，按模型倍率（万分比，精度 0.01）折算；零头向上取整，计费不可被抹零打磨；扣费与记账同一事务，原子 UPDATE 防透支；余额不足按透支结算——实扣全部剩余积分、余额清零，用量照记、响应照常返回
+- **精确埋点**：输入 / 输出 / 缓存 token 分开记录，上游不报用量时按本地启发式估算（带 `estimated` 标记）
+- **双轨日志**：管理员看全部细节（块、上游密钥、IP、UA、上游原话），密钥侧只看计费数字与脱敏错误（只给「上游响应异常」，不外泄上游报错原文）——两张表物理分开；默认保留 7 天（1-365 可配置），用量与日志均支持游标分页向前翻阅
+- **管理面板**：内嵌前端（rust-embed），账号密码 + TOTP 登录、设备管理、上游与密钥管理（含每把密钥的用量视图）、请求日志、模型路由编辑
 
-> ⚡ **1,700+ RPS** 单机吞吐，毫秒级延迟  
-> 🔐 **二元 key 状态** active/invalid，无 cooldown 定时器  
-> 🛡️ **并发保护** per-key 并发限制，零 429 风暴  
-> 📊 **实时监控** SSE 流式推送，零轮询  
-> 🎛️ **管理后台** Web UI + REST API，支持批量操作  
-> 📦 **Docker 部署** ghcr.io/mogumc/aequi，开箱即用
+## 构建
 
----
-
-## 快速开始
-
-### Docker（推荐）
+面板源码在项目外的 `../Aequi-web`（React 19 + Vite），构建产物输出到后端 `web/` 目录：
 
 ```bash
-docker pull ghcr.io/mogumc/aequi:latest
-
-docker run -d --name aequi \
-  -p 3000:3000 \
-  -v ./config.toml:/app/config.toml:ro \
-  -v ./data:/app/data \
-  ghcr.io/mogumc/aequi:latest
+cd ../Aequi-web && npm install && npm run build
+cp -r ../Aequi-web/dist/* web/   # 构建后把产物复制进来（rust-embed 嵌入）
+cd . && cargo build --release
 ```
 
-### 源码构建
+跳过前端构建也能编译（build.rs 会兜底创建空的 `web/` 目录，运行时显示「控制台尚未构建」提示页）。
+
+## 运行
 
 ```bash
-# 安装依赖（Ubuntu/Debian）
-sudo apt-get install -y build-essential pkg-config libssl-dev
+# 无参启动服务（默认监听 0.0.0.0:8080）
+./target/release/aequi
 
-# 构建发布版（含 LTO + strip）
-cargo build --release
+# 首次启动通过环境变量初始化管理员账号（仅数据库不存在时生效）
+AEQUI_ADMIN_USERNAME=admin AEQUI_ADMIN_PASSWORD=改成随机值 ./target/release/aequi
 
-# 可选：启用 mimalloc 分配器（高并发下更低延迟）
-cargo build --release --features mimalloc
+# 将密码重置为新的随机值（打印一次）
+./target/release/aequi reset-password
+
+# 关闭两步验证（验证器丢失时的自救途径）
+./target/release/aequi disable-otp
 ```
 
-### 配置
+- 没有配置文件：后台设置存 SQLite 的 `settings` 表，首次启动导入默认值，之后以数据库为准（面板可改）
+- 数据库默认在工作目录：`aequi.db`（控制面）与 `aequi-data.db`（数据面），可用环境变量覆盖
+
+### 环境变量
+
+| 变量 | 说明 |
+| --- | --- |
+| `AEQUI_DATABASE_PATH` | 控制面数据库路径（账号、会话、设置） |
+| `AEQUI_DATA_DATABASE_PATH` | 数据面数据库路径（密钥、用量、上游、日志） |
+| `AEQUI_ADMIN_USERNAME` / `AEQUI_ADMIN_PASSWORD` | 首次启动的管理员账号，仅在控制面数据库不存在时读取 |
+
+## Docker
 
 ```bash
-cp config.example.toml config.toml
-# 填写上游地址和密钥
+docker run -d -p 8080:8080 -v aequi-data:/data \
+  -e AEQUI_ADMIN_USERNAME=admin -e AEQUI_ADMIN_PASSWORD=改成随机值 \
+  ghcr.io/<owner>/aequi:latest
 ```
 
-### 启动
+镜像基于 alpine（无头精简系统）+ musl 静态二进制，约 20 MB；非 root 用户运行，`/data` 挂卷即持久化，带健康检查。镜像由 `.github/workflows/docker.yml` 在推 tag 时构建发布（amd64 / arm64）。
+
+## API
+
+完整接口文档见仓库根目录的 [`API.md`](API.md)：请求/响应结构、认证约定、错误格式、计费口径、日志保留与脱敏规则。
+
+## 测试与 CI
 
 ```bash
-RUST_LOG=info ./target/release/aequi --config config.toml
+cargo test            # 单元 + 集成测试
+cargo test --all-targets  # CI 同款检查范围（改 service 签名后务必跑这个）
 ```
 
-启动后：
-- **管理后台**: http://127.0.0.1:3000/web/
-- **健康检查**: http://127.0.0.1:3000/health
-- **SIGHUP 热重载**: `kill -HUP $(pidof aequi)`（Unix）
-
----
-
-## 核心特性
-
-### Key 管理
-
-采用 **active/invalid 二元状态** 模型，不依赖 cooldown 定时器：
-
-| 上游响应 | 行为 |
-|---------|------|
-| 401/403 | 失败计数 +1，达阈值标记 invalid |
-| 429 | 不惩罚 key，重试其他 key |
-| 5xx | 不惩罚 key，重试其他 upstream |
-| 超时/网络错误 | 重试其他 upstream |
-
-**自动恢复**：后台定时验证 invalid key，通过则恢复为 active。纯原子操作，无 Mutex。
-
-### 并发保护
-
-每个 key 有并发上限，防止上游限流：
-
-```toml
-[key]
-max_concurrent_per_key = 5  # 全局默认
-
-[[upstreams]]
-id = "strict-provider"
-max_concurrent_per_key = 3   # 覆盖全局
-
-[[upstreams]]
-id = "generous-provider"
-max_concurrent_per_key = 20
-```
-
-超限请求立即返回 503，不浪费上游资源。
-
-### 计费系统
-
-**预留-结算** 模式，防止余额超扣：
-
-1. `reserve_request()` — 预扣除最低扣费额度
-2. `settle_reserved_usage()` — 按实际 token 结算
-3. `release_reservation()` — 失败时归还
-
-支持模型级费率配置，按 input/output token 分别计价。
-
-### 上游代理
-
-支持 HTTP/SOCKS5 代理连接上游：
-
-```toml
-[[upstreams]]
-id = "openai"
-base_url = "https://api.openai.com"
-proxy = "socks5://127.0.0.1:1080"
-
-[[upstreams]]
-id = "custom"
-base_url = "https://api.example.com"
-proxy = "http://proxy:8080"
-```
-
-### 热重载
-
-Unix 系统支持 SIGHUP 信号触发热重载，运行时更新配置无需重启。
-
----
-
-## 配置参考
-
-```toml
-listen_addr = "0.0.0.0:3000"
-# worker_threads = 4                  # 可选，默认 CPU 核心数
-request_timeout_ms = 60000
-max_retries = 5
-retry_status_codes = [429, 500, 502, 503, 504]
-admin_tokens = ["your-admin-token"]   # 必需
-data_dir = "./data"
-
-[server]
-graceful_shutdown_timeout_secs = 30
-cors_origins = ["*"]
-queue_enabled = false
-queue_max_depth = 100
-queue_timeout_ms = 10000
-
-[key]
-blacklist_threshold = 3               # 401/403 失败阈值，0=禁用
-max_concurrent_per_key = 5            # 全局默认并发限制，0=不限制
-rate_limit_cooldown_ms = 3000         # 429 默认冷却（无 Retry-After 时）
-max_rate_limit_cooldown_ms = 30000    # Retry-After 冷却上限
-revalidation_interval_secs = 300      # invalid key 验证间隔
-revalidation_timeout_secs = 20        # 验证请求超时
-```
-
----
-
-## 管理 API
-
-所有 API 需携带 `X-Admin-Token` 请求头。
-
-### Upstream 管理
-
-```bash
-# 列出
-curl http://localhost:3000/admin/api/v1/upstreams -H "X-Admin-Token: xxx"
-
-# 添加
-curl -X POST http://localhost:3000/admin/api/v1/upstreams \
-  -H "X-Admin-Token: xxx" -H "Content-Type: application/json" \
-  -d '{"id":"new","base_url":"https://api.example.com","weight":1}'
-
-# 删除
-curl -X DELETE http://localhost:3000/admin/api/v1/upstreams/new \
-  -H "X-Admin-Token: xxx"
-```
-
-### Key 管理
-
-```bash
-# 添加（JSON）
-curl -X POST http://localhost:3000/admin/api/v1/upstreams/openai/keys \
-  -H "X-Admin-Token: xxx" -H "Content-Type: application/json" \
-  -d '{"keys":["sk-xxx1","sk-xxx2"]}'
-
-# 添加（纯文本，每行一个）
-curl -X POST http://localhost:3000/admin/api/v1/upstreams/openai/keys \
-  -H "X-Admin-Token: xxx" -H "Content-Type: text/plain" \
-  -d @keys.txt
-
-# 替换所有 key
-curl -X PUT http://localhost:3000/admin/api/v1/upstreams/openai/keys \
-  -H "X-Admin-Token: xxx" -H "Content-Type: application/json" \
-  -d '{"keys":["sk-xxx1","sk-xxx2"]}'
-
-# 删除指定 key
-curl -X DELETE http://localhost:3000/admin/api/v1/upstreams/openai/keys \
-  -H "X-Admin-Token: xxx" -H "Content-Type: application/json" \
-  -d '{"keys":["sk-xxx1"]}'
-
-# 查看 key 状态（分页）
-curl "http://localhost:3000/admin/api/v1/upstreams/openai/keys?offset=0&limit=100" \
-  -H "X-Admin-Token: xxx"
-```
-
-### Key 状态操作
-
-```bash
-# 恢复指定 key（invalid → active）
-curl -X POST http://localhost:3000/admin/api/v1/upstreams/openai/keys/release \
-  -H "X-Admin-Token: xxx" -H "Content-Type: application/json" \
-  -d '{"keys":["sk-xxx1"]}'
-
-# 恢复所有 invalid key
-curl -X POST http://localhost:3000/admin/api/v1/upstreams/openai/keys/release \
-  -H "X-Admin-Token: xxx" -H "Content-Type: application/json" \
-  -d '{"all":true}'
-
-# 标记为 invalid
-curl -X POST http://localhost:3000/admin/api/v1/upstreams/openai/keys/invalidate \
-  -H "X-Admin-Token: xxx" -H "Content-Type: application/json" \
-  -d '{"keys":["sk-xxx1"]}'
-```
-
-### 计费管理
-
-```bash
-# 创建计费 key
-curl -X POST http://localhost:3000/admin/api/v1/billing/keys \
-  -H "X-Admin-Token: xxx" -H "Content-Type: application/json" \
-  -d '{"key":"my-api-key","balance":100000}'
-
-# 查询余额
-curl http://localhost:3000/admin/api/v1/billing/keys/my-api-key \
-  -H "X-Admin-Token: xxx"
-
-# 调整余额
-curl -X POST http://localhost:3000/admin/api/v1/billing/keys/my-api-key/adjust \
-  -H "X-Admin-Token: xxx" -H "Content-Type: application/json" \
-  -d '{"delta":50000}'
-
-# 删除计费 key
-curl -X DELETE http://localhost:3000/admin/api/v1/billing/keys/my-api-key \
-  -H "X-Admin-Token: xxx"
-```
-
-### 模型路由
-
-```bash
-# 查看路由
-curl http://localhost:3000/admin/api/v1/models/routes -H "X-Admin-Token: xxx"
-
-# 设置路由
-curl -X PUT http://localhost:3000/admin/api/v1/models/routes \
-  -H "X-Admin-Token: xxx" -H "Content-Type: application/json" \
-  -d '{"upstreams":{"openai":["gpt-4o","gpt-4o-mini"]}}'
-
-# 从上游刷新模型列表
-curl -X POST http://localhost:3000/admin/api/v1/upstreams/openai/models/refresh \
-  -H "X-Admin-Token: xxx"
-```
-
-### 其他
-
-```bash
-# 热重载内存索引
-curl -X POST http://localhost:3000/admin/api/v1/reload \
-  -H "X-Admin-Token: xxx"
-
-# 实时统计（SSE）
-curl "http://localhost:3000/admin/api/v1/stats/stream?token=xxx"
-```
-
----
-
-## 客户端调用
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    api_key="your-billing-key",
-    base_url="http://localhost:3000"
-)
-
-response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=[{"role": "user", "content": "Hello!"}]
-)
-```
-
-健康检查：
-
-```bash
-curl http://localhost:3000/health
-```
-
-```json
-{
-    "status": "ok",
-    "upstreams": 2,
-    "keys_total": 100,
-    "keys_active": 85,
-    "requests_inflight": 12
-}
-```
-
----
-
-## 请求处理流程
-
-```
-客户端请求
-    │
-    ▼
-[proxy] 路由匹配
-  ├─ /health     → 系统状态
-  ├─ /admin      → 管理 API/UI
-  └─ /v1/*       → 代理流程
-       │
-       ▼
-[proxy] 认证检查（API Key）
-       │
-       ▼
-[proxy] 提取 billing key，检查余额
-       │
-       ▼
-[state] select_for_model()
-  ├─ 加权轮询 upstream
-  ├─ select_key() 选 active key（跳过并发达上限的）
-  └─ 无可用 → 503
-       │
-       ▼
-[proxy] 计费预留（reserve_request）
-       │
-       ▼
-[proxy] 替换 Authorization，请求上游
-       │
-       ▼
-[proxy] 处理响应
-  ├─ 200           → 计费结算，转发
-  ├─ 401/403       → 失败计数，重试其他 key
-  ├─ 429           → 重试其他 key（不惩罚当前）
-  ├─ 5xx           → 重试其他 upstream
-  └─ 超时/网络错误  → 重试其他 upstream
-       │
-       ▼
-[proxy] 失败时释放计费预留
-       │
-       ▼
-返回客户端
-```
-
----
-
-## 架构
-
-```
-src/
-├── main.rs            # 入口，Tokio 运行时、优雅关闭、SIGHUP 热重载
-├── config.rs          # TOML 配置加载与验证
-├── state.rs           # 路由状态、key 选择、加权轮询
-├── proxy.rs           # HTTP 代理、重试逻辑、流式处理
-├── admin.rs           # 管理 API、Prometheus 指标、SSE 推送
-├── billing.rs         # 计费预留/结算/余额管理
-├── storage.rs         # sled 嵌入式数据库封装
-├── route.rs           # 模型路由匹配
-├── format.rs          # OpenAI / Anthropic / Gemini 格式兼容
-├── upstream_client.rs # 上游 HTTP 客户端（支持 SOCKS5/HTTP 代理）
-├── util.rs            # 工具函数
-└── static/
-    └── dist/          # 管理后台前端（独立项目编译输出）
-```
-
----
-
-## 性能
-
-实测数据（53 key，100 并发）：
-
-| 指标 | 数值 |
-|------|------|
-| 代理吞吐 | 1,700+ RPS |
-| 平均延迟 | 58ms |
-| P99 延迟 | 554ms |
-| 内存占用 | ~18MB |
-| CPU 占用 | ~2% /
-
-瓶颈在上游限流，不在代理本身。启用 `mimalloc` 特性可在高并发下进一步降低延迟。
-
----
-
-## 许可证
-
-MIT License
+- `ci.yml`：每次推送与 PR 跑 `cargo check --all-targets --locked` + `cargo test --locked`
+- `rust_release.yml`：推 tag 时构建四个架构的二进制并发布 GitHub Release
+- `docker.yml`：推 tag 时构建并发布多架构镜像到 GHCR
+- 三条流水线都有测试门：构建前必须先通过测试
+
+## 已知边界
+
+- 流式对话（`stream: true`）对三家上游均已支持（SSE 逐字转发、usage 聚合计费）；生图接口不支持流式
+- 上游块目前单 URL（多 URL 轮询未实现）

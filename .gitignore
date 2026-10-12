@@ -1,51 +1,26 @@
-# Rust
-/target/
-Cargo.lock
-**/*.rs.bk
-*.pdb
+# 构建产物
+/target
 
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
-*.iml
+# 前端产物（面板源码在项目外的 ../dev-web，构建后输出到这里）。
+# 默认入库：clone 下来不必装 Node 环境也能编译出带面板的二进制。
+# 不想提交就取消下面一行的注释。
+# /web
 
-# Runtime data
-data/
+# 运行时数据（数据库含账号与会话，禁止入库）
+/data
+*.db
+*.db-wal
+*.db-shm
+
+# 本地配置
 config.toml
-
-# Pre-built binaries (docker-build)
-aequi-linux-amd64
-aequi-linux-arm64
-aequi
-
-# Test outputs
-unexpected_responses/
-available_models_*.json
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
 .env
 
-# OS
+# 编辑器与系统
+.idea/
+.vscode/
 .DS_Store
 Thumbs.db
-mimo_testkeys.txt
 
-# Agent
-.copilt/
-.trae/
-.claude/
-.codex/
-.codebuddy/
-.workbuddy/
-.trellis/
+# 本地 Agent 工作目录（非项目产物）
+/.workbuddy

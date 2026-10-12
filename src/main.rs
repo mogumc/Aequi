@@ -1,245 +1,102 @@
-#![forbid(unsafe_code)]
+//! 二进制入口。
+//!
+//! 不带参数时启动服务；带子命令时执行一次性操作（详见 [`aequi::cli`]）。
+//!
+//! 启动顺序：读引导参数 → 初始化日志 → 建库建表 → 载入设置 → 初始化账号
+//! → 启动后台维护任务 → 启动服务。
+//!
+//! 只有首次启动（数据库文件尚不存在）才接受环境变量形式的初始账号密码；
+//! 后台设置一律以数据库为准，没有配置文件。
 
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-mod admin;
-mod billing;
-mod config;
-mod format;
-mod proxy;
-mod route;
-mod state;
-mod storage;
-mod upstream_client;
-mod util;
-
-use clap::Parser;
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
-use tracing_subscriber::EnvFilter;
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "aequi",
-    version,
-    about = "High-performance OpenAI-format proxy with admin UI/API, hot key reload, realtime stats"
-)]
-struct Cli {
-    /// Path to TOML config
-    #[arg(long, default_value = "config.toml")]
-    config: String,
+use anyhow::Context;
+use aequi::cli::{self, Command};
+use aequi::config::{ADMIN_PASSWORD_ENV, Bootstrap};
+use aequi::service::auth::InitialCredentials;
+use aequi::{AppState, db, server, service, utils};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    match Command::parse(&args)? {
+        Command::Help => {
+            cli::print_help();
+            Ok(())
+        }
+        // 命令行操作不需要日志订阅者：输出走 println，报错由 anyhow 打印，
+        // 多一行 INFO 只是噪音。
+        Command::ResetPassword => cli::reset_password(&Bootstrap::from_env()).await,
+        Command::DisableOtp => cli::disable_otp(&Bootstrap::from_env()).await,
+        Command::Serve => serve().await,
+    }
 }
 
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+/// 启动 HTTP 服务。
+async fn serve() -> anyhow::Result<()> {
+    // 引导参数必须在连库之前确定：首次判定依赖数据库文件是否存在。
+    let bootstrap = Bootstrap::from_env();
+    let is_first_run = bootstrap.is_first_run();
 
-    let config_path = cli.config.clone();
-    let cfg = config::Config::load(&config_path)?;
+    utils::logging::init();
 
-    // Init tracing subscriber with optional OTLP layer.
-    init_tracing()?;
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        database = %bootstrap.database.display(),
+        data_database = %bootstrap.data_database.display(),
+        first_run = is_first_run,
+        "Aequi 启动中"
+    );
 
-    let worker_threads = cfg.worker_threads.unwrap_or_else(num_cpus::get);
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(worker_threads)
-        .thread_name("aequi-worker")
-        .build()?;
+    // 控制面与数据面各自独立，密钥体系在文件层面就碰不到管理员数据。
+    let store = db::Store::connect(&bootstrap.database, &bootstrap.data_database).await?;
+    store.migrate().await?;
 
-    rt.block_on(async move {
-        let addr: SocketAddr = cfg.listen_addr.parse()?;
-        let state = Arc::new(state::RouterState::new(
-            cfg,
-            Some(PathBuf::from(config_path.clone())),
-        )?);
-        state.refresh_missing_models_routes().await;
-        state.start_revalidation();
-        spawn_config_reload(state.clone(), config_path);
+    // 首次启动导入默认设置，之后一律以数据库为准。
+    let mut settings = service::settings::ensure(&store.control).await?;
+    if let Some(listen) = &bootstrap.listen {
+        // 显式给环境变量表达的就是「这次启动听这里」，优先于库里的设置。
+        // 解析失败直接报错退出，不能静默回退到库里的值——那会让人以为
+        // 环境变量生效了。
+        let addr: SocketAddr = listen
+            .parse()
+            .with_context(|| format!("AEQUI_LISTEN 无效: {listen}"))?;
+        settings.listen = addr;
+        tracing::info!(listen = %addr, "监听地址已由 AEQUI_LISTEN 覆盖");
+    }
+    tracing::info!(listen = %settings.listen, "后台设置已载入");
 
-        // Print startup info
-        print_startup_info(&state, addr);
+    match service::auth::initialize_account(&store.control, is_first_run).await? {
+        Some(credentials) => print_initial_credentials(&credentials),
+        None => tracing::info!("账号已存在，跳过初始化"),
+    }
 
-        let shutdown = graceful_shutdown_signal(state.clone());
-        proxy::serve_http(addr, state, shutdown).await
-    })
+    let state = Arc::new(AppState::new(settings, store));
+    service::maintenance::spawn(state.clone());
+
+    server::serve(state).await
 }
 
-fn print_startup_info(state: &Arc<state::RouterState>, addr: SocketAddr) {
-    let snapshot = state.snapshot.load();
-    let upstreams = &snapshot.upstreams;
-    let admin_tokens = &state.admin_tokens;
-
-    let display_addr = if addr.ip().is_unspecified() {
-        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), addr.port())
+/// 把初始凭据打印到控制台。
+///
+/// 密码只在这一次输出中出现，之后系统仅保存其哈希。
+fn print_initial_credentials(credentials: &InitialCredentials) {
+    println!();
+    println!("================= Aequi 初始账号 =================");
+    println!("  用户名 : {}", credentials.username);
+    if credentials.from_env {
+        println!("  密码   : （由环境变量 {ADMIN_PASSWORD_ENV} 提供，此处不回显）");
     } else {
-        addr
-    };
-
-    tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    tracing::info!("  aequi v{}", env!("CARGO_PKG_VERSION"));
-    tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    tracing::info!(%addr, "listening");
-    tracing::info!(url = %format!("http://{}/web/", display_addr), "admin panel");
-
-    // Admin tokens
-    let token_count = admin_tokens.len();
-    if token_count > 0 {
-        let masked: Vec<String> = admin_tokens
-            .iter()
-            .take(3)
-            .map(|t| {
-                let char_count = t.chars().count();
-                if char_count > 8 {
-                    let prefix: String = t.chars().take(4).collect();
-                    let suffix: String = t.chars().skip(char_count - 4).collect();
-                    format!("{prefix}...{suffix}")
-                } else {
-                    t.clone()
-                }
-            })
-            .collect();
-        let extra = if token_count > 3 {
-            format!(" (+{} more)", token_count - 3)
-        } else {
-            String::new()
-        };
-        tracing::info!(tokens = %masked.join(", "), extra, "admin tokens");
+        println!("  密码   : {}", credentials.password);
     }
-
-    // Upstreams
-    tracing::info!(count = upstreams.len(), "upstreams loaded");
-    for u in upstreams.iter() {
-        tracing::info!(
-            id = %u.id,
-            base_url = %u.base_url,
-            weight = u.weight,
-            format = ?u.format,
-            "  upstream"
-        );
+    println!();
+    if credentials.from_env {
+        println!("  凭据来自环境变量，仅首次启动生效，后续启动不再读取。");
+    } else {
+        println!("  该密码为随机生成，仅显示这一次，请立即妥善保存。");
     }
-
-    // Key config
-    let key_cfg = &state.key_config;
-    tracing::info!(
-        max_concurrent = key_cfg.max_concurrent_per_key,
-        blacklist_threshold = key_cfg.blacklist_threshold,
-        "key config"
-    );
-
-    // Runtime config
-    let rt = state.runtime.load();
-    tracing::info!(
-        timeout_ms = rt.request_timeout.as_millis() as u64,
-        max_retries = rt.max_retries,
-        queue_enabled = rt.server.queue_enabled,
-        "runtime config"
-    );
-
-    tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-}
-
-async fn graceful_shutdown_signal(state: Arc<state::RouterState>) {
-    wait_shutdown_signal().await;
-    state.begin_shutdown();
-    tokio::spawn(wait_inflight_or_exit(state));
-}
-
-async fn wait_inflight_or_exit(state: Arc<state::RouterState>) {
-    let timeout_secs = state.server_config().graceful_shutdown_timeout_secs;
-    let deadline = tokio::time::sleep(Duration::from_secs(timeout_secs));
-    tokio::pin!(deadline);
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
-
-    loop {
-        let inflight = state.stats.requests_inflight.load(Ordering::Relaxed);
-        if inflight == 0 {
-            tracing::info!("graceful shutdown: no inflight requests, exiting");
-            break;
-        }
-        tokio::select! {
-            _ = &mut deadline => {
-                tracing::error!(
-                    inflight,
-                    "graceful shutdown: timeout reached, forcing exit (some data may be lost)"
-                );
-                // Best-effort flush of persistent storage before forced exit.
-                if let Err(e) = state.store.flush() {
-                    tracing::error!(error = %e, "failed to flush storage before exit");
-                }
-                std::process::exit(1);
-            }
-            _ = tick.tick() => {
-                tracing::info!(
-                    inflight,
-                    "graceful shutdown: waiting for inflight requests..."
-                );
-            }
-        }
-    }
-}
-
-async fn wait_shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = signal(SignalKind::terminate()).ok();
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = async {
-                if let Some(ref mut term) = term {
-                    term.recv().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-}
-
-fn init_tracing() -> anyhow::Result<()> {
-    let log_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(log_filter)
-        .with_target(false)
-        .with_level(true)
-        .init();
-    Ok(())
-}
-
-fn spawn_config_reload(state: Arc<state::RouterState>, config_path: String) {
-    #[cfg(unix)]
-    tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut hup = match signal(SignalKind::hangup()) {
-            Ok(signal) => signal,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to install SIGHUP handler");
-                return;
-            }
-        };
-        while hup.recv().await.is_some() {
-            match config::Config::load(&config_path) {
-                Ok(cfg) => match state.apply_config_reload(cfg) {
-                    Ok(()) => tracing::info!("config reloaded"),
-                    Err(e) => tracing::warn!(error = %e, "config reload failed"),
-                },
-                Err(e) => tracing::warn!(error = %e, "config reload failed"),
-            }
-        }
-    });
-
-    #[cfg(not(unix))]
-    {
-        let _ = state;
-        let _ = config_path;
-    }
+    println!("=================================================");
+    println!();
 }

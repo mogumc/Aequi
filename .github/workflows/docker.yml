@@ -20,8 +20,28 @@ env:
   IMAGE_NAME: ${{ github.repository_owner }}/aequi
 
 jobs:
+  test:
+    name: Check & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Check（含测试与示例代码）
+        run: cargo check --all-targets --locked
+
+      - name: Test
+        run: cargo test --locked
+
   build:
     name: Build (${{ matrix.arch }})
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
