@@ -42,7 +42,7 @@ jobs:
   build:
     name: Build (${{ matrix.arch }})
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -50,15 +50,28 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             arch: x86_64
             rustflags: "-C target-cpu=x86-64-v3"
+            os: ubuntu-latest
+            use_cross: true
           - target: aarch64-unknown-linux-gnu
             arch: arm64
             rustflags: "-C target-cpu=neoverse-n1"
+            os: ubuntu-latest
+            use_cross: true
           - target: x86_64-unknown-linux-musl
             arch: x86_64-musl
             rustflags: "-C target-cpu=x86-64-v3"
+            os: ubuntu-latest
+            use_cross: true
           - target: aarch64-unknown-linux-musl
             arch: arm64-musl
             rustflags: "-C target-cpu=neoverse-n1"
+            os: ubuntu-latest
+            use_cross: true
+          - target: x86_64-pc-windows-msvc
+            arch: x86_64-windows
+            rustflags: ""
+            os: windows-latest
+            use_cross: false
 
     steps:
       - name: Checkout code
@@ -70,6 +83,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install Cross
+        if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross.git
 
       - name: Rust Cache
@@ -78,21 +92,30 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build Optimized Binary
+        shell: bash
         run: |
           export RUSTFLAGS="${{ matrix.rustflags }} -C codegen-units=1 -C llvm-args=-inline-threshold=500"
-          cross build --release --target ${{ matrix.target }}
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
 
       - name: Prepare Release Assets
         shell: bash
         run: |
           mkdir -p ./dist
-          SOURCE_BIN="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}"
-          strip "$SOURCE_BIN" || true
-          
+
+          # Windows 产物带 .exe；MSVC 的二进制不需要也不可用 binutils strip。
+          EXT=""
+          if [ "${{ matrix.use_cross }}" != "true" ]; then EXT=".exe"; fi
+          SOURCE_BIN="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${EXT}"
+          strip "$SOURCE_BIN" 2>/dev/null || true
+
           # 只有手动触发时，文件名才会带上自定义输入的 tag
           # 自动触发时使用 github.ref_name (即 v1.0.x)
           TAG="${{ github.event.inputs.tag_name || github.ref_name }}"
-          DEST_NAME="${{ env.BINARY_NAME }}-$TAG-linux-${{ matrix.arch }}"
+          DEST_NAME="${{ env.BINARY_NAME }}-$TAG-${{ matrix.arch }}${EXT}"
           mv "$SOURCE_BIN" "./dist/$DEST_NAME"
 
       - name: Upload Build Artifact
