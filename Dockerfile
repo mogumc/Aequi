@@ -9,7 +9,9 @@
 FROM alpine:3.21
 
 # BuildKit 在多平台构建时自动注入目标架构（amd64 / arm64）。
-ARG TARGETARCH=amd64
+# 不能给默认值：带默认值的 ARG 不会被平台参数覆盖，
+# arm64 构建会因此去 COPY amd64 二进制而直接失败。
+ARG TARGETARCH
 
 COPY aequi-linux-${TARGETARCH} /usr/local/bin/aequi
 
