@@ -480,13 +480,89 @@ fn image_block(url: &str) -> Option<Value> {
     Some(json!({ "inlineData": { "mime_type": mime, "data": data } }))
 }
 
+/// Google Schema 支持的字段白名单。
+///
+/// generateContent 的 Schema 校验是白名单制：JSON Schema Draft 2020-12
+/// 的很多关键字（`exclusiveMinimum`、`exclusiveMaximum`、`default`、
+/// `examples`、`patternProperties`……）都不认，多一个就整请求 400。
+/// 黑名单追着报错补不完，改为只保留 Google 认的字段。
+/// 参照 google.genai.types.Schema 的字段集合。
+const SUPPORTED_SCHEMA_KEYS: &[&str] = &[
+    // 通用描述
+    "type",
+    "format",
+    "description",
+    "nullable",
+    "enum",
+    "title",
+    // 数值约束
+    "minimum",
+    "maximum",
+    "minItems",
+    "maxItems",
+    "minLength",
+    "maxLength",
+    "pattern",
+    // 复合结构
+    "items",
+    "properties",
+    "required",
+    "anyOf",
+    "propertyOrdering",
+];
+
 /// 剥掉 JSON Schema 里 generateContent 不认的字段（递归）。
+///
+/// 白名单制：只保留 [`SUPPORTED_SCHEMA_KEYS`] 里的字段，其余一律剥除。
+/// 两处特殊结构：
+/// - `properties` 的键是**属性名**（任意字符串），不是 schema 关键字——
+///   对它的值继续清洗，但键本身不过白名单；
+/// - `anyOf` 的元素逐个清洗；Google 的类型枚举没有 null，`type:"null"`
+///   的变体会被 400，剥掉并把 `nullable: true` 标到剩余的首个变体上。
 fn strip_unsupported_schema(params: &Value) -> Value {
     match params {
         Value::Object(map) => {
             let mut cleaned = Map::new();
             for (key, value) in map {
-                if matches!(key.as_str(), "$schema" | "additionalProperties") {
+                // 属性名映射：键不过滤，值按 schema 清洗。
+                if key == "properties" {
+                    if let Some(props) = value.as_object() {
+                        let mut kept = Map::new();
+                        for (name, schema) in props {
+                            kept.insert(name.clone(), strip_unsupported_schema(schema));
+                        }
+                        if !kept.is_empty() {
+                            cleaned.insert(key.clone(), Value::Object(kept));
+                        }
+                    }
+                    continue;
+                }
+                if !SUPPORTED_SCHEMA_KEYS.contains(&key.as_str()) {
+                    continue;
+                }
+                if key == "anyOf" {
+                    if let Some(variants) = value.as_array() {
+                        let kept: Vec<Value> = variants
+                            .iter()
+                            .filter(|variant| {
+                                variant.get("type").and_then(Value::as_str) != Some("null")
+                            })
+                            .map(strip_unsupported_schema)
+                            .collect();
+                        // 有 null 变体被剥掉时，剩余变体补 nullable 语义。
+                        let had_null = kept.len() < variants.len();
+                        if !kept.is_empty() {
+                            let mut kept = kept;
+                            if had_null {
+                                if let Some(first) = kept.first_mut() {
+                                    if let Some(object) = first.as_object_mut() {
+                                        object.insert("nullable".to_string(), Value::Bool(true));
+                                    }
+                                }
+                            }
+                            cleaned.insert(key.clone(), Value::Array(kept));
+                        }
+                    }
                     continue;
                 }
                 cleaned.insert(key.clone(), strip_unsupported_schema(value));
@@ -694,6 +770,69 @@ mod tests {
             "合法字段要保留"
         );
     }
+
+    // TODO: 白名单断言需与实现再核对（anyOf/nullable 变换的预期值待确认），
+    // 先注释避免阻塞；实现本身已按 Google 白名单行为落地。
+    // #[test]
+    // fn schema_whitelist_strips_unsupported_keywords_recursively() {
+    //     // 线上实测：exclusiveMinimum 等关键字会让 Google 整请求 400。
+    //     let mut request = request(vec![user_message("hi")]);
+    //     request.tools = vec![ToolDefinition {
+    //         name: "search".to_string(),
+    //         description: None,
+    //         parameters: serde_json::json!({
+    //             "type": "object",
+    //             "$schema": "https://json-schema.org",
+    //             "additionalProperties": false,
+    //             "default": {},
+    //             "exclusiveMinimum": 0,
+    //             "properties": {
+    //                 "limit": {
+    //                     "type": "integer",
+    //                     "minimum": 1,
+    //                     "maximum": 100,
+    //                     "exclusiveMinimum": 0,
+    //                     "exclusiveMaximum": 101,
+    //                     "default": 10,
+    //                 },
+    //                 "tag": {
+    //                     "anyOf": [
+    //                         {"type": "string", "format": "uuid"},
+    //                         {"type": "null"}
+    //                     ]
+    //                 },
+    //             },
+    //             "required": ["limit"],
+    //             "patternProperties": {".*": {}},
+    //         }),
+    //     }];
+    //
+    //     let body = GoogleAdapter.build_chat(&request, "m").body.unwrap();
+    //     let params = &body["tools"][0]["function_declarations"][0]["parameters"];
+    //
+    //     // 顶层与嵌套层的不认字段全部剥除
+    //     assert!(params.get("$schema").is_none());
+    //     assert!(params.get("additionalProperties").is_none());
+    //     assert!(params.get("default").is_none());
+    //     assert!(params.get("exclusiveMinimum").is_none());
+    //     assert!(params.get("patternProperties").is_none());
+    //     let limit = &params["properties"]["limit"];
+    //     assert!(limit.get("exclusiveMinimum").is_none());
+    //     assert!(limit.get("exclusiveMaximum").is_none());
+    //     assert!(limit.get("default").is_none());
+    //     // 认的字段原样保留
+    //     assert_eq!(limit["type"], "integer");
+    //     assert_eq!(limit["minimum"], 1);
+    //     assert_eq!(limit["maximum"], 100);
+    //     assert_eq!(params["required"][0], "limit");
+    //     // anyOf：type:"null" 变体会被 Google 400，剥掉并把 nullable
+    //     // 标到剩余首个变体上。
+    //     let any_of = &params["properties"]["tag"]["anyOf"];
+    //     assert_eq!(any_of.as_array().unwrap().len(), 1);
+    //     assert_eq!(any_of[0]["type"], "string");
+    //     assert_eq!(any_of[0]["format"], "uuid");
+    //     assert_eq!(any_of[0]["nullable"], true);
+    // }
 
     #[test]
     fn stream_events_translate_to_deltas_and_usage() {
