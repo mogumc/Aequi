@@ -40,7 +40,38 @@ struct ImageOutcome {
 /// 编排一次生图请求。
 ///
 /// 无论成败都会落两轨日志；日志写入失败只留警告，不拖垮业务请求。
+///
+/// 与对话的非流式路径同理：编排跑在脱离的 spawn 任务里，客户端中途断开
+/// 时 handler 的 future 被丢弃，但这笔已经付给上游的钱照常记账落日志。
 pub async fn images_generations(
+    state: &Arc<AppState>,
+    key: &ApiKey,
+    body: &Value,
+    ip: &str,
+    user_agent: Option<&str>,
+    header_block: Option<&str>,
+) -> Result<Value> {
+    let state = Arc::clone(state);
+    let key = key.clone();
+    let body = body.clone();
+    let ip = ip.to_string();
+    let user_agent = user_agent.map(str::to_string);
+    let header_block = header_block.map(str::to_string);
+
+    let handle = tokio::spawn(async move {
+        dispatch_entry(
+            &state, &key, &body, &ip, user_agent.as_deref(), header_block.as_deref(),
+        )
+        .await
+    });
+
+    handle
+        .await
+        .map_err(|error| Error::Internal(anyhow::anyhow!("生图请求任务异常: {error}")))?
+}
+
+/// [`images_generations`] 的实际编排体，跑在脱离的任务里。
+async fn dispatch_entry(
     state: &Arc<AppState>,
     key: &ApiKey,
     body: &Value,
