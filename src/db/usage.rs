@@ -18,12 +18,16 @@ INSERT INTO usage_records \
 (key_id, model, status, error, stream, created_at) \
 VALUES (?, ?, 'error', ?, ?, ?)";
 
+/// 某密钥的用量记录，按 id 倒序（与时间倒序等价，id 自增）。
+///
+/// `before_id` 是游标分页的锚点：传 0 表示从最新开始，传上一页最后一条
+/// 的 id 即取更早的一页——数据持续写入，偏移量分页会漂移，游标不会。
 const SQL_LIST_BY_KEY: &str = "\
-SELECT * FROM (\
-    SELECT id, key_id, model, raw_tokens, prompt_tokens, completion_tokens, cache_tokens, estimated, stream, \
-           multiplier_bp, final_tokens, credits_scaled, status, error, created_at \
-    FROM usage_records WHERE key_id = ?\
-) ORDER BY created_at DESC, id DESC LIMIT ?";
+SELECT id, key_id, model, raw_tokens, prompt_tokens, completion_tokens, cache_tokens, estimated, stream, \
+       multiplier_bp, final_tokens, credits_scaled, status, error, created_at \
+FROM usage_records \
+WHERE key_id = ? AND (? = 0 OR id < ?) \
+ORDER BY id DESC LIMIT ?";
 
 const SQL_SUMMARY: &str = "\
 SELECT COUNT(*)                                            AS requests, \
@@ -153,18 +157,30 @@ pub const MAX_USAGE_LIMIT: i64 = 500;
 
 /// 列出某密钥的用量记录，最近的排在前面。
 ///
-/// `limit` 会被收敛到 `1..=MAX_USAGE_LIMIT`，无论调用方传什么。
+/// `limit` 收敛到 `1..=MAX_USAGE_LIMIT`；`before_id` 为 0 表示从最新开始，
+/// 否则只取 id 更小的记录。多取一条判断 `has_more`，调用方按它决定是否
+/// 展示「查询更多」。
 pub async fn list_by_key(
     pool: &SqlitePool,
     key_id: &str,
     limit: i64,
-) -> Result<Vec<UsageRecord>, sqlx::Error> {
+    before_id: i64,
+) -> Result<(Vec<UsageRecord>, bool), sqlx::Error> {
+    let clamped = limit.clamp(1, MAX_USAGE_LIMIT);
     let rows = sqlx::query(SQL_LIST_BY_KEY)
         .bind(key_id)
-        .bind(limit.clamp(1, MAX_USAGE_LIMIT))
+        .bind(before_id)
+        .bind(before_id)
+        .bind(clamped + 1)
         .fetch_all(pool)
         .await?;
-    Ok(rows.iter().map(map_row).collect())
+    let has_more = rows.len() as i64 > clamped;
+    let records: Vec<UsageRecord> = rows
+        .iter()
+        .take(clamped as usize)
+        .map(map_row)
+        .collect();
+    Ok((records, has_more))
 }
 
 /// 汇总某密钥的累计用量。

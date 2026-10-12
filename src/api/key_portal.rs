@@ -29,10 +29,12 @@ pub async fn usage(
     Query(query): Query<UsageQuery>,
 ) -> Result<Json<UsageListResponse>> {
     let summary = keys::usage_summary(&state.store.data, &context.key.id).await?;
-    let records = keys::usage(&state.store.data, &context.key.id, query.limit()).await?;
+    let (records, has_more) =
+        keys::usage(&state.store.data, &context.key.id, query.limit(), query.before_id()).await?;
 
     Ok(Json(UsageListResponse::new(
         summary,
         records.iter().map(Into::into).collect(),
+        has_more,
     )))
 }

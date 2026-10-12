@@ -39,6 +39,9 @@ impl MessageResponse {
 pub struct UsageQuery {
     #[serde(default = "default_usage_limit")]
     pub limit: i64,
+    /// 游标分页：上一页最后一条记录的 id；0 或缺省表示从最新开始。
+    #[serde(default)]
+    pub before_id: i64,
 }
 
 fn default_usage_limit() -> i64 {
@@ -52,6 +55,11 @@ impl UsageQuery {
     pub fn limit(&self) -> i64 {
         self.limit.clamp(1, crate::db::usage::MAX_USAGE_LIMIT)
     }
+
+    /// 负数游标一律按 0 处理（从最新开始）。
+    pub fn before_id(&self) -> i64 {
+        self.before_id.max(0)
+    }
 }
 
 /// 用量响应：累计汇总 + 明细列表。
@@ -61,10 +69,16 @@ impl UsageQuery {
 pub struct UsageListResponse {
     pub summary: UsageSummary,
     pub records: Vec<UsageView>,
+    /// 是否还有更早的记录，前端据此决定是否展示「查询更多」。
+    pub has_more: bool,
 }
 
 impl UsageListResponse {
-    pub fn new(summary: UsageSummary, records: Vec<UsageView>) -> Self {
-        Self { summary, records }
+    pub fn new(summary: UsageSummary, records: Vec<UsageView>, has_more: bool) -> Self {
+        Self {
+            summary,
+            records,
+            has_more,
+        }
     }
 }

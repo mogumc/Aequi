@@ -29,6 +29,9 @@ pub struct LogQuery {
     pub key_id: Option<String>,
     pub model: Option<String>,
     pub block_id: Option<String>,
+    /// 游标分页：上一页最后一条日志的 id；0 或缺省表示从最新开始。
+    #[serde(default)]
+    pub before_id: Option<i64>,
 }
 
 impl LogQuery {
@@ -47,6 +50,7 @@ impl LogQuery {
             access_key_id: clean(self.key_id),
             model: clean(self.model),
             block_id: clean(self.block_id),
+            before_id: self.before_id.unwrap_or(0).max(0),
             limit: self.limit.unwrap_or(100),
         }
     }
@@ -56,6 +60,8 @@ impl LogQuery {
 #[derive(Debug, Serialize)]
 pub struct LogListResponse {
     pub logs: Vec<ProxyLogView>,
+    /// 是否还有更早的日志，前端据此决定是否展示「查询更多」。
+    pub has_more: bool,
 }
 
 /// `GET /api/logs`
@@ -63,9 +69,10 @@ pub async fn list(
     State(state): State<Arc<AppState>>,
     Query(query): Query<LogQuery>,
 ) -> Result<Json<LogListResponse>> {
-    let logs = db::proxy_log::list_filtered(&state.store.data, &query.into_filter()).await?;
+    let (logs, has_more) = db::proxy_log::list_filtered(&state.store.data, &query.into_filter()).await?;
 
     Ok(Json(LogListResponse {
         logs: logs.iter().map(Into::into).collect(),
+        has_more,
     }))
 }

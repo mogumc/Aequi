@@ -182,9 +182,14 @@ pub async fn authenticate(pool: &SqlitePool, plaintext: &str) -> Result<ApiKey> 
     Ok(key)
 }
 
-/// 某密钥的用量记录。
-pub async fn usage(pool: &SqlitePool, key_id: &str, limit: i64) -> Result<Vec<UsageRecord>> {
-    Ok(db::usage::list_by_key(pool, key_id, limit).await?)
+/// 某密钥的用量记录（游标分页，`before_id` 为 0 表示从最新开始）。
+pub async fn usage(
+    pool: &SqlitePool,
+    key_id: &str,
+    limit: i64,
+    before_id: i64,
+) -> Result<(Vec<UsageRecord>, bool)> {
+    Ok(db::usage::list_by_key(pool, key_id, limit, before_id).await?)
 }
 
 /// 某密钥的用量汇总。
