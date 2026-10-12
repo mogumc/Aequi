@@ -305,6 +305,7 @@ pub async fn update_block(
 ) -> Result<UpstreamBlock> {
     let BlockUpdate {
         name,
+        api_format,
         weight,
         base_url,
         proxy,
@@ -321,6 +322,9 @@ pub async fn update_block(
 
     if let Some(name) = name {
         block.name = name.trim().to_string();
+    }
+    if let Some(api_format) = api_format {
+        block.api_format = api_format;
     }
     if let Some(weight) = weight {
         block.weight = weight;

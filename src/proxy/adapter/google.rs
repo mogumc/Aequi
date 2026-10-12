@@ -13,6 +13,8 @@
 //! - 流式：`POST /v1beta/models/{model}:streamGenerateContent?alt=sse`
 //!   （SSE 增量为 parts 累积，无 [DONE] 哨兵，以 EOF 结束）
 
+use std::collections::{HashMap, VecDeque};
+
 use serde_json::{json, Map, Value};
 
 use crate::error::{Error, Result};
@@ -276,6 +278,14 @@ fn build_body(request: &ChatRequest) -> Value {
     let mut contents: Vec<Value> = Vec::new();
     let mut system_parts: Vec<String> = Vec::new();
 
+    // 工具结果回放时 functionResponse 必须带 name，而 OpenAI 协议里
+    // tool 消息的 name 是可选字段——很多客户端只带 tool_call_id。
+    // 随遍历维护两份索引：id → 名字（精确找回），以及尚未被结果
+    // 消费的调用队列（顺序兜底——Gemini 生成的 functionCall 本就
+    // 可能没有 id，客户端回传的 tool_call_id 也会是空）。
+    let mut call_names: HashMap<String, String> = HashMap::new();
+    let mut pending: VecDeque<(String, String)> = VecDeque::new();
+
     for message in &request.messages {
         match message.role {
             Role::System => {
@@ -302,6 +312,10 @@ fn build_body(request: &ChatRequest) -> Value {
                     attach_text_bypass(&mut parts);
                 } else {
                     for (i, call) in message.tool_calls.iter().enumerate() {
+                        if !call.id.is_empty() {
+                            call_names.insert(call.id.clone(), call.name.clone());
+                        }
+                        pending.push_back((call.id.clone(), call.name.clone()));
                         // arguments 在请求里是 JSON 字符串，回放时要对象形态。
                         let args: Value =
                             serde_json::from_str(&call.arguments).unwrap_or(json!({}));
@@ -337,6 +351,26 @@ fn build_body(request: &ChatRequest) -> Value {
                 let last = contents.last_mut().expect("刚 push 过");
                 let parts = last["parts"].as_array_mut().expect("parts 是数组");
 
+                // 名字的三级来源：客户端显式给的 name → 按 tool_call_id
+                // 从前面 assistant 的 tool_calls 找回 → 顺序消费最近的
+                // 未匹配调用。Google 对 name 为空直接 400，都找不回时
+                // 给非空占位符，别让整条请求被拒。
+                if let Some(id) = &message.tool_call_id {
+                    pending.retain(|(call_id, _)| call_id != id);
+                }
+                let tool_name = message
+                    .name
+                    .clone()
+                    .filter(|name| !name.is_empty())
+                    .or_else(|| {
+                        message
+                            .tool_call_id
+                            .as_ref()
+                            .and_then(|id| call_names.get(id).cloned())
+                    })
+                    .or_else(|| pending.pop_front().map(|(_, name)| name))
+                    .unwrap_or_else(|| "tool".to_string());
+
                 // MCP 客户端常把结果双重编码成 JSON 字符串，先解开一层。
                 let text = unwrap_json_content(&message.text());
                 let response = match serde_json::from_str::<Value>(&text) {
@@ -344,11 +378,13 @@ fn build_body(request: &ChatRequest) -> Value {
                     _ => json!({ "result": text }),
                 };
                 let mut function_response = json!({
-                    "name": message.name.clone().unwrap_or_default(),
+                    "name": tool_name,
                     "response": response,
                 });
                 if let Some(call_id) = &message.tool_call_id {
-                    function_response["id"] = json!(call_id);
+                    if !call_id.is_empty() {
+                        function_response["id"] = json!(call_id);
+                    }
                 }
                 parts.push(json!({ "functionResponse": function_response }));
             }
@@ -734,6 +770,122 @@ mod tests {
         let parts = &build_body(&plain)["contents"][0]["parts"];
         assert_eq!(parts[0]["thoughtSignature"], THOUGHT_SIGNATURE_BYPASS);
         assert!(parts[1].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn tool_message_without_name_recovers_it_from_the_call() {
+        // OpenAI 协议里 tool 消息的 name 是可选字段——客户端只回传
+        // tool_call_id 时，名字要从前面 assistant 的 tool_calls 找回，
+        // 否则 functionResponse.name 为空会被 Google 直接 400。
+        let request = request(vec![
+            user_message("搜下今日新闻"),
+            Message {
+                role: Role::Assistant,
+                content: vec![],
+                tool_calls: vec![ToolCall {
+                    id: "call_1735540".to_string(),
+                    name: "WebSearch".to_string(),
+                    arguments: "{\"query\": \"今日新闻\"}".to_string(),
+                }],
+                tool_call_id: None,
+                name: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![ContentPart::text("搜索结果")],
+                tool_calls: vec![],
+                tool_call_id: Some("call_1735540".to_string()),
+                name: None,
+            },
+        ]);
+
+        let body = build_body(&request);
+        let contents = body["contents"].as_array().unwrap();
+        let response_part = &contents[2]["parts"][0];
+        assert_eq!(response_part["functionResponse"]["name"], "WebSearch");
+        assert_eq!(response_part["functionResponse"]["id"], "call_1735540");
+    }
+
+    #[test]
+    fn tool_message_without_id_falls_back_to_call_order() {
+        // Gemini 生成的 functionCall 本就可能没有 id，客户端回传的
+        // tool_call_id 也会是空——此时按顺序消费最近的未匹配调用。
+        let request = request(vec![
+            user_message("查天气"),
+            Message {
+                role: Role::Assistant,
+                content: vec![],
+                tool_calls: vec![ToolCall {
+                    id: String::new(),
+                    name: "get_weather".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                tool_call_id: None,
+                name: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![ContentPart::text("晴")],
+                tool_calls: vec![],
+                tool_call_id: None,
+                name: None,
+            },
+        ]);
+
+        let body = build_body(&request);
+        let contents = body["contents"].as_array().unwrap();
+        assert_eq!(contents[2]["parts"][0]["functionResponse"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn parallel_calls_match_results_by_id_not_by_order() {
+        // 并行调用 + 结果乱序回传：id 能对上的必须精确匹配，
+        // 不能靠顺序碰运气。
+        let request = request(vec![
+            user_message("查两件事"),
+            Message {
+                role: Role::Assistant,
+                content: vec![],
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call-a".to_string(),
+                        name: "get_weather".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                    ToolCall {
+                        id: "call-b".to_string(),
+                        name: "get_time".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                ],
+                tool_call_id: None,
+                name: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![ContentPart::text("12:00")],
+                tool_calls: vec![],
+                tool_call_id: Some("call-b".to_string()),
+                name: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![ContentPart::text("晴")],
+                tool_calls: vec![],
+                tool_call_id: Some("call-a".to_string()),
+                name: None,
+            },
+        ]);
+
+        let body = build_body(&request);
+        let contents = body["contents"].as_array().unwrap();
+        let responses: Vec<&serde_json::Value> = contents[2]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .collect();
+        assert_eq!(responses[0]["functionResponse"]["name"], "get_time");
+        assert_eq!(responses[1]["functionResponse"]["name"], "get_weather");
     }
 
     #[test]

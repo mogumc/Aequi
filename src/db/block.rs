@@ -72,10 +72,11 @@ pub async fn insert_block(pool: &SqlitePool, block: &UpstreamBlock) -> Result<()
 pub async fn update_block(pool: &SqlitePool, block: &UpstreamBlock) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE upstream_blocks \
-         SET name = ?, weight = ?, base_url = ?, proxy = ?, models = ?, enabled = ?, updated_at = ? \
+         SET name = ?, api_format = ?, weight = ?, base_url = ?, proxy = ?, models = ?, enabled = ?, updated_at = ? \
          WHERE id = ?",
     )
     .bind(&block.name)
+    .bind(block.api_format.as_str())
     .bind(block.weight as i64)
     .bind(&block.base_url)
     .bind(&block.proxy)

@@ -229,6 +229,7 @@ pub struct BlockCreate {
 #[derive(Debug, Default, Deserialize)]
 pub struct BlockUpdate {
     pub name: Option<String>,
+    pub api_format: Option<ApiFormat>,
     pub weight: Option<u32>,
     pub base_url: Option<String>,
     /// 显式传 `null` 表示清空代理，不传则保持原值。
