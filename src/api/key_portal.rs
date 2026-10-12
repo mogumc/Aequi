@@ -36,5 +36,6 @@ pub async fn usage(
         summary,
         records.iter().map(Into::into).collect(),
         has_more,
+        state.settings().log_retention_days,
     )))
 }

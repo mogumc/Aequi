@@ -71,14 +71,23 @@ pub struct UsageListResponse {
     pub records: Vec<UsageView>,
     /// 是否还有更早的记录，前端据此决定是否展示「查询更多」。
     pub has_more: bool,
+    /// 日志保留天数（后台设置）。汇总与明细都是这段窗口内的数据，
+    /// 过期记录会被后台任务回收，前端用它注明「最近 N 天」。
+    pub retention_days: i64,
 }
 
 impl UsageListResponse {
-    pub fn new(summary: UsageSummary, records: Vec<UsageView>, has_more: bool) -> Self {
+    pub fn new(
+        summary: UsageSummary,
+        records: Vec<UsageView>,
+        has_more: bool,
+        retention_days: i64,
+    ) -> Self {
         Self {
             summary,
             records,
             has_more,
+            retention_days,
         }
     }
 }

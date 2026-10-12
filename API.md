@@ -322,6 +322,7 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
 {
   "summary": { "requests": 12, "failed": 1, "raw_tokens": 480, "final_tokens": 480, "prompt_tokens": 400, "completion_tokens": 80, "cache_tokens": 0, "credits": "0.0480", "credits_scaled": 480 },
   "has_more": false,
+  "retention_days": 7,
   "records": [
     {
       "id": 3, "model": "gpt-4o", "status": "success",
@@ -337,7 +338,9 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
 分页是**游标式**：`before_id` 传上一页最后一条记录的 `id` 即取更早的一页
 （0 / 缺省从最新开始），响应里的 `has_more` 说明是否还有更早的记录——
 数据持续写入，偏移量分页会漂移，游标不会。日志保留期由后台设置
-`log_retention_days`（默认 7 天，1-365 可调）决定，过期由后台任务回收。
+`log_retention_days`（默认 7 天，1-365 可调）决定，过期由后台任务回收；
+响应里的 `retention_days` 就是当前生效值——**汇总与明细都只是这段窗口
+内的数据**，前端应据此注明统计口径。
 
 失败请求同样出现在 `records` 里（`status: "error"`、token 与积分为 0、`error` 为一句脱敏描述：上游错误只给「上游响应异常」或「上游响应异常: 返回 {status}」，不包含上游报错原文；原话与内部细节只在管理员的 `/api/logs` 里）。
 
