@@ -136,6 +136,14 @@ impl Adapter for OpenAiAdapter {
             events.push(StreamEvent::Delta { text, tool_calls });
         }
 
+        // usage 不一定只出现在 choices 为空的收尾 chunk——不少 OpenAI 兼容
+        // 网关把它塞在最后一个普通 chunk 里。宽松提取，merge_usage 取较大
+        // 值，多次出现不重复计。
+        let usage = parse_usage(value.get("usage"));
+        if usage.total_tokens > 0 {
+            events.push(StreamEvent::Usage(usage));
+        }
+
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             events.push(StreamEvent::Finish {
                 finish_reason: finish_reason(Some(reason)),

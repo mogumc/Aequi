@@ -40,6 +40,9 @@ pub struct UpstreamState {
     currents: Mutex<HashMap<String, i64>>,
     /// 每块一个客户端，连接池跨请求复用；块配置变更时失效。
     clients: Mutex<HashMap<String, reqwest::Client>>,
+    /// 被「不认识 stream_options」的上游拉黑的块：对这些块不再注入
+    /// include_usage。进程内记录，重启后重新试探——降级是自动的。
+    no_usage_inject: Mutex<HashMap<String, ()>>,
 }
 
 impl UpstreamState {
@@ -82,6 +85,26 @@ impl UpstreamState {
         if let Ok(mut currents) = self.currents.lock() {
             for id in ids {
                 currents.remove(id);
+            }
+        }
+    }
+
+    /// 该块是否允许注入 `stream_options.include_usage`。
+    pub fn usage_inject_allowed(&self, block_id: &str) -> bool {
+        !self
+            .no_usage_inject
+            .lock()
+            .is_ok_and(|set| set.contains_key(block_id))
+    }
+
+    /// 上游用 400 拒绝了注入字段：拉黑该块，之后剥离注入重试。
+    pub fn disable_usage_inject(&self, block_id: &str) {
+        if let Ok(mut set) = self.no_usage_inject.lock() {
+            if set.insert(block_id.to_string(), ()).is_none() {
+                tracing::warn!(
+                    block = %block_id,
+                    "上游不认识 stream_options，已停止对该块注入 include_usage"
+                );
             }
         }
     }
