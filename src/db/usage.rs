@@ -30,6 +30,9 @@ SELECT COUNT(*)                                            AS requests, \
        COALESCE(SUM(status = 'error'), 0)                  AS failed, \
        COALESCE(SUM(raw_tokens), 0)                        AS raw_tokens, \
        COALESCE(SUM(final_tokens), 0)                      AS final_tokens, \
+       COALESCE(SUM(prompt_tokens), 0)                     AS prompt_tokens, \
+       COALESCE(SUM(completion_tokens), 0)                 AS completion_tokens, \
+       COALESCE(SUM(cache_tokens), 0)                      AS cache_tokens, \
        COALESCE(SUM(credits_scaled), 0)                    AS credits_scaled \
 FROM usage_records WHERE key_id = ?";
 
@@ -176,6 +179,9 @@ pub async fn summary(pool: &SqlitePool, key_id: &str) -> Result<UsageSummary, sq
         row.get("failed"),
         row.get("raw_tokens"),
         row.get("final_tokens"),
+        row.get("prompt_tokens"),
+        row.get("completion_tokens"),
+        row.get("cache_tokens"),
         row.get("credits_scaled"),
     ))
 }

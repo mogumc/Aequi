@@ -308,7 +308,7 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
 
 ```json
 {
-  "summary": { "requests": 12, "failed": 1, "raw_tokens": 480, "final_tokens": 480, "credits": "0.0480", "credits_scaled": 480 },
+  "summary": { "requests": 12, "failed": 1, "raw_tokens": 480, "final_tokens": 480, "prompt_tokens": 400, "completion_tokens": 80, "cache_tokens": 0, "credits": "0.0480", "credits_scaled": 480 },
   "records": [
     {
       "id": 3, "model": "gpt-4o", "status": "success",

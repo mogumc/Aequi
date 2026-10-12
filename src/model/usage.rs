@@ -93,6 +93,12 @@ pub struct UsageSummary {
     pub failed: i64,
     pub raw_tokens: i64,
     pub final_tokens: i64,
+    /// 累计输入 token（含缓存命中的部分）。
+    pub prompt_tokens: i64,
+    /// 累计输出 token。
+    pub completion_tokens: i64,
+    /// 累计命中缓存的输入 token。
+    pub cache_tokens: i64,
     /// 累计消耗积分，四位小数字符串。
     pub credits: String,
     pub credits_scaled: i64,
@@ -100,11 +106,15 @@ pub struct UsageSummary {
 
 impl UsageSummary {
     /// 由数据库返回的整数汇总组装视图。
+    #[allow(clippy::too_many_arguments)]
     pub fn from_scaled(
         requests: i64,
         failed: i64,
         raw_tokens: i64,
         final_tokens: i64,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+        cache_tokens: i64,
         credits_scaled: i64,
     ) -> Self {
         Self {
@@ -112,6 +122,9 @@ impl UsageSummary {
             failed,
             raw_tokens,
             final_tokens,
+            prompt_tokens,
+            completion_tokens,
+            cache_tokens,
             credits: credits::format_credits(credits_scaled),
             credits_scaled,
         }
