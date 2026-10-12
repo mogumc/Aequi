@@ -73,6 +73,8 @@ jobs:
 
       - name: Build Optimized Binary
         run: |
+          # 发布 tag 注入二进制（build.rs → AEQUI_VERSION）
+          export AEQUI_VERSION="${{ github.event.inputs.tag_name || github.ref_name }}"
           export RUSTFLAGS="${{ matrix.rustflags }} -C codegen-units=1 -C llvm-args=-inline-threshold=500"
           cross build --release --target ${{ matrix.target }}
 

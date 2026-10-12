@@ -26,3 +26,15 @@ pub mod web;
 
 pub use app::AppState;
 pub use error::{Error, Result};
+
+/// 运行版本号。
+///
+/// CI 打包时通过 `AEQUI_VERSION` 环境变量注入发布 tag（build.rs 转成
+/// `rustc-env`），本地 `cargo build` 没有该变量时回退 Cargo.toml 的
+/// 包版本。两者只能取其一：`option_env!` 在编译期展开，不会说谎。
+pub fn version() -> &'static str {
+    match option_env!("AEQUI_VERSION") {
+        Some(v) if !v.is_empty() => v,
+        _ => env!("CARGO_PKG_VERSION"),
+    }
+}

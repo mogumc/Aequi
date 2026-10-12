@@ -140,7 +140,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Result<Json<HealthRespons
 
     Ok(Json(HealthResponse {
         status: "ok",
-        version: env!("CARGO_PKG_VERSION"),
+        version: crate::version(),
         uptime_seconds: state.uptime().as_secs(),
         account_configured,
         providers: state.providers.list(),
