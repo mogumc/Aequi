@@ -315,6 +315,13 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
 | --- | --- | --- |
 | `GET` | `/api/key/me` | 自身信息（`KeySelfView`：`name`、`key_prefix`、`credits`、`credits_scaled`、`unlimited`、`enabled`、`allowed_models`、`created_at`、`last_used_at`——不含明文） |
 | `GET` | `/api/key/usage?limit=50&before_id=0` | 自身用量（游标分页） |
+| `GET` | `/api/key/models` | 自身可用的模型路由（脱敏视图，见下） |
+
+`/api/key/models` 返回 `{ models: [...] }`，每条为该密钥实际可调用的
+「块/模型」路由（与 `/v1/models` 同一套白名单过滤口径，但保留结构化
+倍率）：`block_id`（调用前缀）、`model`（模型名）、`multiplier`
+（两位小数字符串）。**脱敏视图**：只有调用时本来就公开的信息，
+转发名与上游出口不出这个接口；停用块的路由不出现。
 
 用量响应：
 
