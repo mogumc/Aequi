@@ -181,6 +181,9 @@ impl Usage {
 pub struct ChatResponse {
     pub model: String,
     pub content: Vec<ContentPart>,
+    /// 推理（思考）内容。与正文分开存放——客户端普遍按
+    /// `reasoning_content` 区分展示，混进正文会让思考模型无法折叠显示。
+    pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
     pub usage: Usage,
@@ -203,8 +206,14 @@ pub struct ToolCallDelta {
 /// 增量聚合、计费与输出收尾由编排层统一处理。
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    /// 内容增量：一段文本和/或工具调用分片。
+    /// 内容增量：一段思考、一段正文和/或工具调用分片。
+    ///
+    /// `reasoning` 与 `text` 分开：三家上游对思考都有独立通道
+    /// （OpenAI 系 `delta.reasoning_content`、Anthropic `thinking_delta`、
+    /// Gemini 带 `thought` 标志的 part），客户端也按 `reasoning_content`
+    /// 单独渲染。合并成一路就再也拆不开。
     Delta {
+        reasoning: String,
         text: String,
         tool_calls: Vec<ToolCallDelta>,
     },
@@ -233,5 +242,37 @@ impl ChatResponse {
             })
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    /// 估算口径的完整输出：推理 + 正文。
+    ///
+    /// 思考 token 也是输出成本——上游没报用量时不能只算可见正文，
+    /// 否则推理模型的思考部分等于免费（旧版的口径同样是全算）。
+    /// 注意与 [`ChatResponse::text`] 分开：那个是给用户看的内容，
+    /// 不能把推理混进去。
+    pub fn output_for_estimate(&self) -> String {
+        format!("{}{}", self.reasoning, self.text())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 估算口径必须包含推理；给用户看的 text() 必须不包含。
+    /// 两者混用会直接造成计费缺口或正文污染。
+    #[test]
+    fn estimate_output_includes_reasoning_but_text_does_not() {
+        let response = ChatResponse {
+            model: "m".into(),
+            content: vec![ContentPart::text("答案")],
+            reasoning: "推理过程".into(),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        };
+
+        assert_eq!(response.text(), "答案");
+        assert_eq!(response.output_for_estimate(), "推理过程答案");
     }
 }

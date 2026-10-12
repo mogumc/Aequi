@@ -101,6 +101,14 @@ impl Adapter for OpenAiAdapter {
         let choice = &value["choices"][0];
         let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
 
+        // 推理内容：DeepSeek / QwQ / GLM / Moonshot 一类用 reasoning_content，
+        // 部分网关（如 OpenRouter）用 reasoning。两个字段名都认，前者优先。
+        let reasoning = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let text = delta
             .get("content")
             .and_then(Value::as_str)
@@ -132,8 +140,12 @@ impl Adapter for OpenAiAdapter {
             .unwrap_or_default();
 
         let mut events = Vec::new();
-        if !text.is_empty() || !tool_calls.is_empty() {
-            events.push(StreamEvent::Delta { text, tool_calls });
+        if !reasoning.is_empty() || !text.is_empty() || !tool_calls.is_empty() {
+            events.push(StreamEvent::Delta {
+                reasoning,
+                text,
+                tool_calls,
+            });
         }
 
         // usage 不一定只出现在 choices 为空的收尾 chunk——不少 OpenAI 兼容
@@ -161,6 +173,13 @@ impl Adapter for OpenAiAdapter {
 
         let message = choice.get("message").unwrap_or(&Value::Null);
 
+        // 与流式口径一致：reasoning_content 优先，reasoning 兜底。
+        let reasoning = message
+            .get("reasoning_content")
+            .or_else(|| message.get("reasoning"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let content = message
             .get("content")
             .and_then(Value::as_str)
@@ -177,6 +196,7 @@ impl Adapter for OpenAiAdapter {
         Ok(ChatResponse {
             model: text_at(body, "model"),
             content,
+            reasoning,
             tool_calls,
             finish_reason: finish_reason(choice.get("finish_reason").and_then(Value::as_str)),
             usage: parse_usage(body.get("usage")),

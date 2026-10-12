@@ -107,12 +107,16 @@ impl Adapter for AnthropicAdapter {
         match value.get("type").and_then(Value::as_str) {
             Some("content_block_start") => {
                 let block = value.get("content_block").cloned().unwrap_or(Value::Null);
+                // 只有 tool_use 需要在这里亮相（id/name 在块头，参数随后才到）。
+                // thinking 块不带可转发信息：内容全在后续的 thinking_delta 里，
+                // 签名在 signature_delta 里（OpenAI 协议没有放它的位置，跳过）。
                 if block.get("type").and_then(Value::as_str) != Some("tool_use") {
                     return Ok(Vec::new());
                 }
 
                 let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                 Ok(vec![StreamEvent::Delta {
+                    reasoning: String::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCallDelta {
                         index,
@@ -133,7 +137,22 @@ impl Adapter for AnthropicAdapter {
                             Ok(Vec::new())
                         } else {
                             Ok(vec![StreamEvent::Delta {
+                                reasoning: String::new(),
                                 text: text.to_string(),
+                                tool_calls: Vec::new(),
+                            }])
+                        }
+                    }
+                    // 扩展思考的增量。文本在 delta.thinking 里而不是 delta.text——
+                    // 只认 text_delta 会把整个思考过程静默丢掉。
+                    Some("thinking_delta") => {
+                        let thinking = delta.get("thinking").and_then(Value::as_str).unwrap_or("");
+                        if thinking.is_empty() {
+                            Ok(Vec::new())
+                        } else {
+                            Ok(vec![StreamEvent::Delta {
+                                reasoning: thinking.to_string(),
+                                text: String::new(),
                                 tool_calls: Vec::new(),
                             }])
                         }
@@ -147,6 +166,7 @@ impl Adapter for AnthropicAdapter {
                             Ok(Vec::new())
                         } else {
                             Ok(vec![StreamEvent::Delta {
+                                reasoning: String::new(),
                                 text: String::new(),
                                 tool_calls: vec![ToolCallDelta {
                                     index,
@@ -157,6 +177,8 @@ impl Adapter for AnthropicAdapter {
                             }])
                         }
                     }
+                    // signature_delta 是思考块的校验签名，OpenAI 协议里没有
+                    // 对应位置，跳过（redacted_thinking 是密文，同样无可转发）。
                     _ => Ok(Vec::new()),
                 }
             }
@@ -220,6 +242,7 @@ impl Adapter for AnthropicAdapter {
             .ok_or_else(|| Error::UpstreamUnavailable("上游响应里没有 content".to_string()))?;
 
         let mut content = Vec::new();
+        let mut reasoning = String::new();
         let mut tool_calls = Vec::new();
 
         for block in blocks {
@@ -229,6 +252,12 @@ impl Adapter for AnthropicAdapter {
                         if !text.is_empty() {
                             content.push(ContentPart::text(text));
                         }
+                    }
+                }
+                // 扩展思考的完整块：文本在 block.thinking 里而不是 block.text。
+                Some("thinking") => {
+                    if let Some(text) = block.get("thinking").and_then(Value::as_str) {
+                        reasoning.push_str(text);
                     }
                 }
                 Some("tool_use") => tool_calls.push(ToolCall {
@@ -247,6 +276,7 @@ impl Adapter for AnthropicAdapter {
         Ok(ChatResponse {
             model: text_at(body, "model"),
             content,
+            reasoning,
             tool_calls,
             finish_reason: finish_reason(body.get("stop_reason").and_then(Value::as_str)),
             usage: parse_usage(body.get("usage")),

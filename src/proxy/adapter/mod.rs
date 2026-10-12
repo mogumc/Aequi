@@ -375,6 +375,115 @@ mod tests {
     }
 
     #[test]
+    fn openai_stream_reasoning_content_becomes_reasoning_delta() {
+        // DeepSeek-R1 / QwQ / GLM 一类推理模型的流式形状：思考走
+        // delta.reasoning_content，正文走 delta.content，两者必须分开。
+        let adapter = adapter_for(ApiFormat::Openai);
+
+        let events = adapter
+            .parse_stream_event(
+                r#"{"choices":[{"index":0,"delta":{"reasoning_content":"用户问的是天气"},"finish_reason":null}]}"#,
+            )
+            .unwrap();
+        assert!(
+            matches!(&events[0], StreamEvent::Delta { reasoning, text, .. }
+                if reasoning == "用户问的是天气" && text.is_empty()),
+            "reasoning_content 必须进 reasoning，不能混进正文更不能丢"
+        );
+
+        // 部分网关（如 OpenRouter）用 reasoning 字段名，同样认。
+        let events = adapter
+            .parse_stream_event(
+                r#"{"choices":[{"index":0,"delta":{"reasoning":"thinking..."},"finish_reason":null}]}"#,
+            )
+            .unwrap();
+        assert!(
+            matches!(&events[0], StreamEvent::Delta { reasoning, .. } if reasoning == "thinking...")
+        );
+
+        // 正文增量不受影响：reasoning 为空。
+        let events = adapter
+            .parse_stream_event(
+                r#"{"choices":[{"index":0,"delta":{"content":"我来查一下"},"finish_reason":null}]}"#,
+            )
+            .unwrap();
+        assert!(
+            matches!(&events[0], StreamEvent::Delta { reasoning, text, .. }
+                if text == "我来查一下" && reasoning.is_empty())
+        );
+    }
+
+    #[test]
+    fn openai_response_parses_reasoning_content() {
+        let body = json!({
+            "model": "mock-reasoner",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "先分析",
+                    "content": "答案"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 }
+        });
+
+        let response = adapter_for(ApiFormat::Openai).parse_chat(&body).unwrap();
+        assert_eq!(response.reasoning, "先分析");
+        assert_eq!(response.text(), "答案");
+    }
+
+    #[test]
+    fn anthropic_stream_thinking_delta_becomes_reasoning_delta() {
+        // 扩展思考：thinking 块的载荷在 content_block_delta 的
+        // delta.thinking 里，不是 delta.text。
+        let adapter = adapter_for(ApiFormat::Anthropic);
+
+        let events = adapter
+            .parse_stream_event(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            )
+            .unwrap();
+        assert!(events.is_empty(), "thinking 块的块头没有可转发内容");
+
+        let events = adapter
+            .parse_stream_event(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先想一下"}}"#,
+            )
+            .unwrap();
+        assert!(
+            matches!(&events[0], StreamEvent::Delta { reasoning, text, .. }
+                if reasoning == "先想一下" && text.is_empty()),
+            "thinking_delta 必须进 reasoning"
+        );
+
+        // 签名与正文增量互不串门。
+        let events = adapter
+            .parse_stream_event(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc"}}"#,
+            )
+            .unwrap();
+        assert!(events.is_empty(), "签名在 OpenAI 协议里没有位置，跳过");
+    }
+
+    #[test]
+    fn anthropic_response_parses_thinking_block() {
+        let body = json!({
+            "model": "claude",
+            "content": [
+                { "type": "thinking", "thinking": "推理过程" },
+                { "type": "text", "text": "结论" }
+            ],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 8, "output_tokens": 3 }
+        });
+
+        let response = adapter_for(ApiFormat::Anthropic).parse_chat(&body).unwrap();
+        assert_eq!(response.reasoning, "推理过程");
+        assert_eq!(response.text(), "结论");
+    }
+
+    #[test]
     fn scheduler_rotates_even_weights_in_order() {
         let state = UpstreamState::default();
         let candidates = vec![("a".to_string(), 1), ("b".to_string(), 1)];
