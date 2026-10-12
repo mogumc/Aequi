@@ -60,7 +60,16 @@ pub async fn charge(
     } else {
         db::keys::charge(&mut *tx, &key.id, credits_scaled, now).await?
     }) else {
-        return Err(classify_charge_failure(pool, &key.id).await);
+        let failure = classify_charge_failure(pool, &key.id).await;
+        // 余额不足的那笔消费收不回账，剩余零头也一并作废（清零）——
+        // 否则余额永远停在正数，入口检查形同虚设，任何消耗大于余额的
+        // 密钥都能无限免费调用。清零后必须充值才能再次发起请求。
+        if matches!(failure, Error::InsufficientCredits) {
+            if let Err(error) = db::keys::zero_credits(pool, &key.id, now).await {
+                tracing::warn!(key_id = %key.id, error = %error, "余额不足清零失败");
+            }
+        }
+        return Err(failure);
     };
 
     db::usage::insert(

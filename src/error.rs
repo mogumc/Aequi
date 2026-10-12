@@ -26,7 +26,6 @@ pub enum Error {
 
     #[error("动态验证码不正确")]
     InvalidTotp,
-
     /// 密钥余额不足以支付本次调用。
     #[error("积分不足")]
     InsufficientCredits,
@@ -55,10 +54,12 @@ impl Error {
     pub fn status(&self) -> StatusCode {
         match self {
             Error::BadRequest(_) => StatusCode::BAD_REQUEST,
+            // 验证码不对是「输入错了」，不是「身份失效」——归 400。
+            // 之前归 401，前端会把验证码输错当成会话过期直接踢回登录页。
+            Error::InvalidTotp => StatusCode::BAD_REQUEST,
             Error::Unauthorized(_)
             | Error::InvalidCredentials
-            | Error::TotpRequired
-            | Error::InvalidTotp => StatusCode::UNAUTHORIZED,
+            | Error::TotpRequired => StatusCode::UNAUTHORIZED,
             Error::Forbidden(_) => StatusCode::FORBIDDEN,
             // 402 比 403 更贴切：不是没权限，是余额不够。
             Error::InsufficientCredits => StatusCode::PAYMENT_REQUIRED,

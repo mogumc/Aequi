@@ -238,6 +238,22 @@ pub async fn set_credits(
     Ok(())
 }
 
+/// 把余额清零。
+///
+/// 结算发现余额不足时调用：那笔消费的上游成本已经发生且收不回账，
+/// 剩余的小额零头也一并作废——否则余额永远停在正数，入口的
+/// `credits_scaled <= 0` 检查形同虚设，任何消耗大于余额的密钥都能
+/// 无限免费调用。清零之后必须充值才能再次发起请求。
+pub async fn zero_credits(pool: &SqlitePool, id: &str, now: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(SQL_SET_CREDITS)
+        .bind(0)
+        .bind(now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// 扣减余额。
 ///
 /// 返回扣减后的余额；`None` 表示余额不足或密钥已停用，本次未扣除任何积分。

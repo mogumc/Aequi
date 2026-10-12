@@ -6,6 +6,7 @@
 //! 不要求任何已有凭证——能碰到这台机器和库文件的人，本来就掌握着这个服务的一切。
 
 use crate::config::Bootstrap;
+use crate::utils::time;
 use crate::{db, service};
 
 /// 一次调用要做什么。
@@ -15,6 +16,8 @@ pub enum Command {
     Serve,
     /// 重置账号密码。
     ResetPassword,
+    /// 关闭账号的两步验证（TOTP）。
+    DisableOtp,
     /// 打印帮助。
     Help,
 }
@@ -25,6 +28,7 @@ impl Command {
         match args.first().map(String::as_str) {
             None => Ok(Self::Serve),
             Some("reset-password") => Ok(Self::ResetPassword),
+            Some("disable-otp") => Ok(Self::DisableOtp),
             Some("-h" | "--help" | "help") => Ok(Self::Help),
             Some(other) => Err(anyhow::anyhow!(
                 "未知的命令 `{other}`；用 `aequi help` 查看可用命令"
@@ -41,6 +45,7 @@ pub fn print_help() {
 用法:
   aequi                 启动服务
   aequi reset-password  把账号密码重置为新的随机值（忘记密码时使用）
+  aequi disable-otp     关闭账号的两步验证（验证器丢失时使用）
   aequi help            显示本帮助
 
 环境变量:
@@ -89,6 +94,31 @@ fn print_reset_credentials(username: &str, password: &str) {
     println!();
 }
 
+/// 关闭账号的两步验证。
+///
+/// 验证器丢失后的自救途径，与 `reset-password` 同一套口径：只要求能读到
+/// 数据库文件。绑定密钥一并清除——残留的绑定信息没有任何用处，重新启用
+/// 时会生成新密钥重新扫码。
+pub async fn disable_otp(bootstrap: &Bootstrap) -> anyhow::Result<()> {
+    if !bootstrap.database.exists() {
+        anyhow::bail!("数据库尚未创建，请先启动一次服务完成初始化");
+    }
+
+    // 只打开控制面库，与 reset-password 相同的副作用控制。
+    let pool = db::open_pool(&bootstrap.database).await?;
+    db::migrate_control(&pool).await?;
+
+    let account = service::auth::sole_account(&pool).await?;
+    if !account.totp_enabled {
+        println!("该账号未启用两步验证，无需处理。");
+        return Ok(());
+    }
+
+    db::account::set_totp(&pool, account.id, false, None, time::now_secs()).await?;
+    println!("账号 {} 的两步验证已关闭，可重新登录后台再次启用。", account.username);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +137,10 @@ mod tests {
         assert_eq!(
             Command::parse(&args(&["reset-password"])).unwrap(),
             Command::ResetPassword
+        );
+        assert_eq!(
+            Command::parse(&args(&["disable-otp"])).unwrap(),
+            Command::DisableOtp
         );
         assert_eq!(Command::parse(&args(&["help"])).unwrap(), Command::Help);
         assert_eq!(Command::parse(&args(&["--help"])).unwrap(), Command::Help);

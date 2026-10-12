@@ -29,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
         // 命令行操作不需要日志订阅者：输出走 println，报错由 anyhow 打印，
         // 多一行 INFO 只是噪音。
         Command::ResetPassword => cli::reset_password(&Bootstrap::from_env()).await,
+        Command::DisableOtp => cli::disable_otp(&Bootstrap::from_env()).await,
         Command::Serve => serve().await,
     }
 }
