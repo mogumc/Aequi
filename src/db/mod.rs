@@ -137,11 +137,13 @@ pub async fn migrate_data(pool: &SqlitePool) -> anyhow::Result<()> {
         ("api_keys", API_KEYS_DDL),
         ("usage_records", USAGE_RECORDS_DDL),
         ("idx_usage_key_time", USAGE_KEY_TIME_INDEX),
+        ("idx_usage_key_id", USAGE_KEY_ID_INDEX),
         ("upstream_blocks", UPSTREAM_BLOCKS_DDL),
         ("upstream_keys", UPSTREAM_KEYS_DDL),
         ("idx_upstream_keys_block", UPSTREAM_KEYS_BLOCK_INDEX),
         ("proxy_logs", PROXY_LOGS_DDL),
         ("idx_proxy_logs_time", PROXY_LOGS_TIME_INDEX),
+        ("idx_proxy_logs_id", PROXY_LOGS_ID_INDEX),
     ] {
         sqlx::query(ddl)
             .execute(pool)
@@ -304,3 +306,12 @@ const PROXY_LOGS_TIME_INDEX: &str =
 
 const USAGE_KEY_TIME_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_usage_key_time ON usage_records(key_id, created_at DESC)";
+
+/// 游标分页走 `WHERE key_id = ? AND id < ? ORDER BY id DESC`——
+/// 排序与游标条件都落在 id 上，需要 (key_id, id) 才能免排序、免全表扫。
+const USAGE_KEY_ID_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_usage_key_id ON usage_records(key_id, id)";
+
+/// 管理端日志的游标查询只有 `id < ?` + 各筛选列，id 序扫描是唯一免排序路径。
+const PROXY_LOGS_ID_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_proxy_logs_id ON proxy_logs(id)";

@@ -328,22 +328,24 @@ async fn charging_deducts_credits_and_records_usage() {
     assert_eq!(outcome.credits_scaled, credits::CREDIT_SCALE);
     assert_eq!(outcome.remaining_scaled, 0);
 
-    // 余额已空，再扣一分都不行
-    let error = charge_total(app.data(), &key, "demo-model", 1)
-        .await
-        .expect_err("余额不足应当报错");
-    assert!(matches!(error, Error::InsufficientCredits));
-    assert_eq!(error.status(), StatusCode::PAYMENT_REQUIRED);
+    // 余额已空（0），再请求 1 token：透支结算——照常记账，实扣 0，
+    // 余额维持 0。真实链路里入口会先拦余额 ≤ 0，这里直接调 billing
+    // 验证的是结算语义。
+    let outcome = charge_total(app.data(), &key, "demo-model", 1).await.expect("透支结算不应报错");
+    assert_eq!(outcome.credits_scaled, 0);
+    assert_eq!(outcome.remaining_scaled, 0);
 
-    // 用量落账
+    // 用量落账：两笔都在，透支那笔实扣 0。
     let summary = key_service::usage_summary(app.data(), &key.id).await.unwrap();
-    assert_eq!(summary.requests, 1, "失败的那次不应留记录");
-    assert_eq!(summary.raw_tokens, 10_000);
+    assert_eq!(summary.requests, 2);
+    assert_eq!(summary.raw_tokens, 10_001);
     assert_eq!(summary.credits, "1.0000");
 
-    let records = key_service::usage(app.data(), &key.id, 10).await.unwrap();
-    assert_eq!(records.len(), 1);
+    let (records, has_more) = key_service::usage(app.data(), &key.id, 10, 0).await.unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(!has_more);
     assert_eq!(records[0].model, "demo-model");
+    assert_eq!(records[0].credits_scaled, 0, "透支那笔实扣 0");
 }
 
 #[tokio::test]
@@ -519,7 +521,7 @@ async fn key_only_reads_its_own_usage() {
     .await;
     assert_eq!(managed["summary"]["requests"], 1);
     assert_eq!(managed["records"][0]["credits"], "0.5000");
-    assert_eq!(managed["records"][0]["multiplier"], "1.0000");
+    assert_eq!(managed["records"][0]["multiplier"], "1.00");
 }
 
 #[tokio::test]
@@ -599,13 +601,15 @@ async fn charging_a_disabled_key_reports_forbidden_not_insufficient() {
     let current = key_service::get(app.data(), &key.id).await.unwrap();
     assert_eq!(credits::format_credits(current.credits_scaled), "10.0000");
 
-    // 确实余额不足时，仍然是 402
+    // 确实余额不足时，按透支结算：实扣 = 全部剩余（0.0001 积分），余额清零
     let poor = app.make_key("0.0001", Vec::new()).await;
-    let error = charge_total(app.data(), &poor, "demo-model", 100)
+    let outcome = charge_total(app.data(), &poor, "demo-model", 100)
         .await
-        .expect_err("余额不足应当报错");
-    assert!(matches!(error, Error::InsufficientCredits));
-    assert_eq!(error.status(), StatusCode::PAYMENT_REQUIRED);
+        .expect("余额不足按透支结算，不应报错");
+    assert_eq!(outcome.credits_scaled, 1, "实扣 = 全部剩余（0.0001 积分）");
+    assert_eq!(outcome.remaining_scaled, 0);
+    let current = key_service::get(app.data(), &poor.id).await.unwrap();
+    assert_eq!(current.credits_scaled, 0, "余额被清零，等充值后再用");
 }
 
 #[tokio::test]
@@ -616,18 +620,14 @@ async fn deleting_a_key_cascades_its_usage_records() {
     charge_total(app.data(), &key, "demo-model", 5_000)
         .await
         .unwrap();
-    assert_eq!(
-        key_service::usage(app.data(), &key.id, 10).await.unwrap().len(),
-        1
-    );
+    let (records, _) = key_service::usage(app.data(), &key.id, 10, 0).await.unwrap();
+    assert_eq!(records.len(), 1);
 
     key_service::delete(app.data(), &key.id).await.unwrap();
 
     // 记录随密钥一起清掉，不留下无主的孤儿数据
-    assert_eq!(
-        key_service::usage(app.data(), &key.id, 10).await.unwrap().len(),
-        0
-    );
+    let (records, _) = key_service::usage(app.data(), &key.id, 10, 0).await.unwrap();
+    assert_eq!(records.len(), 0);
     assert_eq!(
         key_service::usage_summary(app.data(), &key.id)
             .await
@@ -649,11 +649,11 @@ async fn usage_limit_is_clamped_by_the_data_layer() {
     }
 
     // 负数在 SQLite 里表示「不设上限」，必须被数据层挡住
-    let records = key_service::usage(app.data(), &key.id, -1).await.unwrap();
+    let (records, _) = key_service::usage(app.data(), &key.id, -1, 0).await.unwrap();
     assert_eq!(records.len(), 1, "负数 limit 应被收敛为 1");
 
     // 超上限的值收敛到数据层允许的最大值，这里只有 3 条，就返回 3 条
-    let records = key_service::usage(app.data(), &key.id, 999_999)
+    let (records, _) = key_service::usage(app.data(), &key.id, 999_999, 0)
         .await
         .unwrap();
     assert_eq!(records.len(), 3);
@@ -678,7 +678,7 @@ async fn unlimited_key_never_runs_out_but_still_records_usage() {
     assert!(current.unlimited);
 
     // 但消耗照记：三笔记录，合计 3 积分。
-    let records = key_service::usage(app.data(), &key.id, 10).await.unwrap();
+    let (records, _) = key_service::usage(app.data(), &key.id, 10, 0).await.unwrap();
     assert_eq!(records.len(), 3, "无限额度同样每次请求都记账");
     let total: i64 = records.iter().map(|record| record.credits_scaled).sum();
     assert_eq!(total, 3 * credits::CREDIT_SCALE);
@@ -694,7 +694,8 @@ async fn switching_off_unlimited_restores_the_balance_check() {
         .await
         .unwrap();
 
-    // 切回有限额度：余额还是 0，下一次就该被拒。
+    // 切回有限额度：余额还是 0。结算层对余额 0 同样按透支处理（实扣 0）；
+    // 真实链路里入口会先拦余额 ≤ 0，这里验证的是结算语义。
     let updated = key_service::set_credits(
         app.data(),
         &key.id,
@@ -707,8 +708,9 @@ async fn switching_off_unlimited_restores_the_balance_check() {
     .unwrap();
     assert!(!updated.unlimited);
 
-    let error = charge_total(app.data(), &updated, "demo-model", 1)
+    let outcome = charge_total(app.data(), &updated, "demo-model", 1)
         .await
-        .expect_err("切回有限额度后余额为 0，应拒绝");
-    assert!(matches!(error, aequi::Error::InsufficientCredits));
+        .expect("余额 0 按透支结算，不应报错");
+    assert_eq!(outcome.credits_scaled, 0);
+    assert_eq!(outcome.remaining_scaled, 0);
 }
