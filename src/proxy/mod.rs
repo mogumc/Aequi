@@ -433,9 +433,12 @@ pub async fn chat_completion_stream(
     let output = async_stream::stream! {
         let pool = &state.store.data;
         let mut text_acc = String::new();
+        // 推理内容单独累计：估算用量时与正文一起算（思考 token 也是输出
+        // 成本），但发给客户端的 chunk 里两者分属不同字段。
+        let mut reasoning_acc = String::new();
         let mut usage_acc = Usage::default();
         let mut finished = false;
-        // 上游是否真的产出过内容（文本或工具调用）。
+        // 上游是否真的产出过内容（思考、文本或工具调用）。
         let mut produced = false;
         // 是否收到过工具调用的分片增量——决定收尾快照是否需要补发。
         let mut tools_seen = false;
@@ -531,16 +534,26 @@ pub async fn chat_completion_stream(
 
             for event in events {
                 match event {
-                    StreamEvent::Delta { text, tool_calls } => {
-                        if !text.is_empty() || !tool_calls.is_empty() {
+                    StreamEvent::Delta {
+                        reasoning,
+                        text,
+                        tool_calls,
+                    } => {
+                        if !reasoning.is_empty() || !text.is_empty() || !tool_calls.is_empty() {
                             produced = true;
                         }
                         if !tool_calls.is_empty() {
                             tools_seen = true;
                         }
                         text_acc.push_str(&text);
+                        reasoning_acc.push_str(&reasoning);
                         yield frame(openai_in::render_stream_delta(
-                            &id, created, &model, &text, &tool_calls,
+                            &id,
+                            created,
+                            &model,
+                            &reasoning,
+                            &text,
+                            &tool_calls,
                         ));
                     }
                     StreamEvent::Finish { finish_reason } => {
@@ -569,7 +582,12 @@ pub async fn chat_completion_stream(
                                 })
                                 .collect::<Vec<_>>();
                             yield frame(openai_in::render_stream_delta(
-                                &id, created, &model, "", &deltas,
+                                &id,
+                                created,
+                                &model,
+                                "",
+                                "",
+                                &deltas,
                             ));
                         }
                     }
@@ -579,7 +597,7 @@ pub async fn chat_completion_stream(
             }
         }
 
-        // 整个流没有任何实际产出（无文本、无工具调用）时按失败处理，
+        // 整个流没有任何实际产出（无思考、无文本、无工具调用）时按失败处理，
         // 不估算也不计费——上游可能返回了 200 加一段错误事件，或根本不是
         // 我们以为的格式（解析器什么都提不出来）。哪怕它报了用量，客户端
         // 什么都没收到，这钱也不能收。之前这里会按请求体估算照样扣费。
@@ -625,9 +643,12 @@ pub async fn chat_completion_stream(
         }
 
         // 计费：上游报的用量聚合；没报就按聚合出来的文本估算。
+        // 思考也是输出成本——估算路径把推理与正文拼在一起算，
+        // 与上游 usage 里 completion 已含 reasoning 的口径一致。
         let mut usage = usage_acc;
         if usage.total_tokens == 0 {
-            usage = estimate::estimate_usage(&request, &text_acc);
+            let output = format!("{reasoning_acc}{text_acc}");
+            usage = estimate::estimate_usage(&request, &output);
         } else {
             usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
         }
@@ -808,8 +829,9 @@ async fn dispatch(
                 upstream::report_success(pool, &upstream_key.id).await;
 
                 // 上游没报用量就用本地估算补齐，记账不能被钻空子。
+                // 估算口径含推理文本——思考模型的思考部分不是免费的。
                 let usage = if response.usage.total_tokens == 0 {
-                    estimate::estimate_usage(request, &response.text())
+                    estimate::estimate_usage(request, &response.output_for_estimate())
                 } else {
                     response.usage
                 };

@@ -415,6 +415,13 @@ chunk 结构与 OpenAI 完全一致（`chat.completion.chunk`），流末尾依�
 （含工具调用分片）；上游不报用量时按聚合文本估算计费。流建立之前上游出错会换密钥重试
 （最多 3 次）；流开始后的中途错误以内联 `error` 帧发出并以 `[DONE]` 收尾。
 
+**推理（思考）内容**：思考模型的推理过程按 OpenAI 兼容生态惯例走
+`delta.reasoning_content`（非流式在 `message.reasoning_content`），与 `content` 分开——
+客户端可据此折叠展示。三家上游的思考通道都会汇入该字段：OpenAI 兼容上游的
+`delta.reasoning_content`/`delta.reasoning`、Anthropic 的 `thinking` 块与
+`thinking_delta`、Gemini 带 `"thought": true` 标志的 part。思考 token 计入输出用量
+参与计费（上游 usage 未报时，估算同样包含推理文本）。
+
 ### `POST /v1/images/generations`
 
 OpenAI 生图协议，与对话共用认证、调度、重试与双轨日志。

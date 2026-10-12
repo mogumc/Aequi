@@ -55,6 +55,12 @@ pub fn render_response(response: &ChatResponse, id: &str, created: i64) -> Value
     message.insert("role".into(), json!("assistant"));
     message.insert("content".into(), json!(response.text()));
 
+    // 推理内容按 OpenAI 兼容生态的惯例放 message.reasoning_content，
+    // 与正文分开——客户端靠这个字段折叠展示思考过程。
+    if !response.reasoning.is_empty() {
+        message.insert("reasoning_content".into(), json!(response.reasoning));
+    }
+
     if !response.tool_calls.is_empty() {
         message.insert(
             "tool_calls".into(),
@@ -246,15 +252,21 @@ pub fn render_stream_role(id: &str, created: i64, model: &str) -> Value {
     Value::Object(object)
 }
 
-/// 内容增量 chunk：一段文本和/或工具调用分片。
+/// 内容增量 chunk：一段思考、一段正文和/或工具调用分片。
 pub fn render_stream_delta(
     id: &str,
     created: i64,
     model: &str,
+    reasoning: &str,
     text: &str,
     tool_calls: &[ToolCallDelta],
 ) -> Value {
     let mut delta = serde_json::Map::new();
+    // 空字段一律不写：OpenAI 的 chunk 约定里 absent 与 empty string
+    // 对客户端的含义不同（部分 SDK 会把空串当作一次真实增量）。
+    if !reasoning.is_empty() {
+        delta.insert("reasoning_content".to_string(), json!(reasoning));
+    }
     if !text.is_empty() {
         delta.insert("content".to_string(), json!(text));
     }
@@ -386,6 +398,41 @@ mod tests {
             "messages": [{ "role": "user", "content": "hi" }]
         });
         assert!(parse_request(&explicit_false).is_ok());
+    }
+
+    #[test]
+    fn stream_delta_renders_reasoning_and_content_separately() {
+        let with_reasoning = render_stream_delta("id", 0, "m", "思考中", "", &[]);
+        assert_eq!(
+            with_reasoning["choices"][0]["delta"]["reasoning_content"],
+            "思考中"
+        );
+        assert!(
+            with_reasoning["choices"][0]["delta"].get("content").is_none(),
+            "空字段不写：absent 与空串对客户端含义不同"
+        );
+
+        let with_text = render_stream_delta("id", 0, "m", "", "正文", &[]);
+        assert_eq!(with_text["choices"][0]["delta"]["content"], "正文");
+        assert!(with_text["choices"][0]["delta"]
+            .get("reasoning_content")
+            .is_none());
+    }
+
+    #[test]
+    fn response_renders_reasoning_content_in_message() {
+        let response = ChatResponse {
+            model: "m".into(),
+            content: vec![ContentPart::text("答案")],
+            reasoning: "推理".into(),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        };
+
+        let rendered = render_response(&response, "id", 0);
+        assert_eq!(rendered["choices"][0]["message"]["reasoning_content"], "推理");
+        assert_eq!(rendered["choices"][0]["message"]["content"], "答案");
     }
 
     #[test]

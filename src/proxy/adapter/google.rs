@@ -85,8 +85,21 @@ impl Adapter for GoogleAdapter {
             for part in parts {
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
                     if !text.is_empty() {
+                        // 思考模型的 part 带 "thought": true 标志——那是推理过程，
+                        // 不是正文。混进 content 会让客户端无法折叠展示，也模糊了
+                        // 「可见输出」的边界。按标志分流到 reasoning。
+                        let thought = part
+                            .get("thought")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let (reasoning, text) = if thought {
+                            (text.to_string(), String::new())
+                        } else {
+                            (String::new(), text.to_string())
+                        };
                         events.push(StreamEvent::Delta {
-                            text: text.to_string(),
+                            reasoning,
+                            text,
                             tool_calls: vec![],
                         });
                     }
@@ -96,6 +109,7 @@ impl Adapter for GoogleAdapter {
                     // functionCall 的参数字段是 args（对象）。
                     let args = call.get("args").cloned().unwrap_or(json!({}));
                     events.push(StreamEvent::Delta {
+                        reasoning: String::new(),
                         text: String::new(),
                         tool_calls: vec![ToolCallDelta {
                             index: call_index,
@@ -160,6 +174,7 @@ impl Adapter for GoogleAdapter {
             .ok_or_else(|| Error::UpstreamUnavailable("上游响应里没有 candidates".to_string()))?;
 
         let mut content = Vec::new();
+        let mut reasoning = String::new();
         let mut tool_calls = Vec::new();
 
         for part in candidate
@@ -169,7 +184,13 @@ impl Adapter for GoogleAdapter {
             .into_iter()
             .flatten()
         {
-            match (part.get("text").and_then(Value::as_str), part.get("functionCall")) {
+            // 与流式同一口径：thought 标志的 part 是推理，不是正文。
+            let is_thought = part.get("thought").and_then(Value::as_bool).unwrap_or(false);
+            match (
+                part.get("text").and_then(Value::as_str),
+                part.get("functionCall"),
+            ) {
+                (Some(text), _) if is_thought => reasoning.push_str(text),
                 (Some(text), _) => content.push(ContentPart::text(text)),
                 (_, Some(call)) => {
                     tool_calls.push(ToolCall {
@@ -218,6 +239,7 @@ impl Adapter for GoogleAdapter {
         Ok(ChatResponse {
             model: String::new(),
             content,
+            reasoning,
             tool_calls,
             finish_reason,
             usage: Usage::new(prompt as i64, (output + thought) as i64),
@@ -1066,6 +1088,46 @@ mod tests {
         assert!(adapter
             .parse_stream_event(r#"{"error":{"message":"API key not valid"}}"#)
             .is_err());
+    }
+
+    #[test]
+    fn thought_parts_route_to_reasoning_not_content() {
+        let adapter = GoogleAdapter;
+
+        // 流式：thought 标志的 part 是推理，普通 part 是正文，两者不能混。
+        let events = adapter
+            .parse_stream_event(
+                r#"{"candidates":[{"content":{"parts":[
+                    {"text":"让我想想","thought":true},
+                    {"text":"答案是 42"}
+                ]}}]}"#,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(&events[0], StreamEvent::Delta { reasoning, text, .. }
+                if reasoning == "让我想想" && text.is_empty()),
+            "thought part 必须走 reasoning"
+        );
+        assert!(
+            matches!(&events[1], StreamEvent::Delta { reasoning, text, .. }
+                if text == "答案是 42" && reasoning.is_empty()),
+            "普通 part 必须走 content"
+        );
+
+        // 非流式：同一口径。
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": { "parts": [
+                    { "text": "先想一下", "thought": true },
+                    { "text": "结论" }
+                ]},
+                "finishReason": "STOP"
+            }]
+        });
+        let response = adapter.parse_chat(&body).unwrap();
+        assert_eq!(response.reasoning, "先想一下");
+        assert_eq!(response.text(), "结论");
     }
 
     #[test]
