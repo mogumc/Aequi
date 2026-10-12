@@ -1,33 +1,38 @@
-//! Google（Gemini）格式 —— v1beta Interactions API。
+//! Google（Gemini）格式 —— v1beta generateContent 端点（正式版本）。
 //!
-//! 为什么不是 `generateContent`：新版 Interactions API 的请求形态完全是另一套
-//! 「事件流」模型（`input` 数组 + `steps` 输出），而且对字段极其严格——
-//! `generateContent` 的 body 里多一个 `stream` 字段都会被 400 拒掉
-//! （「Unknown name "stream": Cannot find field」）。流式与非流式共用
-//! 同一个端点，区别只在 body 里的 `stream` 布尔。
+//! 曾短暂切换到 v1beta Interactions API，但它对多轮工具回放强制校验
+//! thought_signature，而签名在客户端→网关一环就随 OpenAI 格式丢失了，
+//! 无状态网关无法恢复；Interactions 又没有提供可用的绕过手段。
+//! generateContent 接受官方文档为迁移场景定义的哨兵签名，配合 new-api
+//! 验证过的回放方案（functionCall/functionResponse 原样回放 + 哨兵签名）
+//! 可以稳定支撑多轮工具对话，因此切换回 generateContent 并移除
+//! Interactions 实现。
 //!
-//! 工具调用在这个 API 下也格外严格：`function_call` / `function_result`
-//! 都不能出现在输入里，所以多轮工具对话要把「assistant 的调用」折叠掉、
-//! 把「工具结果」伪装成一段 `user_input` 文本补回去。
+//! 端点与形状：
+//! - 非流式：`POST /v1beta/models/{model}:generateContent`
+//! - 流式：`POST /v1beta/models/{model}:streamGenerateContent?alt=sse`
+//!   （SSE 增量为 parts 累积，无 [DONE] 哨兵，以 EOF 结束）
 
-use std::collections::HashMap;
-
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use crate::error::{Error, Result};
 use crate::model::ApiFormat;
 
 use super::{Adapter, AuthStyle, ProbeOutcome, UpstreamRequest};
 use crate::proxy::scheme::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Role, StreamEvent, ToolCall,
+    ChatRequest, ChatResponse, ContentPart, FinishReason, Role, StreamEvent, ToolCall,
     ToolCallDelta, Usage,
 };
 
-/// 列模型接口，探测密钥用（Interactions API 下它没有变）。
+/// 列模型接口，探测密钥用。
 const MODELS_PATH: &str = "/v1beta/models";
 
-/// Interactions API 端点。流式与非流式同一个，区别在 body 的 `stream` 字段。
-const INTERACTIONS_PATH: &str = "/v1beta/interactions";
+/// thoughtSignature 绕过值（new-api 同款）。
+///
+/// Gemini 3 要求回放的 functionCall part 携带 thoughtSignature，缺失直接
+/// 400；官方文档为「从其它模型迁移历史 / 手工构造调用」的场景提供了这个
+/// 哨兵值，可以直接通过校验。
+const THOUGHT_SIGNATURE_BYPASS: &str = "context_engineering_is_the_way_to_go";
 
 pub struct GoogleAdapter;
 
@@ -40,24 +45,18 @@ impl Adapter for GoogleAdapter {
         AuthStyle::GoogleApiKey
     }
 
-    /// Interactions API 要求带版本头，缺了会被拒。
-    fn extra_headers(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("api-revision", "2026-05-20")]
-    }
-
     fn build_chat(&self, request: &ChatRequest, model: &str) -> UpstreamRequest {
         UpstreamRequest {
-            path: INTERACTIONS_PATH.to_string(),
-            body: Some(build_body(request, model, false)),
+            path: format!("/v1beta/models/{model}:generateContent"),
+            body: Some(build_body(request)),
         }
     }
 
-    /// 覆写默认实现：这里不能往 body 里塞一个 `stream` 就完事——
-    /// 端点本身倒是同一个，但 body 形状要整体重建，交给 `build_body`。
+    /// 流式走独立端点，body 与非流式完全一致——不需要也不能带 stream 字段。
     fn build_chat_stream(&self, request: &ChatRequest, model: &str) -> UpstreamRequest {
         UpstreamRequest {
-            path: INTERACTIONS_PATH.to_string(),
-            body: Some(build_body(request, model, true)),
+            path: format!("/v1beta/models/{model}:streamGenerateContent?alt=sse"),
+            body: Some(build_body(request)),
         }
     }
 
@@ -65,172 +64,81 @@ impl Adapter for GoogleAdapter {
         let value: Value = serde_json::from_str(payload)
             .map_err(|error| Error::UpstreamUnavailable(format!("上游流载荷不是 JSON: {error}")))?;
 
+        if let Some(message) = value.pointer("/error/message").and_then(Value::as_str) {
+            return Err(Error::UpstreamUnavailable(format!(
+                "上游返回错误: {message}"
+            )));
+        }
+
         let mut events = Vec::new();
 
-        match value
-            .get("event_type")
-            .and_then(Value::as_str)
-            .unwrap_or("")
+        // generateContent 的流式 chunk：candidates[0].content.parts 为
+        // 增量内容；functionCall 整体到达（单个 chunk），文本为增量。
+        // 同一 chunk 内的多个 functionCall（并行调用）按下标区分。
+        if let Some(parts) = value
+            .pointer("/candidates/0/content/parts")
+            .and_then(Value::as_array)
         {
-            // function_call 的开始。身份字段可能在 step 顶层，也可能收在
-            // step.function_call 子对象里——官方示例两种形状都出现过，都处理。
-            // 参数可能随 start 一次性到达（对象），也可能随后分片。
-            "step.start" => {
-                if let Some(step) = value.get("step") {
-                    let is_call = step.get("type").and_then(Value::as_str) == Some("function_call");
-                    let call = step
-                        .get("function_call")
-                        .filter(|_| !is_call)
-                        .unwrap_or(step);
-                    if is_call || call.get("name").is_some() {
-                        let id = call
-                            .get("id")
-                            .or_else(|| step.get("id"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
-                        let name = call
-                            .get("name")
-                            .or_else(|| step.get("name"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
-                        let fragment = match call.get("arguments").or_else(|| step.get("arguments"))
-                        {
-                            Some(Value::String(text)) => text.clone(),
-                            Some(other) => serde_json::to_string(other).unwrap_or_default(),
-                            None => String::new(),
-                        };
+            let mut call_index = 0usize;
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
                         events.push(StreamEvent::Delta {
-                            text: String::new(),
-                            tool_calls: vec![ToolCallDelta {
-                                index: 0,
-                                id,
-                                name,
-                                arguments_fragment: Some(fragment),
-                            }],
+                            text: text.to_string(),
+                            tool_calls: vec![],
                         });
                     }
                 }
-            }
-            "step.delta" => {
-                if let Some(delta) = value.get("delta") {
-                    let delta_type = delta.get("type").and_then(Value::as_str).unwrap_or("");
-                    // 文本：直接在 delta.text，或嵌在 delta.content.text（thought 摘要的形状）。
-                    if delta_type == "text" || delta_type == "thought_summary" {
-                        let text = delta
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .or_else(|| delta.pointer("/content/text").and_then(Value::as_str))
-                            .unwrap_or("");
-                        if !text.is_empty() && delta_type == "text" {
-                            events.push(StreamEvent::Delta {
-                                text: text.to_string(),
-                                tool_calls: vec![],
-                            });
-                        }
-                        return Ok(events);
-                    }
-                    // 工具调用参数：官方形状多变——arguments_delta 的字符串分片、
-                    // 一次性对象、或收在 content 子对象里。字符串按分片转发，
-                    // 对象整体序列化后一次性转发。
-                    let arguments = delta
-                        .get("arguments")
-                        .or_else(|| delta.pointer("/content/arguments"));
-                    if delta_type.contains("argument") || delta_type == "function_call" {
-                        if let Some(arguments) = arguments {
-                            let fragment = match arguments {
-                                Value::String(text) => text.clone(),
-                                other => serde_json::to_string(other).unwrap_or_default(),
-                            };
-                            events.push(StreamEvent::Delta {
-                                text: String::new(),
-                                tool_calls: vec![ToolCallDelta {
-                                    index: 0,
-                                    id: None,
-                                    name: None,
-                                    arguments_fragment: Some(fragment),
-                                }],
-                            });
-                        }
-                    }
-                }
-            }
-            "step.stop" => {}
-            "interaction.completed" => {
-                let interaction = value.get("interaction");
-                let steps = interaction
-                    .and_then(|i| i.get("steps"))
-                    .and_then(Value::as_array);
-
-                // 从最终 steps 提取工具调用的权威全集，交给编排层兜底补发——
-                // 分片增量可能因形状差异未被识别，收尾快照是唯一可靠来源。
-                let snapshot: Vec<ToolCall> = steps
-                    .into_iter()
-                    .flatten()
-                    .filter(|step| {
-                        step.get("type").and_then(Value::as_str) == Some("function_call")
-                    })
-                    .map(|step| ToolCall {
-                        id: step
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        name: step
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        arguments: serde_json::to_string(
-                            &step.get("arguments").cloned().unwrap_or(json!({})),
-                        )
-                        .unwrap_or_default(),
-                    })
-                    .collect();
-                let has_calls = !snapshot.is_empty();
-                if has_calls {
-                    events.push(StreamEvent::Snapshot {
-                        tool_calls: snapshot,
+                if let Some(call) = part.get("functionCall") {
+                    let name = call.get("name").and_then(Value::as_str).unwrap_or("");
+                    // functionCall 的参数字段是 args（对象）。
+                    let args = call.get("args").cloned().unwrap_or(json!({}));
+                    events.push(StreamEvent::Delta {
+                        text: String::new(),
+                        tool_calls: vec![ToolCallDelta {
+                            index: call_index,
+                            id: call
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            name: Some(name.to_string()),
+                            arguments_fragment: Some(
+                                serde_json::to_string(&args).unwrap_or_default(),
+                            ),
+                        }],
                     });
+                    call_index += 1;
                 }
-
-                let status = interaction
-                    .and_then(|i| i.get("status"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("completed");
-
-                let finish = if has_calls {
-                    FinishReason::ToolCalls
-                } else if status == "completed" {
-                    FinishReason::Stop
-                } else {
-                    // 安全拦截、取消等非正常状态。
-                    FinishReason::ContentFilter
-                };
-                events.push(StreamEvent::Finish {
-                    finish_reason: finish,
-                });
-
-                // 用量嵌在 interaction.usage 里；thought 是真实的输出成本，并入计费。
-                let usage = interaction.and_then(|i| i.get("usage"));
-                let input = usage
-                    .and_then(|u| u.get("total_input_tokens"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let output = usage
-                    .and_then(|u| u.get("total_output_tokens"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let thought = usage
-                    .and_then(|u| u.get("total_thought_tokens"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                events.push(StreamEvent::Usage(Usage::new(
-                    input as i64,
-                    (output + thought) as i64,
-                )));
             }
-            // interaction.created / status_update 与其它未知事件不含对话内容。
-            _ => {}
+        }
+
+        if let Some(reason) = value
+            .pointer("/candidates/0/finishReason")
+            .and_then(Value::as_str)
+        {
+            events.push(StreamEvent::Finish {
+                finish_reason: finish_reason(reason),
+            });
+        }
+
+        // usageMetadata 在收尾 chunk 里；thought 是真实的输出成本，计费时并入。
+        if let Some(usage) = value.get("usageMetadata") {
+            let prompt = usage
+                .get("promptTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let output = usage
+                .get("candidatesTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let thought = usage
+                .get("thoughtsTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            events.push(StreamEvent::Usage(Usage::new(
+                prompt as i64,
+                (output + thought) as i64,
+            )));
         }
 
         Ok(events)
@@ -243,48 +151,38 @@ impl Adapter for GoogleAdapter {
             )));
         }
 
-        let status = body
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("completed");
+        let candidate = body
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .ok_or_else(|| Error::UpstreamUnavailable("上游响应里没有 candidates".to_string()))?;
+
         let mut content = Vec::new();
         let mut tool_calls = Vec::new();
 
-        for step in body
-            .get("steps")
+        for part in candidate
+            .get("content")
+            .and_then(|c| c.get("parts"))
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
         {
-            match step.get("type").and_then(Value::as_str).unwrap_or("") {
-                "model_output" => {
-                    for block in step
-                        .get("content")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                    {
-                        if block.get("type").and_then(Value::as_str) == Some("text") {
-                            if let Some(text) = block.get("text").and_then(Value::as_str) {
-                                content.push(ContentPart::text(text));
-                            }
-                        }
-                    }
-                }
-                "function_call" => {
+            match (part.get("text").and_then(Value::as_str), part.get("functionCall")) {
+                (Some(text), _) => content.push(ContentPart::text(text)),
+                (_, Some(call)) => {
                     tool_calls.push(ToolCall {
-                        id: step
+                        id: call
                             .get("id")
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string(),
-                        name: step
+                        name: call
                             .get("name")
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string(),
                         arguments: serde_json::to_string(
-                            &step.get("arguments").cloned().unwrap_or(json!({})),
+                            &call.get("args").cloned().unwrap_or(json!({})),
                         )
                         .unwrap_or_default(),
                     });
@@ -293,25 +191,25 @@ impl Adapter for GoogleAdapter {
             }
         }
 
-        let finish_reason = if !tool_calls.is_empty() {
-            FinishReason::ToolCalls
-        } else if status == "completed" {
-            FinishReason::Stop
-        } else {
-            FinishReason::ContentFilter
+        let finish_reason = match candidate.get("finishReason").and_then(Value::as_str) {
+            Some("STOP") if tool_calls.is_empty() => FinishReason::Stop,
+            Some("MAX_TOKENS") => FinishReason::Length,
+            Some("SAFETY") | Some("PROHIBITED_CONTENT") => FinishReason::ContentFilter,
+            _ if !tool_calls.is_empty() => FinishReason::ToolCalls,
+            _ => FinishReason::Stop,
         };
 
-        let usage = body.get("usage");
-        let input = usage
-            .and_then(|u| u.get("total_input_tokens"))
+        let usage = body.get("usageMetadata");
+        let prompt = usage
+            .and_then(|u| u.get("promptTokenCount"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
         let output = usage
-            .and_then(|u| u.get("total_output_tokens"))
+            .and_then(|u| u.get("candidatesTokenCount"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
         let thought = usage
-            .and_then(|u| u.get("total_thought_tokens"))
+            .and_then(|u| u.get("thoughtsTokenCount"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
 
@@ -320,7 +218,7 @@ impl Adapter for GoogleAdapter {
             content,
             tool_calls,
             finish_reason,
-            usage: Usage::new(input as i64, (output + thought) as i64),
+            usage: Usage::new(prompt as i64, (output + thought) as i64),
         })
     }
 
@@ -331,7 +229,7 @@ impl Adapter for GoogleAdapter {
         }
     }
 
-    /// Google 返回的是 `{ "models": [{ "name": "models/gemini-2.0-flash", ... }] }`，
+    /// Google 返回 `{ "models": [{ "name": "models/gemini-2.0-flash", ... }] }`，
     /// 名字带 `models/` 前缀，要剥掉才是调用时用的模型名。
     fn parse_models(&self, body: &Value) -> Vec<String> {
         body.get("models")
@@ -356,26 +254,27 @@ impl Adapter for GoogleAdapter {
     }
 }
 
+fn finish_reason(reason: &str) -> FinishReason {
+    match reason {
+        "STOP" => FinishReason::Stop,
+        "MAX_TOKENS" => FinishReason::Length,
+        "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "SPII" => FinishReason::ContentFilter,
+        _ => FinishReason::Stop,
+    }
+}
+
 // ---------- 请求体 ----------
 
-/// 把标准请求折成 Interactions API 的 body。
+/// 把标准请求折成 generateContent 的 body（模型名在 URL 路径里）。
 ///
-/// 多轮工具对话沿用旧版 Aequi 的方式：assistant 的调用折叠（只留
-/// id→名字映射），工具结果伪装成「[Tool 名字 result] 正文」的 user_input。
-/// 官方的 function_call/function_result 回放要求调用与结果严格交错，而
-/// 平台侧难以保证历史结构恰好满足（实测会 400）；伪装方式经过线上长期
-/// 验证，工具定义照常传、真调用照常返回，只有历史回放这一环走伪装。
-fn build_body(request: &ChatRequest, model: &str, stream: bool) -> Value {
-    let mut input = Vec::new();
+/// 多轮工具对话按 new-api 的方式回放：assistant 的 functionCall parts
+/// 原样回放（每条 assistant 一个 model content），工具结果挂在
+/// `role:"user"` 的 content 里作为 functionResponse parts——连续的结果
+/// 合并进同一条 user content。generateContent 没有 Interactions 那套
+/// 「call 必须紧跟 user/result」的交错约束。
+fn build_body(request: &ChatRequest) -> Value {
+    let mut contents: Vec<Value> = Vec::new();
     let mut system_parts: Vec<String> = Vec::new();
-
-    // 多轮工具对话采用旧版 Aequi 的方式：assistant 的调用折叠（只留
-    // id→名字映射），工具结果伪装成「[Tool 名字 result] 正文」的 user_input。
-    // 官方的 function_call/function_result 回放要求调用与结果严格交错，
-    // 而平台侧难以保证历史结构恰好满足，线上验证过的伪装方式更稳——
-    // 工具定义照常传给模型（tools 字段），模型发起的真调用也照常返回
-    // 给客户端（function_call 形态），只有**历史回放**这一环走伪装。
-    let mut call_names: HashMap<String, String> = HashMap::new();
 
     for message in &request.messages {
         match message.role {
@@ -385,146 +284,192 @@ fn build_body(request: &ChatRequest, model: &str, stream: bool) -> Value {
                     system_parts.push(text);
                 }
             }
-            Role::User => push_input(&mut input, "user_input", &message.content),
+            Role::User => {
+                contents.push(user_content(&message.content));
+            }
             Role::Assistant => {
+                let mut parts: Vec<Value> = Vec::new();
                 if message.tool_calls.is_empty() {
-                    push_input(&mut input, "model_output", &message.content);
-                } else {
-                    for call in &message.tool_calls {
-                        call_names.insert(call.id.clone(), call.name.clone());
+                    for part in &message.content {
+                        if let ContentPart::Text { text } = part {
+                            if !text.is_empty() {
+                                parts.push(json!({ "text": text }));
+                            }
+                        }
                     }
+                    // 签名兜底：本条没有 functionCall 时，把哨兵签名补在
+                    // 「Markdown 图片 → 首个文本」中的一处。
+                    attach_text_bypass(&mut parts);
+                } else {
+                    for (i, call) in message.tool_calls.iter().enumerate() {
+                        // arguments 在请求里是 JSON 字符串，回放时要对象形态。
+                        let args: Value =
+                            serde_json::from_str(&call.arguments).unwrap_or(json!({}));
+                        let mut function_call = json!({
+                            "name": call.name,
+                            "args": args,
+                        });
+                        if !call.id.is_empty() {
+                            function_call["id"] = json!(call.id);
+                        }
+                        let mut part = json!({ "functionCall": function_call });
+                        // 每条 assistant 消息最多一处：给首个 functionCall。
+                        if i == 0 {
+                            part["thoughtSignature"] = json!(THOUGHT_SIGNATURE_BYPASS);
+                        }
+                        parts.push(part);
+                    }
+                }
+                if !parts.is_empty() {
+                    contents.push(json!({ "role": "model", "parts": parts }));
                 }
             }
             Role::Tool => {
-                let name = message
-                    .name
-                    .clone()
-                    .or_else(|| {
-                        message
-                            .tool_call_id
-                            .as_ref()
-                            .and_then(|id| call_names.get(id).cloned())
-                    })
-                    .unwrap_or_default();
+                // 工具结果挂在 role:"user" 的 content 里；若上一条不是
+                // model（functionCall），新开一条 user content 承载。
+                if contents
+                    .last()
+                    .map(|c| c["role"] == "model")
+                    .unwrap_or(true)
+                {
+                    contents.push(json!({ "role": "user", "parts": [] }));
+                }
+                let last = contents.last_mut().expect("刚 push 过");
+                let parts = last["parts"].as_array_mut().expect("parts 是数组");
+
                 // MCP 客户端常把结果双重编码成 JSON 字符串，先解开一层。
                 let text = unwrap_json_content(&message.text());
-                // 空结果不发——content 为空的条目会被整个拒掉。
-                if text.is_empty() {
-                    continue;
-                }
-                let text = if name.is_empty() {
-                    text
-                } else {
-                    format!("[Tool {name} result]\n{text}")
+                let response = match serde_json::from_str::<Value>(&text) {
+                    Ok(value @ Value::Object(_)) => value,
+                    _ => json!({ "result": text }),
                 };
-                input.push(json!({
-                    "type": "user_input",
-                    "content": [{"type": "text", "text": text}],
-                }));
+                let mut function_response = json!({
+                    "name": message.name.clone().unwrap_or_default(),
+                    "response": response,
+                });
+                if let Some(call_id) = &message.tool_call_id {
+                    function_response["id"] = json!(call_id);
+                }
+                parts.push(json!({ "functionResponse": function_response }));
             }
         }
     }
 
     let mut body = json!({
-        "model": model,
-        "input": input,
-        // 不存储交互历史，每次请求都自带完整上下文。
-        "store": false,
+        "contents": contents,
     });
-    if stream {
-        body["stream"] = json!(true);
-    }
     if !system_parts.is_empty() {
-        body["system_instruction"] = json!(system_parts.join("\n\n"));
+        body["system_instruction"] = json!({ "parts": [{ "text": system_parts.join("\n\n") }] });
     }
 
     if !request.tools.is_empty() {
-        // 工具是扁平的 {type:"function", name, description?, parameters}，
-        // JSON Schema 里它不认的字段（$schema、additionalProperties）要剥掉。
-        let tools: Vec<Value> = request
+        // generateContent 的工具是 function_declarations 包装，JSON Schema
+        // 里它不认的字段（$schema、additionalProperties）要剥掉。
+        let functions: Vec<Value> = request
             .tools
             .iter()
             .map(|tool| {
-                let mut item = json!({
-                    "type": "function",
+                let mut declaration = json!({
                     "name": tool.name,
                     "parameters": strip_unsupported_schema(&tool.parameters),
                 });
                 if let Some(description) = &tool.description {
-                    item["description"] = json!(description);
+                    declaration["description"] = json!(description);
                 }
-                item
+                declaration
             })
             .collect();
-        if !tools.is_empty() {
-            body["tools"] = json!(tools);
+        if !functions.is_empty() {
+            body["tools"] = json!([{ "function_declarations": functions }]);
         }
     }
 
     let mut config = Map::new();
-    if let Some(choice) = &request.tool_choice {
-        let mapped = match choice {
-            Value::String(text) => match text.as_str() {
-                "auto" => Some("auto"),
-                "required" | "any" => Some("any"),
-                "none" => Some("none"),
-                _ => None,
-            },
-            // 结构化的指定（具体到某个函数）映射成「必须调用」。
-            Value::Object(_) => Some("any"),
-            _ => None,
-        };
-        if let Some(mapped) = mapped {
-            config.insert("tool_choice".to_string(), json!(mapped));
-        }
-    }
-    if let Some(max_tokens) = request.max_tokens {
-        config.insert("max_output_tokens".to_string(), json!(max_tokens));
-    }
     if let Some(temperature) = request.temperature {
         config.insert("temperature".to_string(), json!(temperature));
     }
     if let Some(top_p) = request.top_p {
-        config.insert("top_p".to_string(), json!(top_p));
+        config.insert("topP".to_string(), json!(top_p));
+    }
+    if let Some(max_tokens) = request.max_tokens {
+        config.insert("maxOutputTokens".to_string(), json!(max_tokens));
     }
     if !request.stop.is_empty() {
-        config.insert("stop_sequences".to_string(), json!(request.stop));
+        config.insert("stopSequences".to_string(), json!(request.stop));
+    }
+    if let Some(choice) = &request.tool_choice {
+        let mode = match choice {
+            Value::String(text) => match text.as_str() {
+                "auto" => Some("AUTO"),
+                "required" | "any" => Some("ANY"),
+                "none" => Some("NONE"),
+                _ => None,
+            },
+            Value::Object(_) => Some("ANY"),
+            _ => None,
+        };
+        if let Some(mode) = mode {
+            config.insert(
+                "toolConfig".to_string(),
+                json!({ "functionCallingConfig": { "mode": mode } }),
+            );
+        }
     }
     if !config.is_empty() {
-        body["generation_config"] = Value::Object(config);
+        body["generationConfig"] = Value::Object(config);
     }
 
     body
 }
 
-fn push_input(input: &mut Vec<Value>, kind: &str, parts: &[ContentPart]) {
-    let content = content_blocks(parts);
-    // content 为空的条目会被整个拒掉，宁可不发。
-    if content.is_empty() {
-        return;
+/// new-api 同款的签名兜底：Gemini 3 的严格签名校验发生在工具循环里，
+/// 没有 functionCall 的 model 历史不一定需要签名，但为保推理连续性，
+/// 按 new-api 的策略给一条 assistant 消息最多补一处——
+/// 含 Markdown 图片语法的文本优先（多模态上下文最依赖签名），
+/// 否则首个非空文本；两者都没有则一处都不加。
+fn attach_text_bypass(parts: &mut [Value]) {
+    let target = parts
+        .iter()
+        .position(|part| {
+            part.get("text")
+                .and_then(Value::as_str)
+                .map(looks_like_markdown_image)
+                .unwrap_or(false)
+        })
+        .or_else(|| parts.iter().position(|part| part.get("text").is_some()));
+    if let Some(index) = target {
+        parts[index]["thoughtSignature"] = json!(THOUGHT_SIGNATURE_BYPASS);
     }
-    input.push(json!({ "type": kind, "content": content }));
 }
 
-fn content_blocks(parts: &[ContentPart]) -> Vec<Value> {
-    parts.iter().filter_map(content_block).collect()
+/// 粗判 Markdown 图片语法 `![alt](url)`。
+fn looks_like_markdown_image(text: &str) -> bool {
+    text.find("![")
+        .map(|start| text[start..].contains("]("))
+        .unwrap_or(false)
 }
 
-fn content_block(part: &ContentPart) -> Option<Value> {
-    match part {
-        ContentPart::Text { text } => {
-            if text.is_empty() {
-                None
-            } else {
-                Some(json!({ "type": "text", "text": text }))
+fn user_content(parts: &[ContentPart]) -> Value {
+    let mut all: Vec<Value> = Vec::new();
+    for part in parts {
+        match part {
+            ContentPart::Text { text } => {
+                if !text.is_empty() {
+                    all.push(json!({ "text": text }));
+                }
+            }
+            ContentPart::Image { url } => {
+                if let Some(block) = image_block(url) {
+                    all.push(block);
+                }
             }
         }
-        ContentPart::Image { url } => image_block(url),
     }
+    json!({ "role": "user", "parts": all })
 }
 
-/// 只接受 `data:` 形式的 base64 图片；http 地址发不了（Google 侧只收内联数据），
-/// 入口层本就对此有告警，这里静默跳过。
+/// 只接受 `data:` 形式的 base64 图片；http 地址发不了（Google 侧只收内联
+/// 数据），入口层本就对此有告警，这里静默跳过。
 fn image_block(url: &str) -> Option<Value> {
     let rest = url.strip_prefix("data:")?;
     let (mime, data) = rest.split_once(',')?;
@@ -532,12 +477,28 @@ fn image_block(url: &str) -> Option<Value> {
     if !mime.starts_with("image/") || data.is_empty() {
         return None;
     }
-    Some(json!({ "type": "image", "mime_type": mime, "data": data }))
+    Some(json!({ "inlineData": { "mime_type": mime, "data": data } }))
 }
 
-/// 工具结果若被双重编码（整段是 `[{type:"text",...}]` 或对象形式的 JSON 字符串），
-/// 解开取里面的纯文本；解不开就原样返回。移植自旧版实现——不处理这层，
-/// Google 收到的工具结果就是一坨转义文本。
+/// 剥掉 JSON Schema 里 generateContent 不认的字段（递归）。
+fn strip_unsupported_schema(params: &Value) -> Value {
+    match params {
+        Value::Object(map) => {
+            let mut cleaned = Map::new();
+            for (key, value) in map {
+                if matches!(key.as_str(), "$schema" | "additionalProperties") {
+                    continue;
+                }
+                cleaned.insert(key.clone(), strip_unsupported_schema(value));
+            }
+            Value::Object(cleaned)
+        }
+        _ => params.clone(),
+    }
+}
+
+/// 工具结果若被双重编码（整段是 `[{type:"text",...}]` 形式的 JSON 字符串），
+/// 解开取里面的纯文本；解不开就原样返回。
 fn unwrap_json_content(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.starts_with('[') || trimmed.starts_with('{') {
@@ -557,28 +518,10 @@ fn unwrap_json_content(text: &str) -> String {
                     return extracted.join("\n");
                 }
             }
-            // 是合法 JSON 但不是内容数组：维持原样。
             return text.to_string();
         }
     }
     text.to_string()
-}
-
-/// 剥掉 JSON Schema 里 Interactions API 不认的字段（递归）。
-fn strip_unsupported_schema(params: &Value) -> Value {
-    match params {
-        Value::Object(map) => {
-            let mut cleaned = Map::new();
-            for (key, value) in map {
-                if matches!(key.as_str(), "$schema" | "additionalProperties") {
-                    continue;
-                }
-                cleaned.insert(key.clone(), strip_unsupported_schema(value));
-            }
-            Value::Object(cleaned)
-        }
-        _ => params.clone(),
-    }
 }
 
 #[cfg(test)]
@@ -609,11 +552,18 @@ mod tests {
         }
     }
 
+    fn assistant_text(parts: Vec<ContentPart>) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: parts,
+            tool_calls: vec![],
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
     #[test]
-    fn tool_history_is_replayed_as_user_input_text() {
-        // 沿用旧版 Aequi 的伪装方式：assistant 的调用折叠，工具结果伪装成
-        // 「[Tool 名字 result] 正文」的 user_input——避开官方对调用与结果
-        // 严格交错的约束。工具定义本身照常传给模型（tools 字段）。
+    fn tool_history_replays_function_calls_with_bypass_signature() {
         let request = request(vec![
             user_message("查下天气"),
             Message {
@@ -636,28 +586,82 @@ mod tests {
             },
         ]);
 
-        let body = build_body(&request, "gemini-3.5-flash-lite", false);
-        let input = body["input"].as_array().unwrap();
+        let body = build_body(&request);
+        let contents = body["contents"].as_array().unwrap();
 
-        assert_eq!(input.len(), 2);
-        assert_eq!(input[0]["type"], "user_input");
-        assert_eq!(input[1]["type"], "user_input");
+        assert_eq!(contents.len(), 3);
+        // user 原样回放
+        assert_eq!(contents[0]["role"], "user");
+        // assistant 折成 model 的 functionCall，首个 part 带哨兵签名
+        assert_eq!(contents[1]["role"], "model");
+        let call_part = &contents[1]["parts"][0];
+        assert_eq!(call_part["functionCall"]["name"], "get_weather");
+        assert_eq!(call_part["functionCall"]["args"]["location"], "北京");
+        assert_eq!(call_part["functionCall"]["id"], "call-1");
         assert_eq!(
-            input[1]["content"][0]["text"],
-            "[Tool get_weather result]\n晴，25 度"
+            call_part["thoughtSignature"],
+            THOUGHT_SIGNATURE_BYPASS
         );
-        // input 里不允许出现 function_call / function_result 形态。
-        for item in input {
-            assert_ne!(item["type"], "function_call");
-            assert_ne!(item["type"], "function_result");
-        }
-        // 系统级字段
-        assert_eq!(body["store"], false);
-        assert!(body.get("stream").is_none(), "非流式 body 不该有 stream 字段");
+        // 工具结果挂在 user 的 functionResponse 里
+        assert_eq!(contents[2]["role"], "user");
+        let response_part = &contents[2]["parts"][0];
+        assert_eq!(response_part["functionResponse"]["name"], "get_weather");
+        assert_eq!(response_part["functionResponse"]["id"], "call-1");
+        assert_eq!(response_part["functionResponse"]["response"]["result"], "晴，25 度");
     }
 
     #[test]
-    fn stream_flag_goes_in_body_and_tool_schema_is_stripped() {
+    fn parallel_tool_calls_get_one_signature_on_the_first() {
+        let request = request(vec![Message {
+            role: Role::Assistant,
+            content: vec![],
+            tool_calls: vec![
+                ToolCall {
+                    id: "call-1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                ToolCall {
+                    id: "call-2".to_string(),
+                    name: "get_time".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            ],
+            tool_call_id: None,
+            name: None,
+        }]);
+
+        let body = build_body(&request);
+        let parts = &body["contents"][0]["parts"];
+
+        assert_eq!(parts.as_array().unwrap().len(), 2);
+        assert_eq!(parts[0]["thoughtSignature"], THOUGHT_SIGNATURE_BYPASS);
+        assert!(parts[1].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn text_assistant_signature_prefers_markdown_image_then_first_text() {
+        // 含 Markdown 图片：签名给图片所在的文本 part。
+        let with_image = request(vec![assistant_text(vec![
+            ContentPart::text("这是结果"),
+            ContentPart::text("![图](https://example.com/a.png)"),
+        ])]);
+        let parts = &build_body(&with_image)["contents"][0]["parts"];
+        assert!(parts[0].get("thoughtSignature").is_none());
+        assert_eq!(parts[1]["thoughtSignature"], THOUGHT_SIGNATURE_BYPASS);
+
+        // 纯文本：签名给首个文本。
+        let plain = request(vec![assistant_text(vec![
+            ContentPart::text("第一段"),
+            ContentPart::text("第二段"),
+        ])]);
+        let parts = &build_body(&plain)["contents"][0]["parts"];
+        assert_eq!(parts[0]["thoughtSignature"], THOUGHT_SIGNATURE_BYPASS);
+        assert!(parts[1].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn stream_body_uses_dedicated_endpoint_and_strips_schema() {
         let mut request = request(vec![user_message("hi")]);
         request.tools = vec![ToolDefinition {
             name: "get_weather".to_string(),
@@ -670,11 +674,18 @@ mod tests {
             }),
         }];
 
-        let body = build_body(&request, "gemini-3.5-flash-lite", true);
-        assert_eq!(body["stream"], true);
+        let outgoing = GoogleAdapter.build_chat_stream(&request, "gemini-3.5-flash-lite");
+        assert_eq!(
+            outgoing.path,
+            "/v1beta/models/gemini-3.5-flash-lite:streamGenerateContent?alt=sse"
+        );
+        let body = outgoing.body.unwrap();
+        assert!(
+            body.get("stream").is_none(),
+            "generateContent 的流式端点靠 URL 区分，body 不能带 stream 字段"
+        );
 
-        let tool = &body["tools"][0];
-        assert_eq!(tool["type"], "function");
+        let tool = &body["tools"][0]["function_declarations"][0];
         assert_eq!(tool["name"], "get_weather");
         assert!(tool["parameters"].get("additionalProperties").is_none());
         assert!(tool["parameters"].get("$schema").is_none());
@@ -691,92 +702,101 @@ mod tests {
         // 文本增量
         let events = adapter
             .parse_stream_event(
-                r#"{"event_type":"step.delta","delta":{"type":"text","text":"你好"}}"#,
+                r#"{"candidates":[{"content":{"parts":[{"text":"你好"}]}}]}"#,
             )
             .unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], StreamEvent::Delta { text, .. } if text == "你好"));
 
-        // 参数增量
+        // functionCall：args 是对象，整体到达
         let events = adapter
             .parse_stream_event(
-                r#"{"event_type":"step.delta","delta":{"type":"arguments_delta","arguments":"{\"city\""}}"#,
+                r#"{"candidates":[{"content":{"parts":[
+                    {"functionCall":{"id":"c1","name":"get_weather","args":{"city":"北京"}}}
+                ]}}]}"#,
             )
             .unwrap();
         assert!(matches!(
             &events[0],
-            StreamEvent::Delta { tool_calls, .. } if tool_calls[0].arguments_fragment.as_deref() == Some("{\"city\"")
+            StreamEvent::Delta { tool_calls, .. }
+                if tool_calls[0].index == 0
+                    && tool_calls[0].name.as_deref() == Some("get_weather")
+                    && serde_json::from_str::<Value>(
+                        tool_calls[0].arguments_fragment.as_deref().unwrap_or("")
+                    ).unwrap() == serde_json::json!({"city": "北京"})
         ));
 
-        // 完成：结束原因 + 用量（thought 并入 completion）
+        // 同一 chunk 里的并行调用要有不同下标
         let events = adapter
             .parse_stream_event(
-                r#"{"event_type":"interaction.completed","interaction":{"status":"completed","steps":[{"type":"model_output"}],"usage":{"total_input_tokens":10,"total_output_tokens":5,"total_thought_tokens":7,"total_tokens":22}}}"#,
+                r#"{"candidates":[{"content":{"parts":[
+                    {"functionCall":{"name":"a","args":{}}},
+                    {"functionCall":{"name":"b","args":{}}}
+                ]}}]}"#,
+            )
+            .unwrap();
+        assert!(matches!(
+            &events[0],
+            StreamEvent::Delta { tool_calls, .. } if tool_calls[0].index == 0
+        ));
+        assert!(matches!(
+            &events[1],
+            StreamEvent::Delta { tool_calls, .. } if tool_calls[0].index == 1
+        ));
+
+        // 结束原因 + 用量（thought 并入 completion）
+        let events = adapter
+            .parse_stream_event(
+                r#"{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"thoughtsTokenCount":7,"totalTokenCount":22}}"#,
             )
             .unwrap();
         assert_eq!(events.len(), 2);
         assert!(matches!(
             &events[0],
-            StreamEvent::Finish {
-                finish_reason: FinishReason::Stop
-            }
+            StreamEvent::Finish { finish_reason: FinishReason::Stop }
         ));
         assert!(
             matches!(&events[1], StreamEvent::Usage(u) if u.prompt_tokens == 10 && u.completion_tokens == 12),
             "thought tokens 要并入 completion 参与计费"
         );
 
-        // function_call 存在时：先补发权威快照，再给 ToolCalls 结束原因
+        // 安全拦截 → content_filter
         let events = adapter
             .parse_stream_event(
-                r#"{"event_type":"interaction.completed","interaction":{"status":"completed","steps":[{"type":"function_call","id":"c1","name":"f","arguments":{"city":"北京"}}]}}"#,
+                r#"{"candidates":[{"finishReason":"SAFETY"}]}"#,
             )
             .unwrap();
-        assert_eq!(events.len(), 3);
         assert!(matches!(
             &events[0],
-            StreamEvent::Snapshot { tool_calls } if tool_calls.len() == 1 && tool_calls[0].name == "f"
-        ));
-        assert!(matches!(
-            &events[1],
-            StreamEvent::Finish {
-                finish_reason: FinishReason::ToolCalls
-            }
+            StreamEvent::Finish { finish_reason: FinishReason::ContentFilter }
         ));
 
-        // 非正常状态 → content_filter
-        let events = adapter
-            .parse_stream_event(
-                r#"{"event_type":"interaction.completed","interaction":{"status":"blocked","steps":[]}}"#,
-            )
-            .unwrap();
-        assert!(matches!(
-            &events[0],
-            StreamEvent::Finish {
-                finish_reason: FinishReason::ContentFilter
-            }
-        ));
+        // 流里的错误载荷
+        assert!(adapter
+            .parse_stream_event(r#"{"error":{"message":"API key not valid"}}"#)
+            .is_err());
     }
 
     #[test]
     fn chat_response_extracts_text_and_tool_calls() {
         let adapter = GoogleAdapter;
         let body = serde_json::json!({
-            "id": "abc",
-            "status": "completed",
-            "steps": [
-                {"type": "model_output", "content": [{"type": "text", "text": "今天"}]},
-                {"type": "model_output", "content": [{"type": "text", "text": "晴朗"}]},
-                {"type": "function_call", "id": "c1", "name": "get_weather", "arguments": {"city": "北京"}}
-            ],
-            "usage": {"total_input_tokens": 8, "total_output_tokens": 3, "total_thought_tokens": 1, "total_tokens": 12}
+            "candidates": [{
+                "content": { "parts": [
+                    { "text": "今天" },
+                    { "functionCall": { "id": "c1", "name": "get_weather", "args": { "city": "北京" } } }
+                ]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": { "promptTokenCount": 8, "candidatesTokenCount": 3, "thoughtsTokenCount": 1, "totalTokenCount": 12 }
         });
 
         let response = adapter.parse_chat(&body).unwrap();
         assert!(matches!(response.finish_reason, FinishReason::ToolCalls));
-        assert_eq!(response.content.len(), 2);
+        assert_eq!(response.content.len(), 1);
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].name, "get_weather");
+        assert_eq!(response.tool_calls[0].arguments, r#"{"city":"北京"}"#);
         assert_eq!(response.usage.prompt_tokens, 8);
         assert_eq!(
             response.usage.completion_tokens, 4,
@@ -785,9 +805,31 @@ mod tests {
     }
 
     #[test]
-    fn error_shape_is_recognized() {
+    fn probe_and_models_share_the_listing_endpoint() {
         let adapter = GoogleAdapter;
-        let body = serde_json::json!({"error": {"message": "API key not valid"}});
-        assert!(adapter.parse_chat(&body).is_err());
+        let probe = adapter.build_probe();
+        assert_eq!(probe.path, "/v1beta/models");
+        assert!(probe.body.is_none());
+
+        let body = serde_json::json!({
+            "models": [
+                { "name": "models/gemini-3.5-flash" },
+                { "name": "models/gemini-3.5-pro" }
+            ]
+        });
+        assert_eq!(
+            adapter.parse_models(&body),
+            vec!["gemini-3.5-flash".to_string(), "gemini-3.5-pro".to_string()]
+        );
+
+        // 401 → 密钥无效；429 → 暂时性问题
+        assert!(matches!(
+            adapter.parse_probe(401, &serde_json::json!({"error": {"message": "bad key"}})),
+            ProbeOutcome::Invalid(_)
+        ));
+        assert!(matches!(
+            adapter.parse_probe(429, &serde_json::json!({})),
+            ProbeOutcome::Transient(_)
+        ));
     }
 }

@@ -233,10 +233,13 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
 }
 ```
 
-- `api_format`：`openai` | `google` | `anthropic`。`google` 走 v1beta **Interactions API**
-  （`POST /v1beta/interactions`，带 `api-revision` 版本头），流式与非流式同一个端点，
-  区别在 body 的 `stream` 字段；工具调用受严格限制——输入里不允许出现
-  `function_call`/`function_result`，工具结果会以 `[Tool {name} result]` 文本折回 `user_input`。
+- `api_format`：`openai` | `google` | `anthropic`。`google` 走 v1beta **generateContent**
+  （非流式 `POST /v1beta/models/{model}:generateContent`，流式
+  `POST /v1beta/models/{model}:streamGenerateContent?alt=sse`），多轮工具对话按
+  new-api 的方式回放：assistant 的 functionCall 原样回放并携带官方哨兵
+  thoughtSignature（`context_engineering_is_the_way_to_go`，每条 assistant 消息最多
+  一处：functionCall → Markdown 图片 → 首个文本），工具结果以 functionResponse 挂在
+  `role:"user"` 的 content 里（连续结果合并进同一条）。
 - **`id` 只允许小写字母、数字、点、下划线、连字符**（≤ 64 字符）。它会被当作
   请求里模型名的前缀（`块id/模型名`），含 `/` 或空格会直接破坏那条解析规则。
 - `models[]`：本块对外接受的模型；`forward` 缺省表示同名转发；
