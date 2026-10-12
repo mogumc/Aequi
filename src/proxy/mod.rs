@@ -732,19 +732,21 @@ pub async fn chat_completion_stream(
                 .await;
         }
 
-        // 计费：上游报的用量聚合；没报就按聚合出来的文本估算。
+        // 计费：上游报的用量聚合；缺哪一项就用本地估算补哪一项。
         // 思考也是输出成本——估算路径把推理与正文拼在一起算，
         // 与上游 usage 里 completion 已含 reasoning 的口径一致。
         //
         // 客户端中途断开走到这里时，上游多半没能发出 usage（usage 一般在
-        // 流的末尾），于是走估算：已产出的文本一个字都不会少算。
-        let mut usage = usage_acc;
-        if usage.total_tokens == 0 {
-            let output = format!("{reasoning_acc}{text_acc}");
-            usage = estimate::estimate_usage(&request, &output);
-        } else {
-            usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
-        }
+        // 流的末尾），于是走补齐：已产出的文本一个字都不会少算。
+        let output = format!("{reasoning_acc}{text_acc}");
+        let usage = estimate::complete_usage(
+            usage_acc.prompt_tokens,
+            usage_acc.completion_tokens,
+            usage_acc.total_tokens,
+            usage_acc.cache_tokens,
+            &request,
+            &output,
+        );
 
         match billing::charge(pool, &key, &block_id, &model, usage, multiplier_bp, true).await {
             Ok(charge) => {
@@ -934,13 +936,17 @@ async fn dispatch(
                 };
                 upstream::report_success(pool, &upstream_key.id).await;
 
-                // 上游没报用量就用本地估算补齐，记账不能被钻空子。
-                // 估算口径含推理文本——思考模型的思考部分不是免费的。
-                let usage = if response.usage.total_tokens == 0 {
-                    estimate::estimate_usage(request, &response.output_for_estimate())
-                } else {
-                    response.usage
-                };
+                // 上游没报用量、或只报了一半，就用本地估算补齐缺的那项，
+                // 记账不能被钻空子。估算口径含推理文本——思考模型的思考
+                // 部分不是免费的。
+                let usage = estimate::complete_usage(
+                    response.usage.prompt_tokens,
+                    response.usage.completion_tokens,
+                    response.usage.total_tokens,
+                    response.usage.cache_tokens,
+                    request,
+                    &response.output_for_estimate(),
+                );
 
                 let charge = match billing::charge(
                     pool,
