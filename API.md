@@ -332,7 +332,7 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
   "retention_days": 7,
   "records": [
     {
-      "id": 3, "model": "gpt-4o", "status": "success",
+      "id": 3, "model": "gpt-4o", "block_id": "block-a", "status": "success",
       "prompt_tokens": 30, "completion_tokens": 10, "cache_tokens": 7,
       "estimated": false, "stream": false,
       "raw_tokens": 40, "multiplier": "1.00", "final_tokens": 40, "credits": "0.0040",
@@ -348,6 +348,13 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
 `log_retention_days`（默认 7 天，1-365 可调）决定，过期由后台任务回收；
 响应里的 `retention_days` 就是当前生效值——**汇总与明细都只是这段窗口
 内的数据**，前端应据此注明统计口径。
+
+`block_id` 是**这次请求实际命中的上游块**（路由快照）。只写模型名、不带块前缀的
+请求会在提供该模型的块之间加权轮询，落点执行时才知道、事后算不出来，所以记账时
+记下来。它可能为 `null`：一是本次特性上线**之前的老记录**，二是**选中块之前**
+就失败的请求（如模型名解析不出来、余额不足被拦下）。块 id 对密钥持有者不是秘密
+——它就是 `块/模型` 调用写法的前缀，`/api/key/models` 本来就给出。
+上游密钥、来源 IP、User-Agent 依旧不出这个接口，只在管理员的 `/api/logs` 里。
 
 失败请求同样出现在 `records` 里（`status: "error"`、token 与积分为 0、`error` 为一句脱敏描述：上游错误只给「上游响应异常」或「上游响应异常: 返回 {status}」，不包含上游报错原文；原话与内部细节只在管理员的 `/api/logs` 里）。
 

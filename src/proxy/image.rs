@@ -135,6 +135,8 @@ async fn dispatch_entry(
             Ok(outcome.response)
         }
         Err(failure) => {
+            // 块 id 要先取出来——`.failed_with_context()` 会把它移走。
+            let failed_block = failure.context.as_ref().map(|(block, _)| block.clone());
             write_log(
                 pool,
                 base_log(key, ip, user_agent, started)
@@ -147,6 +149,7 @@ async fn dispatch_entry(
                 pool,
                 &key.id,
                 &model,
+                failed_block.as_deref(),
                 &failure.user_message,
                 false,
                 time::now_secs(),
