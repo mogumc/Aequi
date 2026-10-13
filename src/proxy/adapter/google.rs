@@ -138,23 +138,10 @@ impl Adapter for GoogleAdapter {
         }
 
         // usageMetadata 在收尾 chunk 里；thought 是真实的输出成本，计费时并入。
+        // 流式响应里 Google 会在每个 chunk 都带一份**累计**的 usageMetadata，
+        // 编排层按字段取最大值合并（`merge_usage`），重复出现不会累加。
         if let Some(usage) = value.get("usageMetadata") {
-            let prompt = usage
-                .get("promptTokenCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let output = usage
-                .get("candidatesTokenCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let thought = usage
-                .get("thoughtsTokenCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            events.push(StreamEvent::Usage(Usage::new(
-                prompt as i64,
-                (output + thought) as i64,
-            )));
+            events.push(StreamEvent::Usage(parse_usage(Some(usage))));
         }
 
         Ok(events)
@@ -222,19 +209,7 @@ impl Adapter for GoogleAdapter {
             _ => FinishReason::Stop,
         };
 
-        let usage = body.get("usageMetadata");
-        let prompt = usage
-            .and_then(|u| u.get("promptTokenCount"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let output = usage
-            .and_then(|u| u.get("candidatesTokenCount"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let thought = usage
-            .and_then(|u| u.get("thoughtsTokenCount"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let usage = parse_usage(body.get("usageMetadata"));
 
         Ok(ChatResponse {
             model: String::new(),
@@ -242,7 +217,7 @@ impl Adapter for GoogleAdapter {
             reasoning,
             tool_calls,
             finish_reason,
-            usage: Usage::new(prompt as i64, (output + thought) as i64),
+            usage,
         })
     }
 
@@ -284,6 +259,51 @@ fn finish_reason(reason: &str) -> FinishReason {
         "MAX_TOKENS" => FinishReason::Length,
         "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "SPII" => FinishReason::ContentFilter,
         _ => FinishReason::Stop,
+    }
+}
+
+/// 解析 `usageMetadata`。
+///
+/// 字段名与 OpenAI 完全不同，逐项对应关系：
+/// - `promptTokenCount`：**输入总量**。官方文档明确「cachedContent 命中时它
+///   仍然是完整有效的提示规模，即包含缓存内容的部分」——与 OpenAI 的
+///   `prompt_tokens_details.cached_tokens`、Anthropic 的
+///   `cache_read_input_tokens` 是同一口径（缓存 ⊆ 输入）。所以缓存只作
+///   分解记录，不再重复加进总数。
+/// - `cachedContentTokenCount`：命中缓存的输入部分。**此前整个适配器都没读它**，
+///   于是缓存列恒为 0、缓存率恒为 0%（计费不受影响，缓存本来就不参与折扣）。
+/// - `thoughtsTokenCount`：思考模型的推理 token，是真实的输出成本，并入 completion。
+///
+/// 总数沿用既有口径「输入 + 输出(含思考)」，不用上游的 `totalTokenCount`——
+/// 后者还含 `toolUsePromptTokenCount`，改口径会动到计费，不在这轮范围内。
+fn parse_usage(value: Option<&Value>) -> Usage {
+    let Some(value) = value else {
+        return Usage::default();
+    };
+
+    let prompt = value
+        .get("promptTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output = value
+        .get("candidatesTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let thought = value
+        .get("thoughtsTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached = value
+        .get("cachedContentTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    Usage {
+        prompt_tokens: prompt as i64,
+        completion_tokens: (output + thought) as i64,
+        total_tokens: (prompt + output + thought) as i64,
+        cache_tokens: cached as i64,
+        estimated: false,
     }
 }
 
@@ -1057,10 +1077,10 @@ mod tests {
             StreamEvent::Delta { tool_calls, .. } if tool_calls[0].index == 1
         ));
 
-        // 结束原因 + 用量（thought 并入 completion）
+        // 结束原因 + 用量（thought 并入 completion，缓存命中单独记）
         let events = adapter
             .parse_stream_event(
-                r#"{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"thoughtsTokenCount":7,"totalTokenCount":22}}"#,
+                r#"{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"thoughtsTokenCount":7,"cachedContentTokenCount":6,"totalTokenCount":22}}"#,
             )
             .unwrap();
         assert_eq!(events.len(), 2);
@@ -1069,8 +1089,11 @@ mod tests {
             StreamEvent::Finish { finish_reason: FinishReason::Stop }
         ));
         assert!(
-            matches!(&events[1], StreamEvent::Usage(u) if u.prompt_tokens == 10 && u.completion_tokens == 12),
-            "thought tokens 要并入 completion 参与计费"
+            matches!(&events[1], StreamEvent::Usage(u)
+                if u.prompt_tokens == 10
+                    && u.completion_tokens == 12
+                    && u.cache_tokens == 6),
+            "thought tokens 要并入 completion 参与计费；缓存命中来自 cachedContentTokenCount"
         );
 
         // 安全拦截 → content_filter
@@ -1141,7 +1164,7 @@ mod tests {
                 ]},
                 "finishReason": "STOP"
             }],
-            "usageMetadata": { "promptTokenCount": 8, "candidatesTokenCount": 3, "thoughtsTokenCount": 1, "totalTokenCount": 12 }
+            "usageMetadata": { "promptTokenCount": 8, "candidatesTokenCount": 3, "thoughtsTokenCount": 1, "cachedContentTokenCount": 5, "totalTokenCount": 12 }
         });
 
         let response = adapter.parse_chat(&body).unwrap();
@@ -1155,6 +1178,28 @@ mod tests {
             response.usage.completion_tokens, 4,
             "thought 并入 completion"
         );
+        assert_eq!(
+            response.usage.cache_tokens, 5,
+            "非流式同样要读出 cachedContentTokenCount"
+        );
+        // 缓存是输入的一部分，不能再加进总数（8 + 3 + 1 = 12）
+        assert_eq!(response.usage.total_tokens, 12);
+    }
+
+    #[test]
+    fn usage_without_cache_field_stays_zero() {
+        // 未开启上下文缓存时 Google 不带这个字段，不能因此报错或写脏值。
+        let response = GoogleAdapter
+            .parse_chat(&serde_json::json!({
+                "candidates": [{
+                    "content": { "parts": [{ "text": "hi" }] },
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 2 }
+            }))
+            .unwrap();
+        assert_eq!(response.usage.cache_tokens, 0);
+        assert_eq!(response.usage.total_tokens, 7);
     }
 
     #[test]

@@ -365,12 +365,17 @@ mod tests {
             "usageMetadata": {
                 "promptTokenCount": 6,
                 "candidatesTokenCount": 2,
+                "cachedContentTokenCount": 4,
                 "totalTokenCount": 8
             }
         });
 
         let response = adapter_for(ApiFormat::Google).parse_chat(&body).unwrap();
         assert_eq!(response.usage.total_tokens, 8, "总数由两项相补");
+        assert_eq!(
+            response.usage.cache_tokens, 4,
+            "缓存命中在 cachedContentTokenCount，且已含在输入内，不重复计入总数"
+        );
         assert_eq!(response.finish_reason, FinishReason::Stop);
     }
 
