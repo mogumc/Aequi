@@ -60,6 +60,7 @@ impl TestApp {
                         multiplier_bp: 10_000,
                     })
                     .collect(),
+                headers: Vec::new(),
             },
         )
         .await

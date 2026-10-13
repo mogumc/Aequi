@@ -69,6 +69,7 @@ impl TestApp {
                     forward: None,
                     multiplier_bp: 10_000,
                 }],
+                headers: Vec::new(),
             },
         )
         .await

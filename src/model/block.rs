@@ -63,6 +63,22 @@ impl ModelEntry {
     }
 }
 
+/// 一个自定义请求头。
+///
+/// 有些上游（自建网关、中转站、企业版接口）会要求额外的头才能用：
+/// 指定版本的 `anthropic-version`、租户/组织的 `OpenAI-Organization`、
+/// 网关自己的路由头，或者把认证整条换成只认某种写法的 `Authorization`。
+/// 这些都不该逼着用户去改代码，所以按块配置。
+///
+/// 校验都在写入口（`service::upstream::normalize_headers`）做一次：头名与头值必须
+/// 能构成合法的 HTTP 头、同名不许配两遍、`content-length` 这类由 HTTP 栈自己管的
+/// 头不许配。这里只是记录口径，判断不在这儿。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeaderEntry {
+    pub name: String,
+    pub value: String,
+}
+
 /// 一个上游块。
 #[derive(Debug, Clone)]
 pub struct UpstreamBlock {
@@ -76,6 +92,11 @@ pub struct UpstreamBlock {
     pub proxy: Option<String>,
     /// 本块接受并转发的模型。
     pub models: Vec<ModelEntry>,
+    /// 每次发往该上游都额外带上的请求头。空数组表示不加。
+    ///
+    /// 生效范围是整块：对话、生图、密钥探测与拉取模型走同一个出口，
+    /// 所以「探测通过」与「真实请求能通」始终是同一个条件。
+    pub headers: Vec<HeaderEntry>,
     pub enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -182,6 +203,8 @@ pub struct BlockView {
     pub base_url: String,
     pub proxy: Option<String>,
     pub models: Vec<ModelEntry>,
+    /// 自定义请求头（明文——与上游密钥同一套取舍，管理员要能取回来核对）。
+    pub headers: Vec<HeaderEntry>,
     pub enabled: bool,
     /// 密钥总数。
     pub key_count: usize,
@@ -223,6 +246,9 @@ pub struct BlockCreate {
     pub proxy: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelEntry>,
+    /// 自定义请求头，缺省为空。
+    #[serde(default)]
+    pub headers: Vec<HeaderEntry>,
 }
 
 /// 更新块的请求体。只提交需要改的字段。
@@ -236,6 +262,10 @@ pub struct BlockUpdate {
     #[serde(default, deserialize_with = "double_option")]
     pub proxy: Option<Option<String>>,
     pub models: Option<Vec<ModelEntry>>,
+    /// 整份替换：传 `[]` 表示清空，不传则保持原值。
+    ///
+    /// 不做「按名字逐条合并」——头是有序配置，合并规则只会让人猜不到结果。
+    pub headers: Option<Vec<HeaderEntry>>,
     pub enabled: Option<bool>,
 }
 

@@ -7,7 +7,7 @@
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
-use crate::model::{ApiFormat, KeyStatus, ModelEntry, UpstreamBlock, UpstreamKey};
+use crate::model::{ApiFormat, HeaderEntry, KeyStatus, ModelEntry, UpstreamBlock, UpstreamKey};
 
 fn map_block(row: &SqliteRow) -> UpstreamBlock {
     UpstreamBlock {
@@ -19,6 +19,7 @@ fn map_block(row: &SqliteRow) -> UpstreamBlock {
         base_url: row.get("base_url"),
         proxy: row.get("proxy"),
         models: parse_models(row.get("models")),
+        headers: parse_headers(row.get("headers")),
         enabled: row.get::<i64, _>("enabled") != 0,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
@@ -28,6 +29,18 @@ fn map_block(row: &SqliteRow) -> UpstreamBlock {
 /// 模型列表以 JSON 存储，损坏时退回空列表——块还在，只是暂时不接模型。
 fn parse_models(raw: String) -> Vec<ModelEntry> {
     serde_json::from_str::<Vec<ModelEntry>>(&raw).unwrap_or_default()
+}
+
+/// 自定义请求头同样以 JSON 存储，损坏时退回空列表——宁可少带几个头，
+/// 也不该让整个块（连同它的全部密钥）因为一行坏数据就取不出来。
+///
+/// 读成 `Option<String>` 而不是 `String`：这一列是 `NOT NULL DEFAULT '[]'`，
+/// 正常读不到 NULL。留着这条容错是上一条原则的延伸——真碰上（库被人手改过、
+/// 或以后把列改成可空）也只是当作「没有自定义头」，而不是在 map_block 里
+/// 解码失败把整个 list_blocks 炸掉。
+fn parse_headers(raw: Option<String>) -> Vec<HeaderEntry> {
+    raw.and_then(|text| serde_json::from_str::<Vec<HeaderEntry>>(&text).ok())
+        .unwrap_or_default()
 }
 
 fn map_key(row: &SqliteRow) -> UpstreamKey {
@@ -50,8 +63,8 @@ fn map_key(row: &SqliteRow) -> UpstreamKey {
 pub async fn insert_block(pool: &SqlitePool, block: &UpstreamBlock) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO upstream_blocks \
-         (id, name, api_format, weight, base_url, proxy, models, enabled, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, name, api_format, weight, base_url, proxy, models, headers, enabled, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&block.id)
     .bind(&block.name)
@@ -60,6 +73,7 @@ pub async fn insert_block(pool: &SqlitePool, block: &UpstreamBlock) -> Result<()
     .bind(&block.base_url)
     .bind(&block.proxy)
     .bind(serde_json::to_string(&block.models).unwrap_or_else(|_| "[]".to_string()))
+    .bind(serde_json::to_string(&block.headers).unwrap_or_else(|_| "[]".to_string()))
     .bind(i64::from(block.enabled))
     .bind(block.created_at)
     .bind(block.updated_at)
@@ -72,7 +86,7 @@ pub async fn insert_block(pool: &SqlitePool, block: &UpstreamBlock) -> Result<()
 pub async fn update_block(pool: &SqlitePool, block: &UpstreamBlock) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE upstream_blocks \
-         SET name = ?, api_format = ?, weight = ?, base_url = ?, proxy = ?, models = ?, enabled = ?, updated_at = ? \
+         SET name = ?, api_format = ?, weight = ?, base_url = ?, proxy = ?, models = ?, headers = ?, enabled = ?, updated_at = ? \
          WHERE id = ?",
     )
     .bind(&block.name)
@@ -81,6 +95,7 @@ pub async fn update_block(pool: &SqlitePool, block: &UpstreamBlock) -> Result<()
     .bind(&block.base_url)
     .bind(&block.proxy)
     .bind(serde_json::to_string(&block.models).unwrap_or_else(|_| "[]".to_string()))
+    .bind(serde_json::to_string(&block.headers).unwrap_or_else(|_| "[]".to_string()))
     .bind(i64::from(block.enabled))
     .bind(block.updated_at)
     .bind(&block.id)
@@ -91,12 +106,12 @@ pub async fn update_block(pool: &SqlitePool, block: &UpstreamBlock) -> Result<()
 
 /// 按 ID 查块。
 const SQL_FIND_BLOCK: &str = "\
-SELECT id, name, api_format, weight, base_url, proxy, models, enabled, created_at, updated_at \
+SELECT id, name, api_format, weight, base_url, proxy, models, headers, enabled, created_at, updated_at \
 FROM upstream_blocks WHERE id = ?";
 
 /// 全部块。
 const SQL_LIST_BLOCKS: &str = "\
-SELECT id, name, api_format, weight, base_url, proxy, models, enabled, created_at, updated_at \
+SELECT id, name, api_format, weight, base_url, proxy, models, headers, enabled, created_at, updated_at \
 FROM upstream_blocks ORDER BY created_at, id";
 
 /// 某块的全部密钥。

@@ -15,8 +15,8 @@ use sqlx::SqlitePool;
 use crate::db;
 use crate::error::{Error, Result};
 use crate::model::{
-    ApiKey, BlockCreate, BlockUpdate, BlockView, KeyStatus, ModelEntry, UpstreamBlock, UpstreamKey,
-    UpstreamKeyCreate, UpstreamKeyView,
+    ApiKey, BlockCreate, BlockUpdate, BlockView, HeaderEntry, KeyStatus, ModelEntry, UpstreamBlock,
+    UpstreamKey, UpstreamKeyCreate, UpstreamKeyView,
 };
 use crate::proxy;
 use crate::proxy::adapter::{ProbeOutcome, adapter_for};
@@ -197,6 +197,91 @@ fn validate_models(models: &[ModelEntry]) -> Result<()> {
     Ok(())
 }
 
+/// 自定义请求头的条数上限。
+///
+/// 只是防呆：正常上游要的是三两个头，32 已经远超需要，但能挡住
+/// 「整坨 JSON 粘进来」这种配置事故——那会让每条请求都拖着几十个头出门。
+const MAX_HEADERS: usize = 32;
+
+/// 单个头值的字符数上限。同样是防呆，不是协议限制。
+const MAX_HEADER_VALUE_LEN: usize = 4096;
+
+/// 不允许配置的头。
+///
+/// 这些由 HTTP 栈自己管（请求体长度、连接语义、升级协商），配了只会让
+/// 请求畸形、或者让上游行为变得无从解释——浏览器的 fetch 也禁掉同一批。
+/// 其余一律放行：`host`、乃至整条 `authorization`（有的上游就是要这种写法）
+/// 都是真实存在的需求，由配置者自己负责。
+const FORBIDDEN_HEADERS: &[&str] = &[
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "upgrade",
+    "expect",
+    "te",
+    "trailer",
+    "keep-alive",
+];
+
+/// 校验并归一化自定义请求头。
+///
+/// 在保存前跑一次，脏数据不进库——而且**校验与发送用的是同一套 HTTP 头类型**
+/// （[`reqwest::header`] 就是 http crate 的那一套），所以这里放行的东西
+/// 发请求时一定塞得进去，不会出现「存下来了但发不出去」。
+///
+/// 归一化 = 名字与值都去掉首尾空白（粘贴进来的多半带着）；校验三条，
+/// 都是「现在挡住、否则事后很难查」的：
+///
+/// - 名字与值必须能构成一个合法的 HTTP 头（`\r\n` 之类直接构成头注入）；
+/// - 同一个名字不许配两遍：应用时按名字覆盖，配两遍就说不清哪条生效；
+/// - 不许配由 HTTP 栈自己管的头（见 [`FORBIDDEN_HEADERS`]）。
+fn normalize_headers(headers: Vec<HeaderEntry>) -> Result<Vec<HeaderEntry>> {
+    if headers.len() > MAX_HEADERS {
+        return Err(Error::BadRequest(format!(
+            "自定义请求头最多 {MAX_HEADERS} 条"
+        )));
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(headers.len());
+    let mut normalized = Vec::with_capacity(headers.len());
+
+    for entry in headers {
+        let name = entry.name.trim().to_string();
+        let value = entry.value.trim().to_string();
+
+        if name.is_empty() {
+            return Err(Error::BadRequest("请求头名不能为空".to_string()));
+        }
+        let parsed = reqwest::header::HeaderName::try_from(name.as_str())
+            .map_err(|_| Error::BadRequest(format!("请求头名不合法: {name}")))?;
+        if reqwest::header::HeaderValue::try_from(value.as_str()).is_err() {
+            return Err(Error::BadRequest(format!(
+                "请求头 {name} 的值不合法（不能含换行等控制字符）"
+            )));
+        }
+        if value.chars().count() > MAX_HEADER_VALUE_LEN {
+            return Err(Error::BadRequest(format!(
+                "请求头 {name} 的值不能超过 {MAX_HEADER_VALUE_LEN} 个字符"
+            )));
+        }
+
+        // 头名大小写不敏感，去重与禁用名单都按小写比对。
+        let lower = parsed.as_str().to_string();
+        if FORBIDDEN_HEADERS.contains(&lower.as_str()) {
+            return Err(Error::BadRequest(format!(
+                "请求头 {name} 由 HTTP 栈自己管理，不能配在块上"
+            )));
+        }
+        if !seen.insert(lower) {
+            return Err(Error::BadRequest(format!("请求头 {name} 配置了多次")));
+        }
+
+        normalized.push(HeaderEntry { name, value });
+    }
+
+    Ok(normalized)
+}
+
 /// 该密钥当前可用的模型名，含**短名**与**带块前缀的全名**两种写法。
 ///
 /// 短名（`gpt-4o`）在该密钥**被允许的**那些块之间加权轮询；全名
@@ -284,7 +369,7 @@ pub async fn fetch_models(
         &adapter.build_probe(),
         adapter.auth_style(),
         &key.secret,
-    );
+    )?;
 
     let response = request
         .send()
@@ -329,6 +414,7 @@ pub async fn create_block(pool: &SqlitePool, payload: BlockCreate) -> Result<Ups
         return Err(Error::BadRequest("base_url 不能为空".to_string()));
     }
     validate_models(&payload.models)?;
+    let headers = normalize_headers(payload.headers)?;
 
     let now = time::now_secs();
     let block = UpstreamBlock {
@@ -339,6 +425,7 @@ pub async fn create_block(pool: &SqlitePool, payload: BlockCreate) -> Result<Ups
         base_url: payload.base_url.trim().trim_end_matches('/').to_string(),
         proxy: payload.proxy,
         models: payload.models,
+        headers,
         enabled: true,
         created_at: now,
         updated_at: now,
@@ -370,12 +457,18 @@ pub async fn update_block(
         base_url,
         proxy,
         models,
+        headers,
         enabled,
     } = patch;
 
     if let Some(models) = &models {
         validate_models(models)?;
     }
+    // 整份替换：传 `[]` 就是清空，不做按名字的增量合并（那是猜）。
+    let headers = match headers {
+        Some(headers) => Some(normalize_headers(headers)?),
+        None => None,
+    };
 
     let current = get_block(pool, id).await?;
     let mut block = current;
@@ -397,6 +490,9 @@ pub async fn update_block(
     }
     if let Some(models) = models {
         block.models = models;
+    }
+    if let Some(headers) = headers {
+        block.headers = headers;
     }
     if let Some(enabled) = enabled {
         block.enabled = enabled;
@@ -461,6 +557,7 @@ async fn block_view_of(pool: &SqlitePool, block: &UpstreamBlock) -> Result<Block
         base_url: block.base_url.clone(),
         proxy: block.proxy.clone(),
         models: block.models.clone(),
+        headers: block.headers.clone(),
         enabled: block.enabled,
         key_count: keys.len(),
         available_keys: available,
@@ -933,4 +1030,80 @@ fn view_key(key: &UpstreamKey) -> UpstreamKeyView {
 pub async fn list_keys(pool: &SqlitePool, block_id: &str) -> Result<Vec<UpstreamKeyView>> {
     let keys = db::block::list_keys(pool, block_id).await?;
     Ok(keys.iter().map(view_key).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(name: &str, value: &str) -> HeaderEntry {
+        HeaderEntry {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn headers_are_trimmed_and_kept_in_order() {
+        // 粘贴进来的名字和值多半带着空白；顺手去掉，别让它变成上游看到的怪值。
+        let normalized = normalize_headers(vec![
+            header("  X-Tenant  ", "  demo-tenant  "),
+            header("anthropic-version", "2099-01-01"),
+        ])
+        .expect("合法头应当通过");
+
+        assert_eq!(normalized[0].name, "X-Tenant");
+        assert_eq!(normalized[0].value, "demo-tenant");
+        assert_eq!(normalized[1].name, "anthropic-version", "顺序即配置顺序");
+    }
+
+    #[test]
+    fn duplicate_header_names_are_rejected() {
+        // 头名大小写不敏感，`X-Tenant` 与 `x-tenant` 是同一个头。
+        let error = normalize_headers(vec![header("X-Tenant", "a"), header("x-tenant", "b")])
+            .expect_err("同名头必须被拒");
+        assert!(
+            error.to_string().contains("配置了多次"),
+            "错误要说清是哪条、为什么: {error}"
+        );
+    }
+
+    #[test]
+    fn headers_owned_by_the_http_stack_are_rejected() {
+        for name in ["Content-Length", "transfer-encoding", "Connection"] {
+            let error = normalize_headers(vec![header(name, "1")]).expect_err("这类头必须被拒");
+            assert!(
+                error.to_string().contains("HTTP 栈"),
+                "{name} 的错误文案要指出是 HTTP 栈管的: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn headers_that_cannot_be_sent_are_rejected() {
+        // 头注入就在这里挡住：值里的换行能凭空造出一个新头。
+        assert!(
+            normalize_headers(vec![header("X-Tenant", "bad\nvalue")]).is_err(),
+            "值里带换行必须被拒"
+        );
+        assert!(
+            normalize_headers(vec![header("", "x")]).is_err(),
+            "空头名必须被拒"
+        );
+        assert!(
+            normalize_headers(vec![header("X Bad", "x")]).is_err(),
+            "头名里有空格必须被拒"
+        );
+    }
+
+    #[test]
+    fn too_many_headers_are_rejected() {
+        let many = (0..=MAX_HEADERS)
+            .map(|index| header(&format!("X-Demo-{index}"), "1"))
+            .collect();
+        assert!(
+            normalize_headers(many).is_err(),
+            "超过 {MAX_HEADERS} 条要挡住，免得整坨 JSON 粘进来"
+        );
+    }
 }
