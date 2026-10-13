@@ -265,17 +265,22 @@ fn finish_reason(reason: &str) -> FinishReason {
 /// 解析 `usageMetadata`。
 ///
 /// 字段名与 OpenAI 完全不同，逐项对应关系：
-/// - `promptTokenCount`：**输入总量**。官方文档明确「cachedContent 命中时它
-///   仍然是完整有效的提示规模，即包含缓存内容的部分」——与 OpenAI 的
+/// - `promptTokenCount`：**文本/多模态输入**。官方文档明确「cachedContent 命中时
+///   它仍然是完整有效的提示规模，即包含缓存内容的部分」——与 OpenAI 的
 ///   `prompt_tokens_details.cached_tokens`、Anthropic 的
-///   `cache_read_input_tokens` 是同一口径（缓存 ⊆ 输入）。所以缓存只作
-///   分解记录，不再重复加进总数。
-/// - `cachedContentTokenCount`：命中缓存的输入部分。**此前整个适配器都没读它**，
-///   于是缓存列恒为 0、缓存率恒为 0%（计费不受影响，缓存本来就不参与折扣）。
+///   `cache_read_input_tokens` 是同一口径（缓存 ⊆ 输入），所以缓存只作分解记录。
+/// - `cachedContentTokenCount`：命中缓存的输入部分，单独记入 `cache_tokens`。
+/// - `toolUsePromptTokenCount`：**工具执行结果回灌给模型的输入**。
+///   注意它**不在** `promptTokenCount` 里——官方 `totalTokenCount` 的定义是
+///   `prompt + candidates + toolUsePrompt + thoughts` 四项相加，若它是子集，
+///   公式就会重复计数。所以必须自己并入输入，否则多轮 function calling 的这部分
+///   输入既不计费、也不进任何统计（与缓存漏读同一类问题）。
+///   它**不并入输出**（不是模型生成的内容），**也不算缓存**（不是缓存命中）。
+///   另两家本就把工具结果算在输入里（OpenAI 的 messages、Anthropic 的
+///   tool_result），并入是为了三家口径一致。
 /// - `thoughtsTokenCount`：思考模型的推理 token，是真实的输出成本，并入 completion。
 ///
-/// 总数沿用既有口径「输入 + 输出(含思考)」，不用上游的 `totalTokenCount`——
-/// 后者还含 `toolUsePromptTokenCount`，改口径会动到计费，不在这轮范围内。
+/// 总数沿用「输入(含工具) + 输出(含思考)」，与 `complete_usage` 的兜底口径一致。
 fn parse_usage(value: Option<&Value>) -> Usage {
     let Some(value) = value else {
         return Usage::default();
@@ -283,6 +288,10 @@ fn parse_usage(value: Option<&Value>) -> Usage {
 
     let prompt = value
         .get("promptTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let tool_use = value
+        .get("toolUsePromptTokenCount")
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let output = value
@@ -298,10 +307,13 @@ fn parse_usage(value: Option<&Value>) -> Usage {
         .and_then(Value::as_u64)
         .unwrap_or(0);
 
+    let prompt_tokens = prompt + tool_use;
+    let completion_tokens = output + thought;
+
     Usage {
-        prompt_tokens: prompt as i64,
-        completion_tokens: (output + thought) as i64,
-        total_tokens: (prompt + output + thought) as i64,
+        prompt_tokens: prompt_tokens as i64,
+        completion_tokens: completion_tokens as i64,
+        total_tokens: (prompt_tokens + completion_tokens) as i64,
         cache_tokens: cached as i64,
         estimated: false,
     }
@@ -1200,6 +1212,60 @@ mod tests {
             .unwrap();
         assert_eq!(response.usage.cache_tokens, 0);
         assert_eq!(response.usage.total_tokens, 7);
+    }
+
+    #[test]
+    fn tool_use_prompt_tokens_count_as_input() {
+        // 工具执行结果回灌给模型的输入。官方 `totalTokenCount` 把它与 prompt
+        // **并列为两项**（prompt + candidates + toolUsePrompt + thoughts），
+        // 所以它不在 `promptTokenCount` 里——不自己并入，多轮 function calling
+        // 的这部分输入就整块漏计费、也不进任何 token 统计。
+        let response = GoogleAdapter
+            .parse_chat(&serde_json::json!({
+                "candidates": [{
+                    "content": { "parts": [{ "text": "ok" }] },
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "toolUsePromptTokenCount": 250,
+                    "candidatesTokenCount": 20,
+                    "totalTokenCount": 370
+                }
+            }))
+            .unwrap();
+
+        assert_eq!(response.usage.prompt_tokens, 350, "工具输入并入输入");
+        assert_eq!(response.usage.completion_tokens, 20, "工具输入不是输出");
+        assert_eq!(response.usage.total_tokens, 370, "与上游 totalTokenCount 对齐");
+        assert_eq!(response.usage.cache_tokens, 0, "工具输入不是缓存命中");
+    }
+
+    #[test]
+    fn tool_use_and_cache_do_not_double_count() {
+        // 工具输入与缓存命中是两条独立的分支：合并进输入的是工具那部分，
+        // 缓存只作分解记录，两者都不能重复计进总数。
+        let response = GoogleAdapter
+            .parse_chat(&serde_json::json!({
+                "candidates": [{
+                    "content": { "parts": [{ "text": "ok" }] },
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "cachedContentTokenCount": 60,
+                    "toolUsePromptTokenCount": 30,
+                    "candidatesTokenCount": 10,
+                    "thoughtsTokenCount": 5,
+                    "totalTokenCount": 145
+                }
+            }))
+            .unwrap();
+
+        assert_eq!(response.usage.prompt_tokens, 130, "输入含缓存与工具");
+        assert_eq!(response.usage.cache_tokens, 60, "缓存单独记，不重复计入总数");
+        assert_eq!(response.usage.completion_tokens, 15, "思考并入输出");
+        assert_eq!(response.usage.total_tokens, 145);
     }
 
     #[test]

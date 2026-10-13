@@ -445,7 +445,7 @@ OpenAI 生图协议，与对话共用认证、调度、重试与双轨日志。
 3. 429 → 该密钥退避 30 秒并换下一把；401/403/5xx、网络故障、200 但响应结构损坏 → 记失败并换下一把；最多 3 次。
 4. 其它 4xx 是请求本身的问题（参数、模型名等），直接透传错误，不重试。
 5. 上游不报 usage 时按本地估算计费（CJK 每字 1 token、其余每 4 字符 1 token、图片每张 1000），估算结果在日志里带 `estimated: true`。
-6. 计费按对外模型名的倍率折算；缓存命中的 token **计入输入、按原价结算**（不做折扣），同时在用量里单独记一份便于算命中率。三家上游的口径已归一：OpenAI 的 `prompt_tokens`、Google 的 `promptTokenCount` 本就含缓存，Anthropic 的 `input_tokens` 不含，适配器会补上 `cache_read_input_tokens + cache_creation_input_tokens`。用量里的 `cache_tokens` 只记**读取命中**的部分——缓存**写入**（Anthropic 的 `cache_creation_input_tokens`、本次请求首次建缓存）要下次请求才可能被读到，本次不属于命中，因此计入输入但不计入 `cache_tokens`。余额为零的密钥在发请求前就被拒绝（402）——**无限额度的密钥除外**，它跳过余额判定但照常记账。
+6. 计费按对外模型名的倍率折算；缓存命中的 token **计入输入、按原价结算**（不做折扣），同时在用量里单独记一份便于算命中率。三家上游的口径已归一，两处易漏的输入都要自己补：**其一**，Anthropic 的 `input_tokens` 不含缓存，适配器会补上 `cache_read_input_tokens + cache_creation_input_tokens`；**其二**，Google 的 `toolUsePromptTokenCount`（工具执行结果回灌给模型的输入）不在 `promptTokenCount` 里——官方 `totalTokenCount` 是 `prompt + candidates + toolUsePrompt + thoughts` 四项相加，故适配器把它并入输入（OpenAI 的工具结果本就在 `messages` 里、Anthropic 的 `tool_result` 本就在 `input_tokens` 里，三家口径一致）。用量里的 `cache_tokens` 只记**读取命中**的部分——缓存**写入**（Anthropic 的 `cache_creation_input_tokens`、本次请求首次建缓存）要下次请求才可能被读到，本次不属于命中，因此计入输入但不计入 `cache_tokens`。余额为零的密钥在发请求前就被拒绝（402）——**无限额度的密钥除外**，它跳过余额判定但照常记账。
 
 ---
 
