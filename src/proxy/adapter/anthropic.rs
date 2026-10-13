@@ -192,12 +192,21 @@ impl Adapter for AnthropicAdapter {
                     });
                 }
 
+                // 与非流式同一个口径：input_tokens 只是未命中缓存的那段，
+                // 三段相加才是完整输入（见 `total_input_tokens`）。
                 let prompt_tokens = value
-                    .pointer("/usage/input_tokens")
-                    .and_then(Value::as_i64)
+                    .pointer("/usage")
+                    .map(total_input_tokens)
                     .unwrap_or(0);
                 let completion_tokens = value
                     .pointer("/usage/output_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                // 新版 API 在 message_delta 里也带累计的缓存字段；老版没有就取 0，
+                // 真正的值来自 message_start（见下），merge_usage 按字段取较大值，
+                // 两处都读不会重复计。只认**读取命中**，写入不算（见 parse_usage）。
+                let cache_tokens = value
+                    .pointer("/usage/cache_read_input_tokens")
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
                 if prompt_tokens > 0 || completion_tokens > 0 {
@@ -205,7 +214,7 @@ impl Adapter for AnthropicAdapter {
                         prompt_tokens,
                         completion_tokens,
                         total_tokens: prompt_tokens + completion_tokens,
-                        cache_tokens: 0,
+                        cache_tokens,
                         estimated: false,
                     }));
                 }
@@ -214,16 +223,24 @@ impl Adapter for AnthropicAdapter {
             }
             // 输入用量在流开头就报了，与 message_delta 的输出分开——编排层聚合。
             Some("message_start") => {
-                let prompt_tokens = value
-                    .pointer("/message/usage/input_tokens")
+                let usage = value.pointer("/message/usage");
+                // 同非流式：三段输入相加，缓存命中另外单列。
+                let prompt_tokens = usage.map(total_input_tokens).unwrap_or(0);
+                // 缓存命中就在这一条里（cache_read_input_tokens）。此前这里恒写 0，
+                // 于是**流式请求的缓存列永远是 0**——而 Claude 的输入侧用量
+                // 全在 message_start 报，流式又是绝大多数客户端的走法。
+                // 只取读取命中：`cache_creation_input_tokens` 是本次正在写入缓存的部分，
+                // 本次并未命中任何缓存，不进缓存列（它已被 total_input_tokens 算进输入）。
+                let cache_tokens = usage
+                    .and_then(|u| u.get("cache_read_input_tokens"))
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
-                if prompt_tokens > 0 {
+                if prompt_tokens > 0 || cache_tokens > 0 {
                     Ok(vec![StreamEvent::Usage(Usage {
                         prompt_tokens,
                         completion_tokens: 0,
                         total_tokens: 0,
-                        cache_tokens: 0,
+                        cache_tokens,
                         estimated: false,
                     })])
                 } else {
@@ -424,17 +441,34 @@ fn finish_reason(value: Option<&str>) -> FinishReason {
     }
 }
 
+/// 把 Anthropic 的三段输入合成 `prompt_tokens`。
+///
+/// Claude 与另两家**口径相反**：它的 `input_tokens` **不含**缓存部分，
+/// 官方定义是「最后一个缓存断点之后的 token」，并要求
+/// `total_input = input_tokens + cache_read_input_tokens + cache_creation_input_tokens`。
+/// 而 OpenAI 的 `prompt_tokens`、Google 的 `promptTokenCount` 都把缓存算在里面。
+///
+/// 出口要统一，这里就按后者的口径相加：输入列显示的是**完整输入**，
+/// 缓存列另外单独记「命中」的那部分（`cached ⊆ prompt` 成立，缓存率才是可读的
+/// ≤100% 的比值）。相加后缓存 token 也随输入进入计费总数——与另两家一致。
+///
+/// `cache_creation_input_tokens` 同样相加：它是**这次请求正在写入缓存**的部分，
+/// 属于本次输入（上游也按输入计费），只是还不属于「读取命中」——
+/// 见 `Usage::cache_tokens` 的说明，那个字段只认命中。
+fn total_input_tokens(usage: &Value) -> i64 {
+    let field = |key: &str| usage.get(key).and_then(Value::as_i64).unwrap_or(0);
+    field("input_tokens") + field("cache_read_input_tokens") + field("cache_creation_input_tokens")
+}
+
 /// 字段名与 OpenAI 不同：input_tokens / output_tokens；
-/// 缓存命中分读、写两类，读的那部分记入 cache_tokens。
+/// 缓存命中只看**读取**（`cache_read_input_tokens`）——
+/// 写入（`cache_creation_input_tokens`）算输入但不算命中，不进 `cache_tokens`。
 fn parse_usage(value: Option<&Value>) -> Usage {
     let Some(value) = value else {
         return Usage::default();
     };
 
-    let prompt_tokens = value
-        .get("input_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
+    let prompt_tokens = total_input_tokens(value);
     let completion_tokens = value
         .get("output_tokens")
         .and_then(Value::as_i64)

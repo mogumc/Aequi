@@ -91,6 +91,8 @@ pub async fn charge(
         &NewUsage {
             key_id: &key.id,
             model,
+            // 路由快照：只写模型名的请求在多个块之间轮询，落点事后算不出来。
+            block_id: Some(block_id),
             raw_tokens: usage.total_tokens,
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,

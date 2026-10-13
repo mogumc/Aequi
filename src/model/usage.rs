@@ -1,8 +1,11 @@
 //! 用量记录（密钥侧可见的扣费与普通错误日志）。
 //!
-//! 这套日志是**脱敏**的：只有计费数字、模型与一句普通错误描述，
-//! 上游密钥、块、IP、UA 与详细报错都在 [`crate::model::ProxyLog`] 里，
-//! 只对管理员开放。
+//! 这套日志是**脱敏**的：只有计费数字、模型、上游块与一句普通错误描述。
+//! 上游密钥、IP、UA 与详细报错都在 [`crate::model::ProxyLog`] 里，只对管理员开放。
+//!
+//! **块 id 是例外**：它本就通过 `/api/key/models` 交给密钥持有者（就是
+//! `块/模型` 调用写法的前缀），所以用量记录里给出它不新增暴露面，
+//! 却能让用户核对「只写模型名的请求这次轮询到了哪个上游」。
 
 use serde::Serialize;
 
@@ -17,6 +20,14 @@ pub struct UsageRecord {
     pub id: i64,
     pub key_id: String,
     pub model: String,
+    /// 这次实际命中的上游块。
+    ///
+    /// 只写模型名的请求会在提供它的块之间**轮询**，落点是执行时才知道的、
+    /// 事后算不出来——所以记账时快照下来，用户才有办法核对
+    /// 「我这次到底走了哪个上游」。
+    /// 为空有两种情形：迁移之前的老记录，以及**选中块之前**就失败的请求。
+    /// （块 id 对密钥持有者不是秘密：它本就是 `块/模型` 调用写法的前缀。）
+    pub block_id: Option<String>,
     /// 上游报的总 token 数；失败请求为 0。
     pub raw_tokens: i64,
     pub prompt_tokens: i64,
@@ -47,6 +58,8 @@ pub struct UsageRecord {
 pub struct UsageView {
     pub id: i64,
     pub model: String,
+    /// 实际命中的上游块；老记录或调度前就失败的请求为 `null`。
+    pub block_id: Option<String>,
     pub status: String,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
@@ -68,6 +81,7 @@ impl From<&UsageRecord> for UsageView {
         Self {
             id: record.id,
             model: record.model.clone(),
+            block_id: record.block_id.clone(),
             status: record.status.clone(),
             prompt_tokens: record.prompt_tokens,
             completion_tokens: record.completion_tokens,

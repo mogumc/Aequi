@@ -332,7 +332,7 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
   "retention_days": 7,
   "records": [
     {
-      "id": 3, "model": "gpt-4o", "status": "success",
+      "id": 3, "model": "gpt-4o", "block_id": "block-a", "status": "success",
       "prompt_tokens": 30, "completion_tokens": 10, "cache_tokens": 7,
       "estimated": false, "stream": false,
       "raw_tokens": 40, "multiplier": "1.00", "final_tokens": 40, "credits": "0.0040",
@@ -348,6 +348,13 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
 `log_retention_days`（默认 7 天，1-365 可调）决定，过期由后台任务回收；
 响应里的 `retention_days` 就是当前生效值——**汇总与明细都只是这段窗口
 内的数据**，前端应据此注明统计口径。
+
+`block_id` 是**这次请求实际命中的上游块**（路由快照）。只写模型名、不带块前缀的
+请求会在提供该模型的块之间加权轮询，落点执行时才知道、事后算不出来，所以记账时
+记下来。它可能为 `null`：一是本次特性上线**之前的老记录**，二是**选中块之前**
+就失败的请求（如模型名解析不出来、余额不足被拦下）。块 id 对密钥持有者不是秘密
+——它就是 `块/模型` 调用写法的前缀，`/api/key/models` 本来就给出。
+上游密钥、来源 IP、User-Agent 依旧不出这个接口，只在管理员的 `/api/logs` 里。
 
 失败请求同样出现在 `records` 里（`status: "error"`、token 与积分为 0、`error` 为一句脱敏描述：上游错误只给「上游响应异常」或「上游响应异常: 返回 {status}」，不包含上游报错原文；原话与内部细节只在管理员的 `/api/logs` 里）。
 
@@ -438,7 +445,7 @@ OpenAI 生图协议，与对话共用认证、调度、重试与双轨日志。
 3. 429 → 该密钥退避 30 秒并换下一把；401/403/5xx、网络故障、200 但响应结构损坏 → 记失败并换下一把；最多 3 次。
 4. 其它 4xx 是请求本身的问题（参数、模型名等），直接透传错误，不重试。
 5. 上游不报 usage 时按本地估算计费（CJK 每字 1 token、其余每 4 字符 1 token、图片每张 1000），估算结果在日志里带 `estimated: true`。
-6. 计费按对外模型名的倍率折算，缓存 token 只记录不打折；余额为零的密钥在发请求前就被拒绝（402）——**无限额度的密钥除外**，它跳过余额判定但照常记账。
+6. 计费按对外模型名的倍率折算；缓存命中的 token **计入输入、按原价结算**（不做折扣），同时在用量里单独记一份便于算命中率。三家上游的口径已归一，两处易漏的输入都要自己补：**其一**，Anthropic 的 `input_tokens` 不含缓存，适配器会补上 `cache_read_input_tokens + cache_creation_input_tokens`；**其二**，Google 的 `toolUsePromptTokenCount`（工具执行结果回灌给模型的输入）不在 `promptTokenCount` 里——官方 `totalTokenCount` 是 `prompt + candidates + toolUsePrompt + thoughts` 四项相加，故适配器把它并入输入（OpenAI 的工具结果本就在 `messages` 里、Anthropic 的 `tool_result` 本就在 `input_tokens` 里，三家口径一致）。用量里的 `cache_tokens` 只记**读取命中**的部分——缓存**写入**（Anthropic 的 `cache_creation_input_tokens`、本次请求首次建缓存）要下次请求才可能被读到，本次不属于命中，因此计入输入但不计入 `cache_tokens`。余额为零的密钥在发请求前就被拒绝（402）——**无限额度的密钥除外**，它跳过余额判定但照常记账。
 
 ---
 

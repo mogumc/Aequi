@@ -8,22 +8,23 @@ use crate::model::{UsageRecord, UsageSummary};
 /// 成功请求：与扣费同事务写入。
 const SQL_INSERT: &str = "\
 INSERT INTO usage_records \
-(key_id, model, raw_tokens, prompt_tokens, completion_tokens, cache_tokens, estimated, stream, \
- multiplier_bp, final_tokens, credits_scaled, status, created_at) \
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', ?)";
+(key_id, model, block_id, raw_tokens, prompt_tokens, completion_tokens, cache_tokens, estimated, \
+ stream, multiplier_bp, final_tokens, credits_scaled, status, created_at) \
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', ?)";
 
 /// 失败请求：tokens 与扣费为零，只留一句脱敏错误。
+/// `block_id` 能给就给——「这次去了哪个上游」对用户排障最有用。
 const SQL_INSERT_ERROR: &str = "\
 INSERT INTO usage_records \
-(key_id, model, status, error, stream, created_at) \
-VALUES (?, ?, 'error', ?, ?, ?)";
+(key_id, model, block_id, status, error, stream, created_at) \
+VALUES (?, ?, ?, 'error', ?, ?, ?)";
 
 /// 某密钥的用量记录，按 id 倒序（与时间倒序等价，id 自增）。
 ///
 /// `before_id` 是游标分页的锚点：传 0 表示从最新开始，传上一页最后一条
 /// 的 id 即取更早的一页——数据持续写入，偏移量分页会漂移，游标不会。
 const SQL_LIST_BY_KEY: &str = "\
-SELECT id, key_id, model, raw_tokens, prompt_tokens, completion_tokens, cache_tokens, estimated, stream, \
+SELECT id, key_id, model, block_id, raw_tokens, prompt_tokens, completion_tokens, cache_tokens, estimated, stream, \
        multiplier_bp, final_tokens, credits_scaled, status, error, created_at \
 FROM usage_records \
 WHERE key_id = ? AND (? = 0 OR id < ?) \
@@ -68,6 +69,8 @@ GROUP BY day ORDER BY day";
 pub struct NewUsage<'a> {
     pub key_id: &'a str,
     pub model: &'a str,
+    /// 实际命中的上游块；调用方拿不到时传 `None`（降级为「不知道」）。
+    pub block_id: Option<&'a str>,
     pub raw_tokens: i64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
@@ -85,6 +88,7 @@ fn map_row(row: &SqliteRow) -> UsageRecord {
         id: row.get("id"),
         key_id: row.get("key_id"),
         model: row.get("model"),
+        block_id: row.get("block_id"),
         raw_tokens: row.get("raw_tokens"),
         prompt_tokens: row.get("prompt_tokens"),
         completion_tokens: row.get("completion_tokens"),
@@ -111,6 +115,7 @@ pub async fn insert(
     sqlx::query(SQL_INSERT)
         .bind(usage.key_id)
         .bind(usage.model)
+        .bind(usage.block_id)
         .bind(usage.raw_tokens)
         .bind(usage.prompt_tokens)
         .bind(usage.completion_tokens)
@@ -130,10 +135,14 @@ pub async fn insert(
 ///
 /// 失败也进密钥的用量列表——用户需要知道自己发过的每一次请求去了哪里、
 /// 为什么没成功；但错误信息只有一句普通描述，细节在管理员的日志里。
+///
+/// `block_id` 在**选中块之前**就失败时传 `None`（如模型名解析不出来、
+/// 余额不足被拦下）——那种请求本来就没落到任何块上。
 pub async fn insert_error(
     pool: &SqlitePool,
     key_id: &str,
     model: &str,
+    block_id: Option<&str>,
     error: &str,
     stream: bool,
     created_at: i64,
@@ -141,6 +150,7 @@ pub async fn insert_error(
     sqlx::query(SQL_INSERT_ERROR)
         .bind(key_id)
         .bind(model)
+        .bind(block_id)
         .bind(error)
         .bind(i64::from(stream))
         .bind(created_at)

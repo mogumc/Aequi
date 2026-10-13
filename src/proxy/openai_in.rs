@@ -78,10 +78,23 @@ pub fn render_response(response: &ChatResponse, id: &str, created: i64) -> Value
             "message": Value::Object(message),
             "finish_reason": finish_reason_name(response.finish_reason),
         }],
-        "usage": {
-            "prompt_tokens": response.usage.prompt_tokens,
-            "completion_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens,
+        "usage": usage_json(&response.usage),
+    })
+}
+
+/// OpenAI 形状的 usage 对象。
+///
+/// 缓存命中放 `prompt_tokens_details.cached_tokens`——这是 OpenAI 客户端的既有
+/// 字段（SDK 与各家网关都认），不管上游是 OpenAI / Anthropic / Google，
+/// 出口统一成这个形状，客户端才能读到缓存。
+/// 没有缓存时写 0 而不是省略，让客户端拿到的结构稳定、不必判空。
+fn usage_json(usage: &Usage) -> Value {
+    json!({
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+        "prompt_tokens_details": {
+            "cached_tokens": usage.cache_tokens,
         },
     })
 }
@@ -321,14 +334,7 @@ pub fn render_stream_finish(id: &str, created: i64, model: &str, reason: FinishR
 pub fn render_stream_usage(id: &str, created: i64, model: &str, usage: Usage) -> Value {
     let mut object = render_stream_base(id, created, model);
     object.insert("choices".to_string(), json!([]));
-    object.insert(
-        "usage".to_string(),
-        json!({
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-            "total_tokens": usage.total_tokens,
-        }),
-    );
+    object.insert("usage".to_string(), usage_json(&usage));
     Value::Object(object)
 }
 
@@ -433,6 +439,42 @@ mod tests {
         let rendered = render_response(&response, "id", 0);
         assert_eq!(rendered["choices"][0]["message"]["reasoning_content"], "推理");
         assert_eq!(rendered["choices"][0]["message"]["content"], "答案");
+    }
+
+    #[test]
+    fn usage_exposes_cache_under_prompt_tokens_details() {
+        // 客户端要能从 OpenAI 形状里读到缓存命中：cached_tokens 是
+        // prompt_tokens 的**子集**，位置固定在 prompt_tokens_details 里。
+        let usage = Usage {
+            prompt_tokens: 2000,
+            completion_tokens: 300,
+            total_tokens: 2300,
+            cache_tokens: 1500,
+            estimated: false,
+        };
+
+        let rendered = render_stream_usage("id", 0, "m", usage.clone());
+        assert_eq!(rendered["usage"]["prompt_tokens"], 2000);
+        assert_eq!(rendered["usage"]["prompt_tokens_details"]["cached_tokens"], 1500);
+
+        // 非流式走同一个形状，不能只在流式里给。
+        let response = ChatResponse {
+            model: "m".into(),
+            content: vec![ContentPart::text("答案")],
+            reasoning: String::new(),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage,
+        };
+        let rendered = render_response(&response, "id", 0);
+        assert_eq!(rendered["usage"]["prompt_tokens_details"]["cached_tokens"], 1500);
+    }
+
+    #[test]
+    fn cache_details_are_present_even_without_cache() {
+        // 没缓存时字段也要在（写 0），客户端不必判空。
+        let rendered = render_stream_usage("id", 0, "m", Usage::default());
+        assert_eq!(rendered["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
     }
 
     #[test]

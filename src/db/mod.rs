@@ -131,6 +131,40 @@ CREATE TABLE IF NOT EXISTS upstream_keys (
 const UPSTREAM_KEYS_BLOCK_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_upstream_keys_block ON upstream_keys(block_id)";
 
+/// `usage_records` 的列清单，用于判断要不要补列。
+const USAGE_RECORDS_COLUMNS: &str = "SELECT name FROM pragma_table_info('usage_records')";
+
+/// 给**已存在**的库补上 `block_id`。
+///
+/// `CREATE TABLE IF NOT EXISTS` 对已存在的表什么都不做，所以老库必须显式
+/// `ALTER TABLE`。这里只做**加列**、加的是可空列，因而可以安全重入
+/// （先查列再改）、也可以回滚（旧二进制忽略新列）。
+///
+/// 写成字面量常量而不是拼表名：sqlx 0.9 禁止动态 SQL，而且一次性迁移语句
+/// 本来就该能直接审读。以后再加列，照这个形状补一组常量即可。
+const USAGE_RECORDS_ADD_BLOCK_ID: &str =
+    "ALTER TABLE usage_records ADD COLUMN block_id TEXT";
+
+async fn add_missing_columns(pool: &SqlitePool) -> anyhow::Result<()> {
+    let existing: Vec<String> = sqlx::query_scalar(USAGE_RECORDS_COLUMNS)
+        .fetch_all(pool)
+        .await
+        .with_context(|| "读取 usage_records 的列信息失败")?;
+
+    if existing.iter().any(|name| name == "block_id") {
+        return Ok(());
+    }
+
+    sqlx::query(USAGE_RECORDS_ADD_BLOCK_ID)
+        .execute(pool)
+        .await
+        .with_context(|| "给 usage_records 补列 block_id 失败")?;
+
+    tracing::info!("已为已有的 usage_records 补上 block_id 列");
+
+    Ok(())
+}
+
 /// 建数据面表结构。
 pub async fn migrate_data(pool: &SqlitePool) -> anyhow::Result<()> {
     for (name, ddl) in [
@@ -150,6 +184,8 @@ pub async fn migrate_data(pool: &SqlitePool) -> anyhow::Result<()> {
             .await
             .with_context(|| format!("执行数据面建表语句失败: {name}"))?;
     }
+
+    add_missing_columns(pool).await?;
 
     Ok(())
 }
@@ -257,11 +293,15 @@ CREATE TABLE IF NOT EXISTS api_keys (
 /// 用量记录。
 ///
 /// 倍率按记账当时的取值快照下来，事后调整倍率不会改写历史账单。
+/// `block_id` 同样是一次**路由快照**：只写模型名（不带块前缀）的请求会在
+/// 提供该模型的块之间轮询，事后没法再算出来，所以记账时把实际落到的块记下来。
+/// 可空——旧记录、以及「调度前就失败」的请求都拿不到块。
 const USAGE_RECORDS_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS usage_records (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     key_id            TEXT    NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
     model             TEXT    NOT NULL,
+    block_id          TEXT,
     raw_tokens        INTEGER NOT NULL DEFAULT 0,
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
@@ -315,3 +355,112 @@ const USAGE_KEY_ID_INDEX: &str =
 /// 管理端日志的游标查询只有 `id < ?` + 各筛选列，id 序扫描是唯一免排序路径。
 const PROXY_LOGS_ID_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_proxy_logs_id ON proxy_logs(id)";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 老版 usage_records 的建表语句：当前 DDL 去掉 block_id 那一行。
+    ///
+    /// 用字面量是为了过 sqlx 0.9 的动态 SQL 检查；下面另有一致性断言
+    /// 把它钉在 `USAGE_RECORDS_DDL` 上，避免抄一份之后各自腐坏
+    /// （那样测的就不是「老库能不能被补上」了）。
+    const LEGACY_USAGE_RECORDS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS usage_records (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_id            TEXT    NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+    model             TEXT    NOT NULL,
+    raw_tokens        INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_tokens      INTEGER NOT NULL DEFAULT 0,
+    estimated         INTEGER NOT NULL DEFAULT 0,
+    stream            INTEGER NOT NULL DEFAULT 0,
+    multiplier_bp     INTEGER NOT NULL DEFAULT 10000,
+    final_tokens      INTEGER NOT NULL DEFAULT 0,
+    credits_scaled    INTEGER NOT NULL DEFAULT 0,
+    status            TEXT    NOT NULL DEFAULT 'success',
+    error             TEXT,
+    created_at        INTEGER NOT NULL
+)
+"#;
+
+    /// 造一张「老版」usage_records（没有 block_id）。
+    async fn legacy_pool() -> SqlitePool {
+        assert_eq!(
+            LEGACY_USAGE_RECORDS_DDL,
+            USAGE_RECORDS_DDL.replace("    block_id          TEXT,\n", ""),
+            "老 DDL 与「当前 DDL 去掉 block_id」已经不一致，测试夹具该更新了"
+        );
+
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("打开内存库");
+        sqlx::raw_sql(LEGACY_USAGE_RECORDS_DDL)
+            .execute(&pool)
+            .await
+            .expect("建老表");
+        pool
+    }
+
+    async fn columns_of(pool: &SqlitePool) -> Vec<String> {
+        sqlx::query_scalar(USAGE_RECORDS_COLUMNS)
+            .fetch_all(pool)
+            .await
+            .expect("读列信息")
+    }
+
+    #[tokio::test]
+    async fn adds_block_id_to_a_legacy_usage_table() {
+        let pool = legacy_pool().await;
+        assert!(
+            !columns_of(&pool).await.iter().any(|c| c == "block_id"),
+            "老表本来就不该有 block_id"
+        );
+
+        add_missing_columns(&pool).await.expect("补列");
+        assert!(
+            columns_of(&pool).await.iter().any(|c| c == "block_id"),
+            "补列之后应当有 block_id"
+        );
+
+        // 可重入：再跑一遍直接跳过，不该报错。
+        add_missing_columns(&pool).await.expect("第二次应当跳过");
+    }
+
+    #[tokio::test]
+    async fn migrate_backfills_block_id_and_keeps_existing_rows() {
+        let pool = legacy_pool().await;
+        // usage_records 上有指向 api_keys 的外键，父表与其行都得先在。
+        sqlx::raw_sql(API_KEYS_DDL)
+            .execute(&pool)
+            .await
+            .expect("建父表");
+        sqlx::query(
+            "INSERT INTO api_keys (id, secret, key_prefix, credits_scaled, created_at, updated_at) \
+             VALUES ('k1', 'ak_test', 'ak_test', 0, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("写入父行");
+        sqlx::query("INSERT INTO usage_records (key_id, model, created_at) VALUES ('k1', 'gpt-4o', 1)")
+            .execute(&pool)
+            .await
+            .expect("写入一条老记录");
+
+        migrate_data(&pool).await.expect("全量迁移");
+        migrate_data(&pool).await.expect("再跑一遍应当幂等");
+
+        // 老记录原样保留，新列降级为 NULL（「不知道走的哪个上游」）。
+        let model: String = sqlx::query_scalar("SELECT model FROM usage_records")
+            .fetch_one(&pool)
+            .await
+            .expect("老记录还在");
+        let block: Option<String> = sqlx::query_scalar("SELECT block_id FROM usage_records")
+            .fetch_one(&pool)
+            .await
+            .expect("新列可读");
+        assert_eq!(model, "gpt-4o");
+        assert_eq!(block, None, "旧记录没有块信息，必须是 NULL 而不是空串");
+    }
+}

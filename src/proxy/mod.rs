@@ -215,6 +215,8 @@ async fn chat_completion_inner(
         }
         Err(failure) => {
             // 失败也要留下痕迹：管理员看到细节，用户只看到脱敏描述。
+            // 块 id 要先取出来——`.failed_with_context()` 会把它移走。
+            let failed_block = failure.context.as_ref().map(|(block, _)| block.clone());
             write_log(
                 pool,
                 base_log(key, ip, user_agent, started)
@@ -227,6 +229,8 @@ async fn chat_completion_inner(
                 pool,
                 &key.id,
                 &request.model,
+                // 拿不到块（还没选中就失败）时降级为空，不影响记账。
+                failed_block.as_deref(),
                 &failure.user_message,
                 false,
                 time::now_secs(),
@@ -404,6 +408,7 @@ pub async fn chat_completion_stream(
                         pool,
                         &key.id,
                         &request.model,
+                        Some(block.id.as_str()),
                         &format!("上游响应异常: 返回 {status}"),
                         true,
                         time::now_secs(),
@@ -428,6 +433,8 @@ pub async fn chat_completion_stream(
     let Some(response) = upstream else {
         let failure = last_failure
             .unwrap_or_else(|| Failure::bare(Error::UpstreamUnavailable("上游不可用".to_string())));
+        // 同上：块 id 要先取出来，`.failed_with_context()` 会移走 context。
+        let failed_block = failure.context.as_ref().map(|(block, _)| block.clone());
         write_log(
             pool,
             base_log(&key, &ip, user_agent.as_deref(), started)
@@ -440,6 +447,7 @@ pub async fn chat_completion_stream(
             pool,
             &key.id,
             &request.model,
+            failed_block.as_deref(),
             &failure.user_message,
             true,
             time::now_secs(),
@@ -535,6 +543,7 @@ pub async fn chat_completion_stream(
                         pool,
                         &key.id,
                         &model,
+                        Some(block_id.as_str()),
                         &user_message,
                         true,
                         time::now_secs(),
@@ -579,6 +588,7 @@ pub async fn chat_completion_stream(
                         pool,
                         &key.id,
                         &model,
+                        Some(block_id.as_str()),
                         &user_message,
                         true,
                         time::now_secs(),
@@ -707,6 +717,7 @@ pub async fn chat_completion_stream(
                 pool,
                 &key.id,
                 &model,
+                Some(block_id.as_str()),
                 "上游响应异常: 上游没有返回任何内容",
                 true,
                 time::now_secs(),
@@ -789,6 +800,8 @@ pub async fn chat_completion_stream(
             }
             Err(error) => {
                 let user_message = sanitize_user_message(&error);
+                // 这里的 block_id 会随 context 移进日志，先留一份给用量记录。
+                let failed_block = block_id.clone();
                 write_log(
                     pool,
                     base_log(&key, &ip, user_agent.as_deref(), started)
@@ -803,6 +816,7 @@ pub async fn chat_completion_stream(
                     pool,
                     &key.id,
                     &model,
+                    Some(failed_block.as_str()),
                     &user_message,
                     true,
                     time::now_secs(),
