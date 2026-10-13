@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS upstream_blocks (
     base_url     TEXT    NOT NULL,
     proxy        TEXT,
     models       TEXT    NOT NULL DEFAULT '[]',
+    headers      TEXT    NOT NULL DEFAULT '[]',
     enabled      INTEGER NOT NULL DEFAULT 1,
     created_at   INTEGER NOT NULL,
     updated_at   INTEGER NOT NULL
@@ -132,35 +133,92 @@ const UPSTREAM_KEYS_BLOCK_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_upstream_keys_block ON upstream_keys(block_id)";
 
 /// `usage_records` 的列清单，用于判断要不要补列。
+///
+/// 表名写成字面量：sqlx 0.9 的动态 SQL 检查只认 `&'static str`
+/// （`raw_sql` 同样），而且这些语句本来就该能直接审读。
 const USAGE_RECORDS_COLUMNS: &str = "SELECT name FROM pragma_table_info('usage_records')";
+
+/// `upstream_blocks` 的列清单，用于判断要不要补列。
+const UPSTREAM_BLOCKS_COLUMNS: &str = "SELECT name FROM pragma_table_info('upstream_blocks')";
 
 /// 给**已存在**的库补上 `block_id`。
 ///
 /// `CREATE TABLE IF NOT EXISTS` 对已存在的表什么都不做，所以老库必须显式
-/// `ALTER TABLE`。这里只做**加列**、加的是可空列，因而可以安全重入
-/// （先查列再改）、也可以回滚（旧二进制忽略新列）。
-///
-/// 写成字面量常量而不是拼表名：sqlx 0.9 禁止动态 SQL，而且一次性迁移语句
-/// 本来就该能直接审读。以后再加列，照这个形状补一组常量即可。
+/// `ALTER TABLE`。这条加的是**可空**列，因而可以安全重入（先查列再改）、
+/// 也可以回滚（旧二进制忽略新列）。`headers` 那条加的是 `NOT NULL DEFAULT`，
+/// 同为可重入、可回滚，理由见它自己的注释。
 const USAGE_RECORDS_ADD_BLOCK_ID: &str =
     "ALTER TABLE usage_records ADD COLUMN block_id TEXT";
 
+/// 给**已存在**的库补上 `upstream_blocks.headers`（自定义请求头）。
+///
+/// 带 `NOT NULL DEFAULT '[]'` 而不是留空：新库与老库要读成同一个形状，而
+/// 「没有自定义头」与「自定义头为空」本就无处可区分（不像 `block_id` 的
+/// NULL 还承载「不知道走的哪个上游」）。带常量默认值的加列一样可重入、
+/// 可回滚——旧二进制的 INSERT/UPDATE 都不列这一列，落的就是这个默认值。
+const UPSTREAM_BLOCKS_ADD_HEADERS: &str =
+    "ALTER TABLE upstream_blocks ADD COLUMN headers TEXT NOT NULL DEFAULT '[]'";
+
+/// 一次「老库补列」迁移。
+struct ColumnMigration {
+    table: &'static str,
+    column: &'static str,
+    /// 查该表现有列的 SQL（字面量常量，见上）。
+    columns_sql: &'static str,
+    /// 缺列时执行的 ALTER。
+    alter_sql: &'static str,
+}
+
+/// 补列清单：只加列，不改列、不删列、不动数据。
+///
+/// 收成一个清单而不是散在若干函数里，「哪个库缺哪一列」一眼可见。
+/// 以后再加列，在这里补一项、并补一组字面量常量即可。
+const COLUMN_MIGRATIONS: &[ColumnMigration] = &[
+    ColumnMigration {
+        table: "usage_records",
+        column: "block_id",
+        columns_sql: USAGE_RECORDS_COLUMNS,
+        alter_sql: USAGE_RECORDS_ADD_BLOCK_ID,
+    },
+    ColumnMigration {
+        table: "upstream_blocks",
+        column: "headers",
+        columns_sql: UPSTREAM_BLOCKS_COLUMNS,
+        alter_sql: UPSTREAM_BLOCKS_ADD_HEADERS,
+    },
+];
+
 async fn add_missing_columns(pool: &SqlitePool) -> anyhow::Result<()> {
-    let existing: Vec<String> = sqlx::query_scalar(USAGE_RECORDS_COLUMNS)
+    for migration in COLUMN_MIGRATIONS {
+        add_column_if_missing(pool, migration).await?;
+    }
+    Ok(())
+}
+
+/// 缺哪列补哪列，已经有了就跳过——可重入。
+async fn add_column_if_missing(
+    pool: &SqlitePool,
+    migration: &ColumnMigration,
+) -> anyhow::Result<()> {
+    let existing: Vec<String> = sqlx::query_scalar(migration.columns_sql)
         .fetch_all(pool)
         .await
-        .with_context(|| "读取 usage_records 的列信息失败")?;
+        .with_context(|| format!("读取 {} 的列信息失败", migration.table))?;
 
-    if existing.iter().any(|name| name == "block_id") {
+    if existing.iter().any(|name| name == migration.column) {
         return Ok(());
     }
 
-    sqlx::query(USAGE_RECORDS_ADD_BLOCK_ID)
+    sqlx::query(migration.alter_sql)
         .execute(pool)
         .await
-        .with_context(|| "给 usage_records 补列 block_id 失败")?;
+        .with_context(|| format!("给 {} 补列 {} 失败", migration.table, migration.column))?;
 
-    tracing::info!("已为已有的 usage_records 补上 block_id 列");
+    tracing::info!(
+        table = migration.table,
+        column = migration.column,
+        "已为已有的表补上缺失的列"
+    );
 
     Ok(())
 }
@@ -385,21 +443,47 @@ CREATE TABLE IF NOT EXISTS usage_records (
 )
 "#;
 
-    /// 造一张「老版」usage_records（没有 block_id）。
+    /// 老版 upstream_blocks 的建表语句：当前 DDL 去掉 headers 那一行。
+    ///
+    /// 同样用字面量，并在下面钉住与 `UPSTREAM_BLOCKS_DDL` 的一致性。
+    const LEGACY_UPSTREAM_BLOCKS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS upstream_blocks (
+    id           TEXT    PRIMARY KEY,
+    name         TEXT    NOT NULL DEFAULT '',
+    api_format   TEXT    NOT NULL,
+    weight       INTEGER NOT NULL DEFAULT 1,
+    base_url     TEXT    NOT NULL,
+    proxy        TEXT,
+    models       TEXT    NOT NULL DEFAULT '[]',
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
+)
+"#;
+
+    /// 造一张「老版」数据面的库：usage_records 没有 block_id，
+    /// upstream_blocks 没有 headers。
+    ///
+    /// 两张表都要建——补列是照着真实表名跑的，老库里本来就都有它们；
+    /// 只建一张测的就不是「老库能不能被补上」，而是「表不存在时会怎样」。
     async fn legacy_pool() -> SqlitePool {
         assert_eq!(
             LEGACY_USAGE_RECORDS_DDL,
             USAGE_RECORDS_DDL.replace("    block_id          TEXT,\n", ""),
             "老 DDL 与「当前 DDL 去掉 block_id」已经不一致，测试夹具该更新了"
         );
+        assert_eq!(
+            LEGACY_UPSTREAM_BLOCKS_DDL,
+            UPSTREAM_BLOCKS_DDL.replace("    headers      TEXT    NOT NULL DEFAULT '[]',\n", ""),
+            "老 DDL 与「当前 DDL 去掉 headers」已经不一致，测试夹具该更新了"
+        );
 
         let pool = SqlitePool::connect("sqlite::memory:")
             .await
             .expect("打开内存库");
-        sqlx::raw_sql(LEGACY_USAGE_RECORDS_DDL)
-            .execute(&pool)
-            .await
-            .expect("建老表");
+        for ddl in [LEGACY_USAGE_RECORDS_DDL, LEGACY_UPSTREAM_BLOCKS_DDL] {
+            sqlx::raw_sql(ddl).execute(&pool).await.expect("建老表");
+        }
         pool
     }
 
@@ -425,6 +509,39 @@ CREATE TABLE IF NOT EXISTS usage_records (
         );
 
         // 可重入：再跑一遍直接跳过，不该报错。
+        add_missing_columns(&pool).await.expect("第二次应当跳过");
+    }
+
+    #[tokio::test]
+    async fn adds_headers_to_a_legacy_block_table() {
+        let pool = legacy_pool().await;
+        let columns: Vec<String> = sqlx::query_scalar(UPSTREAM_BLOCKS_COLUMNS)
+            .fetch_all(&pool)
+            .await
+            .expect("读列信息");
+        assert!(
+            !columns.iter().any(|c| c == "headers"),
+            "老表本来就不该有 headers"
+        );
+
+        // 老库里先有一行块——补列之后它必须读到「没有自定义头」，而不是报错或 NULL。
+        sqlx::query(
+            "INSERT INTO upstream_blocks (id, api_format, base_url, created_at, updated_at) \
+             VALUES ('block-a', 'openai', 'https://demo-upstream.invalid', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("写入老块");
+
+        add_missing_columns(&pool).await.expect("补列");
+
+        let headers: String = sqlx::query_scalar("SELECT headers FROM upstream_blocks")
+            .fetch_one(&pool)
+            .await
+            .expect("新列可读");
+        assert_eq!(headers, "[]", "老块的自定义头应当补成空数组，而不是 NULL");
+
+        // 可重入。
         add_missing_columns(&pool).await.expect("第二次应当跳过");
     }
 

@@ -204,7 +204,7 @@ gpt-4o，短名请求却被轮询到 b」这种越权。数组为空表示不限
 | `GET` | `/api/blocks` | 列表（每块带 `key_count` / `available_keys`） |
 | `POST` | `/api/blocks` | 创建 |
 | `GET` | `/api/blocks/{id}` | 详情 |
-| `PATCH` | `/api/blocks/{id}` | 更新（可含 `api_format`；`proxy` 传 `null` 表示清空） |
+| `PATCH` | `/api/blocks/{id}` | 更新（可含 `api_format`；`proxy` 传 `null` 表示清空；`headers` 传 `[]` 表示清空） |
 | `DELETE` | `/api/blocks/{id}` | 删除（密钥级联清理） |
 | `GET` | `/api/blocks/{id}/keys` | 块内密钥列表 |
 | `POST` | `/api/blocks/{id}/keys` | 批量添加：`{ secrets: ["..."], weight? }`；重复条目自动跳过，返回 `{ keys, skipped }` |
@@ -237,6 +237,10 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
   "models": [
     { "name": "gpt-4o", "forward": "gpt-4o-2024-11-20", "multiplier_bp": 15000 },
     { "name": "gpt-4o-mini" }
+  ],
+  "headers": [
+    { "name": "X-Tenant", "value": "demo-tenant" },
+    { "name": "anthropic-version", "value": "2099-01-01" }
   ]
 }
 ```
@@ -252,7 +256,29 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
   请求里模型名的前缀（`块id/模型名`），含 `/` 或空格会直接破坏那条解析规则。
 - `models[]`：本块对外接受的模型；`forward` 缺省表示同名转发；
   **`multiplier_bp` 是该模型的计费倍率（万分比整数，10000 = 1.0 倍，精度 0.01）**，缺省 1.0。
+- `headers[]`：**自定义请求头**，缺省为空数组；详见下节。
 - 密钥生命周期自治：成功清零失败计数、429 退避 30 秒、连续失败 3 次自动停用。
+
+#### 自定义请求头（`headers`）
+
+有些上游要求额外的头：指定版本的 `anthropic-version`、组织/租户头
+（`OpenAI-Organization` 之类）、网关自己的路由头，或者认证压根不是标准那三种写法。
+这些都按块配置，缺省为空数组。
+
+- **生效范围是整块**：对话、流式、生图、测试密钥、拉取模型走的是同一个出口，
+  所以「测试通过」与「真实请求能通」永远是同一个条件。
+- **同名覆盖**：头表按「各家固定头 → 认证头 → 自定义头」组装，自定义头放最后，
+  于是它会盖掉同名的内置头（`Authorization`、`x-api-key`、`anthropic-version` 都算），
+  而且**不会再追加一份**——配一条就只发一条。
+  注意头值是字面量、引用不了块里的上游密钥，所以想靠它改认证写法得自己填死。
+- 头名大小写不敏感；同一个头名**不允许配两遍**（否则哪条生效说不清）；最多 32 条。
+- **由 HTTP 栈自己管的头不允许配置**：`Content-Length`、`Transfer-Encoding`、
+  `Connection`、`Upgrade`、`Expect`、`TE`、`Trailer`、`Keep-Alive`——配了只会让请求
+  畸形。其余一律放行，`Host` 也可以。
+- 头名与头值去掉首尾空白后校验合法性（`\r\n` 之类直接构成头注入，入口就挡），
+  不合法返回 400 且**不写库**。
+- 更新是**整份替换**：传 `headers: []` 即清空，不传则保持原值（与 `proxy` 同一口径）。
+- `BlockView.headers` 明文返回——与 `secret` 同一套取舍，管理员要能取回来核对。
 
 #### `POST /api/blocks/{id}/test`
 

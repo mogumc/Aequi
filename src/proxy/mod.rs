@@ -1011,35 +1011,76 @@ async fn dispatch(
         .unwrap_or_else(|| Failure::bare(Error::UpstreamUnavailable("上游不可用".to_string()))))
 }
 
-/// 组装发往上游的请求（路径、认证头、各家额外头）。
+/// 认证头名。写成常量是为了和 [`AuthStyle`] 的三种放法一一对应地读。
+const HEADER_X_API_KEY: &str = "x-api-key";
+const HEADER_X_GOOG_API_KEY: &str = "x-goog-api-key";
+
+/// 把一个头名与头值变成 HTTP 头，塞不进去就在**发请求之前**报错。
 ///
-/// 对块外也可见：管理面的「拉取上游模型」用的是同一个探测请求，
-/// 认证规则不该在那里再抄一遍。
+/// 写入口（[`crate::service::upstream::create_block`]）已经校验过一遍，
+/// 走到这里还不合法说明库里是脏数据——手改的、或更早的版本写进去的。
+/// 用 [`Error::Internal`] 而不是 `BadRequest`：这是我们这边的配置问题，
+/// 不该让密钥持有者从错误文案里读出块的配置细节；管理员日志里有原文。
+fn build_header(
+    name: &str,
+    value: &str,
+) -> Result<(reqwest::header::HeaderName, reqwest::header::HeaderValue)> {
+    let name = reqwest::header::HeaderName::try_from(name)
+        .map_err(|_| Error::Internal(anyhow::anyhow!("块的请求头名不合法: {name}")))?;
+    let value = reqwest::header::HeaderValue::try_from(value)
+        .map_err(|_| Error::Internal(anyhow::anyhow!("块的请求头 {name} 的值不合法")))?;
+    Ok((name, value))
+}
+
+/// 组装发往上游的请求（路径、各家的固定头、认证头、块上配的自定义头）。
+///
+/// 对块外也可见：管理面的「拉取上游模型」与「测试密钥」走的是同一个出口，
+/// 认证与自定义头不该在那里再抄一遍。
+///
+/// 头是拼成**一张表**而不是一路 `.header()` 叠上去的：`RequestBuilder::header`
+/// 是 append 语义，同名会变成两个值一起发出去。顺序是各家固定头 → 认证头 →
+/// 自定义头（`insert` 覆盖），于是**块上配的说了算**——「上游要的头名不是
+/// 标准那三个」「版本头得换一个值」这类要求，配一下就行，不用改代码。
 pub(crate) fn prepare_request(
     client: &reqwest::Client,
     block: &UpstreamBlock,
     request: &UpstreamRequest,
     style: AuthStyle,
     key: &str,
-) -> reqwest::RequestBuilder {
+) -> Result<reqwest::RequestBuilder> {
     let url = format!("{}{}", block.base_url.trim_end_matches('/'), request.path);
 
-    let builder = match &request.body {
-        Some(body) => client.post(&url).json(body),
-        None => client.get(&url),
-    };
+    let mut headers = reqwest::header::HeaderMap::new();
 
-    let builder = match style {
-        AuthStyle::Bearer => builder.bearer_auth(key),
-        AuthStyle::XApiKey => builder.header("x-api-key", key),
-        AuthStyle::GoogleApiKey => builder.header("x-goog-api-key", key),
-    };
-
-    let mut builder = builder;
     for (name, value) in adapter_for(block.api_format).extra_headers() {
-        builder = builder.header(name, value);
+        let (name, value) = build_header(name, value)?;
+        headers.insert(name, value);
     }
-    builder
+
+    let (auth_name, auth_value) = match style {
+        AuthStyle::Bearer => (
+            reqwest::header::AUTHORIZATION.as_str(),
+            format!("Bearer {key}"),
+        ),
+        AuthStyle::XApiKey => (HEADER_X_API_KEY, key.to_string()),
+        AuthStyle::GoogleApiKey => (HEADER_X_GOOG_API_KEY, key.to_string()),
+    };
+    let (auth_name, mut auth_value) = build_header(auth_name, &auth_value)?;
+    // 上游密钥是凭证：标成 sensitive，免得被任何日志/调试输出带出去。
+    auth_value.set_sensitive(true);
+    headers.insert(auth_name, auth_value);
+
+    for entry in &block.headers {
+        let (name, value) = build_header(&entry.name, &entry.value)?;
+        headers.insert(name, value);
+    }
+
+    let builder = match &request.body {
+        Some(body) => client.post(&url).headers(headers).json(body),
+        None => client.get(&url).headers(headers),
+    };
+
+    Ok(builder)
 }
 
 /// 把请求发给上游，返回状态码与响应体。
@@ -1053,7 +1094,7 @@ pub async fn send(
     style: AuthStyle,
     key: &str,
 ) -> Result<(u16, Value)> {
-    let response = prepare_request(client, block, request, style, key)
+    let response = prepare_request(client, block, request, style, key)?
         .send()
         .await
         .map_err(|error| Error::UpstreamUnavailable(format!("请求上游失败: {error}")))?;
@@ -1073,7 +1114,7 @@ pub async fn send_stream(
     style: AuthStyle,
     key: &str,
 ) -> Result<reqwest::Response> {
-    prepare_request(client, block, request, style, key)
+    prepare_request(client, block, request, style, key)?
         .send()
         .await
         .map_err(|error| Error::UpstreamUnavailable(format!("请求上游失败: {error}")))
@@ -1217,5 +1258,153 @@ impl<'a> LogDraft<'a> {
 async fn write_log(pool: &sqlx::SqlitePool, log: NewProxyLog) {
     if let Err(error) = crate::db::proxy_log::insert(pool, &log).await {
         tracing::warn!(error = %error, "写入代理日志失败");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ApiFormat, HeaderEntry};
+
+    /// 一个不联网的块。测试只组装请求（`build`），不发出去。
+    fn block(format: ApiFormat, headers: Vec<HeaderEntry>) -> UpstreamBlock {
+        UpstreamBlock {
+            id: "demo-block".to_string(),
+            name: "demo".to_string(),
+            api_format: format,
+            weight: 1,
+            base_url: "https://demo-upstream.invalid".to_string(),
+            proxy: None,
+            models: Vec::new(),
+            headers,
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn header(name: &str, value: &str) -> HeaderEntry {
+        HeaderEntry {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    /// 走一遍真实的组装路径，取出最终会发出去的那张头表。
+    fn built_headers(block: &UpstreamBlock, style: AuthStyle) -> reqwest::header::HeaderMap {
+        let client = reqwest::Client::new();
+        let probe = UpstreamRequest {
+            path: "/v1/models".to_string(),
+            body: None,
+        };
+
+        prepare_request(&client, block, &probe, style, "sk-demo-secret")
+            .expect("组装请求")
+            .build()
+            .expect("构建请求")
+            .headers()
+            .clone()
+    }
+
+    fn value_of(headers: &reqwest::header::HeaderMap, name: &str) -> String {
+        headers
+            .get(name)
+            .unwrap_or_else(|| panic!("缺少请求头 {name}"))
+            .to_str()
+            .expect("头值应当是可读文本")
+            .to_string()
+    }
+
+    #[test]
+    fn custom_headers_ride_along_with_every_request() {
+        let block = block(ApiFormat::Openai, vec![header("X-Tenant", "demo-tenant")]);
+        let headers = built_headers(&block, AuthStyle::Bearer);
+
+        assert_eq!(value_of(&headers, "x-tenant"), "demo-tenant");
+        assert_eq!(
+            value_of(&headers, reqwest::header::AUTHORIZATION.as_str()),
+            "Bearer sk-demo-secret",
+            "配了自定义头也不能把认证头挤掉"
+        );
+    }
+
+    #[test]
+    fn without_custom_headers_defaults_are_unchanged() {
+        // 回归线：没配自定义头时，各家的固定头与认证头必须与从前一字不差。
+        let headers = built_headers(&block(ApiFormat::Anthropic, Vec::new()), AuthStyle::XApiKey);
+        assert_eq!(value_of(&headers, "anthropic-version"), "2023-06-01");
+        assert_eq!(value_of(&headers, "x-api-key"), "sk-demo-secret");
+
+        let headers = built_headers(&block(ApiFormat::Google, Vec::new()), AuthStyle::GoogleApiKey);
+        assert_eq!(value_of(&headers, "x-goog-api-key"), "sk-demo-secret");
+
+        let headers = built_headers(&block(ApiFormat::Openai, Vec::new()), AuthStyle::Bearer);
+        assert_eq!(
+            value_of(&headers, reqwest::header::AUTHORIZATION.as_str()),
+            "Bearer sk-demo-secret"
+        );
+    }
+
+    #[test]
+    fn custom_headers_override_builtin_ones() {
+        // 上游要什么写法由配置决定，而不是由我们的默认值决定：
+        // 版本头换一个值、认证头换个名字（甚至整条换掉）都要能表达。
+        let block = block(
+            ApiFormat::Anthropic,
+            vec![
+                header("Anthropic-Version", "2099-01-01"),
+                header("x-api-key", "literal-token"),
+            ],
+        );
+        let headers = built_headers(&block, AuthStyle::XApiKey);
+
+        assert_eq!(value_of(&headers, "anthropic-version"), "2099-01-01");
+        assert_eq!(value_of(&headers, "x-api-key"), "literal-token");
+        // 覆盖而不是追加：`RequestBuilder::header` 是 append 语义，同名会变成
+        // 两个值同时发出去，上游看到哪个就说不准了。
+        assert_eq!(
+            headers.get_all("x-api-key").iter().count(),
+            1,
+            "同名头必须只留一条"
+        );
+    }
+
+    #[test]
+    fn custom_header_name_case_is_not_significant() {
+        // 头名大小写不敏感，`Authorization` 配上去一样要盖住认证头。
+        let block = block(
+            ApiFormat::Openai,
+            vec![header("Authorization", "literal-token")],
+        );
+        let headers = built_headers(&block, AuthStyle::Bearer);
+
+        assert_eq!(
+            value_of(&headers, reqwest::header::AUTHORIZATION.as_str()),
+            "literal-token"
+        );
+        assert_eq!(
+            headers
+                .get_all(reqwest::header::AUTHORIZATION)
+                .iter()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn stored_header_that_cannot_be_sent_fails_loudly() {
+        // 库里若是脏数据（绕过了写入口的校验），必须在发请求前报错，
+        // 而不是静默少带一个头让上游去猜。
+        let block = block(ApiFormat::Openai, vec![header("X-Tenant", "bad\nvalue")]);
+        let client = reqwest::Client::new();
+        let probe = UpstreamRequest {
+            path: "/v1/models".to_string(),
+            body: None,
+        };
+
+        assert!(
+            prepare_request(&client, &block, &probe, AuthStyle::Bearer, "sk-demo-secret").is_err(),
+            "非法头值必须报错"
+        );
     }
 }
