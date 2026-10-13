@@ -338,6 +338,83 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_stream_reads_cache_hit_from_message_start() {
+        // Claude 的输入侧用量（含缓存命中）只在 message_start 里报一次。
+        // 这里曾经恒写 cache_tokens: 0，导致**流式请求的缓存列永远是 0**。
+        let adapter = adapter_for(ApiFormat::Anthropic);
+
+        let events = adapter
+            .parse_stream_event(
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":50,"cache_read_input_tokens":200000,"cache_creation_input_tokens":0,"output_tokens":1}}}"#,
+            )
+            .unwrap();
+        assert!(
+            matches!(&events[0], StreamEvent::Usage(u)
+                if u.cache_tokens == 200000),
+            "message_start 必须带出 cache_read_input_tokens"
+        );
+        // input_tokens 只是未命中缓存的那段，输入要三段相加（与 OpenAI/Google 同口径）。
+        assert!(
+            matches!(&events[0], StreamEvent::Usage(u) if u.prompt_tokens == 200050),
+            "输入必须是 input + cache_read + cache_creation"
+        );
+
+        // 新版 API 在 message_delta 里重复一份累计值；merge_usage 取 max，
+        // 两处都读不会重复计。
+        let events = adapter
+            .parse_stream_event(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":50,"output_tokens":120,"cache_read_input_tokens":200000}}"#,
+            )
+            .unwrap();
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Usage(u) => Some(u),
+                _ => None,
+            })
+            .expect("message_delta 要产出用量事件");
+        assert_eq!(usage.cache_tokens, 200000);
+        assert_eq!(usage.prompt_tokens, 200050);
+        assert_eq!(usage.completion_tokens, 120);
+    }
+
+    #[test]
+    fn anthropic_cache_creation_counts_as_input_but_not_as_hit() {
+        // 写缓存（cache_creation）是输入的一部分，但不是「命中」，
+        // 不该记进缓存列——否则缓存率会被算成命中率。
+        let body = json!({
+            "model": "claude",
+            "content": [{ "type": "text", "text": "好的" }],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 30,
+                "output_tokens": 10,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 2000
+            }
+        });
+
+        let response = adapter_for(ApiFormat::Anthropic).parse_chat(&body).unwrap();
+        assert_eq!(response.usage.prompt_tokens, 2030, "写缓存也算输入");
+        assert_eq!(response.usage.cache_tokens, 0, "写缓存不是命中");
+        assert_eq!(response.usage.total_tokens, 2040);
+    }
+
+    #[test]
+    fn anthropic_stream_without_cache_still_emits_input_usage() {
+        // 没开缓存时不该因为「缓存为 0」而把整条输入用量丢掉。
+        let events = adapter_for(ApiFormat::Anthropic)
+            .parse_stream_event(
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":0}}}"#,
+            )
+            .unwrap();
+        assert!(
+            matches!(&events[0], StreamEvent::Usage(u) if u.prompt_tokens == 12 && u.cache_tokens == 0),
+            "无缓存时仍要报输入用量"
+        );
+    }
+
+    #[test]
     fn google_uses_generate_content_endpoint_with_system_instruction() {
         let outgoing = adapter_for(ApiFormat::Google).build_chat(&sample_request(), "gemini-3.5");
         let body = outgoing.body.as_ref().unwrap();

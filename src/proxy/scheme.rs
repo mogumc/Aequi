@@ -146,7 +146,16 @@ pub struct Usage {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
-    /// 命中缓存的输入 token。各家字段不同，这里归一。
+    /// 命中缓存的输入 token——**读取**命中，才叫命中。
+    ///
+    /// 各家字段不同，这里归一：
+    /// OpenAI `prompt_tokens_details.cached_tokens`、Anthropic
+    /// `cache_read_input_tokens`、Google `cachedContentTokenCount`。
+    ///
+    /// 注意 Anthropic 的 `cache_creation_input_tokens` **不进这一列**：
+    /// 它是**这次请求正在写入缓存**的部分（下次请求才可能读到），
+    /// 本次并没有「命中」任何东西。它仍然算输入（并入 `prompt_tokens`），
+    /// 但不该被记成缓存命中——否则命中率会把「写入量」算进去，越写越高。
     pub cache_tokens: i64,
     /// true 表示这套数字是本地估算的，不是上游报的。
     pub estimated: bool,
