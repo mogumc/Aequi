@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 
 use aequi::config::Settings;
 use aequi::db;
@@ -100,26 +100,61 @@ fn header(name: &str, value: &str) -> HeaderEntry {
     }
 }
 
-/// mock 上游：把收到的头抄一份下来，再回一个合法的列模型响应。
+/// mock 上游：把收到的头抄一份下来，再回一个最小可用响应。
+///
+/// 两个端点都要有——探测走真实对话请求（`/v1/chat/completions`），
+/// 而「拉取模型列表」走 `/v1/models`；两条路共用同一份出口配置。
 fn mock_upstream(sink: Arc<Mutex<Vec<(String, String)>>>) -> Router {
-    Router::new().route(
-        "/v1/models",
-        get(move |headers: axum::http::HeaderMap| {
-            let sink = Arc::clone(&sink);
-            async move {
-                let mut captured = sink.lock().expect("锁住抄表");
-                for (name, value) in headers.iter() {
-                    captured.push((
-                        name.as_str().to_string(),
-                        value.to_str().unwrap_or_default().to_string(),
-                    ));
-                }
-                drop(captured);
+    let chat_sink = Arc::clone(&sink);
+    let models_sink = Arc::clone(&sink);
 
-                axum::Json(serde_json::json!({ "data": [{ "id": "demo-model" }] }))
-            }
-        }),
-    )
+    Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move |headers: axum::http::HeaderMap| {
+                let sink = Arc::clone(&chat_sink);
+                async move {
+                    let mut captured = sink.lock().expect("锁住抄表");
+                    for (name, value) in headers.iter() {
+                        captured.push((
+                            name.as_str().to_string(),
+                            value.to_str().unwrap_or_default().to_string(),
+                        ));
+                    }
+                    drop(captured);
+
+                    axum::Json(serde_json::json!({
+                        "id": "mock-id",
+                        "object": "chat.completion",
+                        "model": "demo-model",
+                        "choices": [{
+                            "index": 0,
+                            "message": { "role": "assistant", "content": "pong" },
+                            "finish_reason": "stop",
+                        }],
+                        "usage": { "prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4 },
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/v1/models",
+            get(move |headers: axum::http::HeaderMap| {
+                let sink = Arc::clone(&models_sink);
+                async move {
+                    let mut captured = sink.lock().expect("锁住抄表");
+                    for (name, value) in headers.iter() {
+                        captured.push((
+                            name.as_str().to_string(),
+                            value.to_str().unwrap_or_default().to_string(),
+                        ));
+                    }
+                    drop(captured);
+
+                    axum::Json(serde_json::json!({ "data": [{ "id": "demo-model" }] }))
+                }
+            }),
+        )
 }
 
 async fn serve(router: Router) -> String {
@@ -185,6 +220,7 @@ async fn custom_headers_reach_the_upstream_from_both_entry_points() {
         &app.state.upstream,
         "demo-block",
         &keys[0].id,
+        "demo-model",
     )
     .await
     .expect("测试密钥失败");

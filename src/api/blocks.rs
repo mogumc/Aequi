@@ -149,7 +149,7 @@ pub async fn resume_keys(
 /// `POST /api/blocks/{id}/keys/never-disable`
 ///
 /// 批量设置「永不暂停」：免于被自动停用。连续失败只记录、不改状态；
-/// 429 与瞬时故障的指数退避照常生效（退避是临时避让，不是停用）。
+/// 429 与瞬时故障的退避照常生效（退避是临时避让，不是停用）。
 /// `enabled` 缺省为 true，传 false 取消豁免。
 pub async fn never_disable_keys(
     State(state): State<Arc<AppState>>,
@@ -182,12 +182,34 @@ pub async fn set_keys_weight(
     ))))
 }
 
+/// 测试密钥的请求体。
+///
+/// 测试改为发一次真实对话请求，所以要指定用哪个模型打上游——不传就用
+/// 块里配的第一个模型。`model` 传的是**对外模型名**，服务层会按块的
+/// 转发配置换成上游要的名字。
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct KeyTestRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
 /// `POST /api/blocks/{id}/keys/{key_id}/test`
 pub async fn test_key(
     State(state): State<Arc<AppState>>,
     Path((id, key_id)): Path<(String, String)>,
+    body: Option<Json<KeyTestRequest>>,
 ) -> Result<Json<MessageResponse>> {
-    match upstream::test_key(&state.store.data, &state.upstream, &id, &key_id).await? {
+    // 请求体整体可省（`{}` 与不带 body 都行），缺省用块里第一个模型。
+    let requested = body.and_then(|Json(payload)| payload.model);
+    let model = match requested.as_deref() {
+        Some(model) => model.to_string(),
+        None => {
+            let block = upstream::get_block(&state.store.data, &id).await?;
+            upstream::probe_model(&block)?
+        }
+    };
+
+    match upstream::test_key(&state.store.data, &state.upstream, &id, &key_id, &model).await? {
         crate::proxy::adapter::ProbeOutcome::Valid => Ok(Json(MessageResponse::ok("密钥可用"))),
         crate::proxy::adapter::ProbeOutcome::Invalid(detail) => {
             Ok(Json(MessageResponse::ok(format!("密钥无效：{detail}"))))
@@ -216,11 +238,23 @@ pub async fn fetch_models(
     Ok(Json(FetchedModelsResponse { models }))
 }
 
+/// `POST /api/blocks/{id}/test`
+///
+/// 整块连通性测试：逐把测试块内全部密钥（都用同一个模型），返回每把的结果与汇总。
+/// 不传 `model` 时用块里配的第一个模型。
 pub async fn test_block(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    body: Option<Json<KeyTestRequest>>,
 ) -> Result<Json<BlockTestResult>> {
+    let requested = body.and_then(|Json(payload)| payload.model);
     Ok(Json(
-        upstream::test_block(&state.store.data, &state.upstream, &id).await?,
+        upstream::test_block(
+            &state.store.data,
+            &state.upstream,
+            &id,
+            requested.as_deref(),
+        )
+        .await?,
     ))
 }

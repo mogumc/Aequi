@@ -221,7 +221,11 @@ impl Adapter for GoogleAdapter {
         })
     }
 
-    fn build_probe(&self) -> UpstreamRequest {
+    fn build_probe(&self, model: &str) -> UpstreamRequest {
+        self.build_chat(&ChatRequest::probe(model), model)
+    }
+
+    fn build_models_request(&self) -> UpstreamRequest {
         UpstreamRequest {
             path: MODELS_PATH.to_string(),
             body: None,
@@ -1369,11 +1373,18 @@ mod tests {
     }
 
     #[test]
-    fn probe_and_models_share_the_listing_endpoint() {
+    fn probe_is_a_real_chat_but_models_listing_keeps_its_own_endpoint() {
         let adapter = GoogleAdapter;
-        let probe = adapter.build_probe();
-        assert_eq!(probe.path, "/v1beta/models");
-        assert!(probe.body.is_none());
+
+        // 探测：真实对话请求，路径带模型名、有请求体。
+        let probe = adapter.build_probe("gemini-3.5-flash");
+        assert_eq!(probe.path, "/v1beta/models/gemini-3.5-flash:generateContent");
+        assert!(probe.body.is_some(), "探测必须是能证明密钥可用的真实请求");
+
+        // 拉模型列表：仍然走列模型接口，两者不该再混为一谈。
+        let listing = adapter.build_models_request();
+        assert_eq!(listing.path, "/v1beta/models");
+        assert!(listing.body.is_none());
 
         let body = serde_json::json!({
             "models": [

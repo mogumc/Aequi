@@ -3,7 +3,8 @@
 //! 入口与上游都只有 OpenAI 一种格式（Google 与 Anthropic 的块没有生图端点），
 //! 一对一的协议不需要中间标准层，直接透传——等第二家格式支持生图时再抽。
 //!
-//! 调度、重试与双轨日志和对话共用同一套规则。
+//! 调度与双轨日志和对话共用同一套规则，**但不重试**：出图是带副作用的慢操作，
+//! 详见 [`dispatch`] 的说明。
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,9 +16,10 @@ use crate::error::{Error, Result};
 use crate::model::ApiKey;
 use crate::proxy::adapter::{AuthStyle, EXTRA_BODY_KEY, UpstreamRequest};
 use crate::proxy::scheme::Usage;
-use crate::proxy::{Failure, MAX_ATTEMPTS, base_log, estimate, sanitize_user_message, write_log};
+use crate::proxy::{
+    Failure, UpstreamResponse, base_log, estimate, log_failure, sanitize_user_message, write_log,
+};
 use crate::service::{billing, upstream};
-use crate::utils::time;
 
 /// 生图接口的路径，与入口同名。
 const IMAGES_PATH: &str = "/v1/images/generations";
@@ -102,7 +104,25 @@ async fn dispatch_entry(
     };
 
     // 解析目标：归一化模型名（剥掉块前缀），并记下是否锁定了某个块。
-    let target = upstream::resolve_with_header(pool, &model, header_block).await?;
+    let target = match upstream::resolve_with_header(pool, &model, header_block).await {
+        Ok(target) => target,
+        Err(error) => {
+            let failure = Failure::bare(error);
+            log_failure(
+                pool,
+                key,
+                ip,
+                user_agent,
+                &model,
+                started,
+                false,
+                &failure,
+                &[],
+            )
+            .await;
+            return Err(failure.error);
+        }
+    };
     let model = &target.model;
     let only = target.block_id.as_deref();
 
@@ -135,36 +155,25 @@ async fn dispatch_entry(
             Ok(outcome.response)
         }
         Err(failure) => {
-            // 块 id 要先取出来——`.failed_with_context()` 会把它移走。
-            let failed_block = failure.context.as_ref().map(|(block, _)| block.clone());
-            write_log(
-                pool,
-                base_log(key, ip, user_agent, started)
-                    .model(model.clone())
-                    .failed_with_context(&failure.error, failure.context),
-            )
-            .await;
-
-            if let Err(log_error) = crate::db::usage::insert_error(
-                pool,
-                &key.id,
-                &model,
-                failed_block.as_deref(),
-                &failure.user_message,
-                false,
-                time::now_secs(),
-            )
-            .await
-            {
-                tracing::warn!(error = %log_error, "写入失败用量记录失败");
-            }
+            // 管理员看到细节，密钥侧只看到脱敏描述。
+            // 生图不重试，所以没有重试链可带。
+            log_failure(pool, key, ip, user_agent, model, started, false, &failure, &[]).await;
 
             Err(failure.error)
         }
     }
 }
 
-/// 挑块、挑密钥、发送、计费。
+/// 挑块、挑密钥、发送、计费——**只发一次，失败即返回**。
+///
+/// 生图与对话最大的不同在这里：对话换把钥匙重试几乎是免费的（上游没产出
+/// 就不计费），出图却是有副作用的慢操作——单张图动辄几十秒，重试等于把最长
+/// 的等待再翻一倍，而且上游很可能**已经出图并计了费**，我们却拿不到结果。
+/// 所以宁可如实把错误交回调用方（由它决定要不要重发），也不替它把时间与
+/// 额度一起赌进去。
+///
+/// 「不重试」不等于「不记账」：上游为什么会失败（限流 / 密钥被拒 / 5xx）
+/// 仍照记到密钥头上，该退避的退避、该停用的停用。
 async fn dispatch(
     state: &Arc<AppState>,
     key: &ApiKey,
@@ -175,232 +184,233 @@ async fn dispatch(
     only: Option<&str>,
 ) -> std::result::Result<ImageOutcome, Failure> {
     let pool = &state.store.data;
-    let mut last_failure = None;
 
-    for _ in 0..MAX_ATTEMPTS {
-        let block = match upstream::select_block(pool, &state.upstream, key, model, only).await {
-            Ok(block) => block,
-            Err(error) => return Err(Failure::bare(error)),
-        };
-
-        // 生图目前只有 OpenAI 格式的上游有对应端点。
-        if block.api_format != crate::model::ApiFormat::Openai {
-            let message = format!("上游块 {} 的格式不支持生图", block.id);
-            return Err(Failure::with_context(
-                Error::BadRequest(message.clone()),
-                message,
-                Some((block.id, String::new())),
-            ));
-        }
-
-        let upstream_key = match upstream::select_key(pool, &state.upstream, &block).await {
-            Ok(key) => key,
-            Err(error) => {
-                let context = Some((block.id.clone(), String::new()));
-                let user_message = sanitize_user_message(&error);
-                return Err(Failure::with_context(error, user_message, context));
-            }
-        };
-
-        // 模型名替换成块里配置的转发名，其余字段原样透传。
-        let mut outgoing = body.clone();
-        outgoing["model"] = json!(block.target_model(model));
-        // 额外请求体只认管理端配置的。生图是透传路径，下游塞的同名键
-        // 不会被任何白名单解析挡住，必须显式丢掉。
-        if let Some(object) = outgoing.as_object_mut() {
-            object.remove(EXTRA_BODY_KEY);
-        }
-
-        let mut request = UpstreamRequest {
-            path: IMAGES_PATH.to_string(),
-            body: Some(outgoing),
-        };
-        request.apply_extra_body(block.extra_body(model));
-        let client = match state.upstream.client(&block) {
-            Ok(client) => client,
-            Err(error) => {
-                let context = Some((block.id.clone(), upstream_key.id.clone()));
-                // 代理地址之类的出口细节不进用户能查到的表。
-                let user_message = sanitize_user_message(&error);
-                return Err(Failure::with_context(error, user_message, context));
-            }
-        };
-
-        let context = Some((block.id.clone(), upstream_key.id.clone()));
-
-        // 并发闸门：与对话同一套规则——块配了上限就排队等位子，
-        // 位子持有到本轮结束（重试换块时先释放）。
-        let _permit = match crate::proxy::acquire_gate(state, &block).await {
-            Ok(permit) => permit,
-            Err(error) => {
-                let user_message = sanitize_user_message(&error);
-                return Err(Failure::with_context(error, user_message, context));
-            }
-        };
-
-        match crate::proxy::send(
-            &client,
-            &block,
-            &request,
-            AuthStyle::Bearer,
-            &upstream_key.secret,
-        )
+    // `select_block` 的失败是确定性的（模型没上游 / 块不提供该模型 /
+    // 密钥无权用它），不需要留上一轮——这里只有一轮。
+    let block = upstream::select_block(pool, &state.upstream, key, model, only)
         .await
-        {
-            Ok((status, response_body)) => {
-                if status == 429 {
-                    upstream::report_failure(
-                        pool,
-                        &upstream_key,
-                        upstream::FailureKind::RateLimited,
-                        "被限流，暂时退避",
-                    )
-                    .await;
-                    last_failure = Some(Failure::with_context(
-                        Error::UpstreamUnavailable("上游限流".to_string()),
-                        "上游限流".to_string(),
-                        context,
-                    ));
-                    continue;
-                }
+        .map_err(Failure::bare)?;
 
-                if status == 401 || status == 403 {
-                    let detail = response_body
-                        .pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    upstream::report_failure(
-                        pool,
-                        &upstream_key,
-                        upstream::FailureKind::Hard,
-                        &format!("上游返回 {status} {detail}"),
-                    )
-                    .await;
-                    last_failure = Some(Failure::with_context(
-                        Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
-                        format!("上游响应异常: 返回 {status}"),
-                        context,
-                    ));
-                    continue;
-                }
-
-                if status >= 500 {
-                    let detail = response_body
-                        .pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    upstream::report_failure(
-                        pool,
-                        &upstream_key,
-                        upstream::FailureKind::Transient,
-                        &format!("上游返回 {status} {detail}"),
-                    )
-                    .await;
-                    last_failure = Some(Failure::with_context(
-                        Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
-                        format!("上游响应异常: 返回 {status}"),
-                        context,
-                    ));
-                    continue;
-                }
-
-                if !(200..300).contains(&status) {
-                    let detail = response_body
-                        .pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let message = format!("上游返回 {status} {detail}");
-                    return Err(Failure::with_context(
-                        Error::UpstreamUnavailable(message.clone()),
-                        format!("上游响应异常: 返回 {status}"),
-                        context,
-                    ));
-                }
-
-                // 200 却没有 data，多半是网关吐了故障页，换一把再试。
-                let data = match response_body.get("data").and_then(Value::as_array) {
-                    Some(data) => data,
-                    None => {
-                        let error = Error::UpstreamUnavailable("上游响应里没有 data".to_string());
-                        let user_message = sanitize_user_message(&error);
-                        upstream::report_failure(
-                            pool,
-                            &upstream_key,
-                            upstream::FailureKind::Transient,
-                            &error.to_string(),
-                        )
-                        .await;
-                        last_failure = Some(Failure::with_context(error, user_message, context));
-                        continue;
-                    }
-                };
-
-                upstream::report_success(pool, &upstream_key.id).await;
-
-                // gpt-image-1 等新一代接口自带 usage；DALL-E 系列按张估算。
-                let usage = parse_usage(&response_body).unwrap_or_else(|| {
-                    Usage::estimated(
-                        estimate::estimate_text(
-                            body.get("prompt").and_then(Value::as_str).unwrap_or(""),
-                        ),
-                        IMAGE_TOKENS_PER_PICTURE * data.len().max(1) as i64,
-                    )
-                });
-
-                let charge = match billing::charge(
-                    pool,
-                    key,
-                    &block.id,
-                    model,
-                    usage,
-                    block.multiplier_bp(model),
-                    false,
-                )
-                .await
-                {
-                    Ok(charge) => charge,
-                    Err(error) => {
-                        let user_message = sanitize_user_message(&error);
-                        return Err(Failure::with_context(error, user_message, context));
-                    }
-                };
-
-                tracing::info!(
-                    model = %model,
-                    block = %block.id,
-                    pictures = data.len(),
-                    tokens = charge.usage.total_tokens,
-                    estimated = charge.usage.estimated,
-                    credits = %charge.credits_scaled,
-                    duration_ms = started.elapsed().as_millis() as u64,
-                    "生图请求完成"
-                );
-
-                return Ok(ImageOutcome {
-                    response: response_body,
-                    usage: charge.usage,
-                    charge,
-                    block_id: block.id,
-                    upstream_key_id: upstream_key.id,
-                });
-            }
-            Err(error) => {
-                // reqwest 的报错可能带 URL，不进用户能查到的表。
-                let user_message = sanitize_user_message(&error);
-                upstream::report_failure(
-                    pool,
-                    &upstream_key,
-                    upstream::FailureKind::Transient,
-                    &error.to_string(),
-                )
-                .await;
-                last_failure = Some(Failure::with_context(error, user_message, context));
-            }
-        }
+    // 生图目前只有 OpenAI 格式的上游有对应端点。
+    if block.api_format != crate::model::ApiFormat::Openai {
+        let message = format!("上游块 {} 的格式不支持生图", block.id);
+        return Err(Failure::with_context(
+            Error::BadRequest(message.clone()),
+            message,
+            Some((block.id, String::new())),
+        ));
     }
 
-    Err(last_failure
-        .unwrap_or_else(|| Failure::bare(Error::UpstreamUnavailable("上游不可用".to_string()))))
+    // 块内选不出密钥（配置问题 403 / 全在退避 429）——照实回给调用方。
+    let upstream_key = upstream::select_key(pool, &state.upstream, &block)
+        .await
+        .map_err(|error| {
+            let user_message = sanitize_user_message(&error);
+            Failure::with_context(error, user_message, Some((block.id.clone(), String::new())))
+        })?;
+
+    // 模型名替换成块里配置的转发名，其余字段原样透传。
+    let mut outgoing = body.clone();
+    outgoing["model"] = json!(block.target_model(model));
+    // 额外请求体只认管理端配置的。生图是透传路径，下游塞的同名键
+    // 不会被任何白名单解析挡住，必须显式丢掉。
+    if let Some(object) = outgoing.as_object_mut() {
+        object.remove(EXTRA_BODY_KEY);
+    }
+
+    let mut request = UpstreamRequest {
+        path: IMAGES_PATH.to_string(),
+        body: Some(outgoing),
+    };
+    request.apply_extra_body(block.extra_body(model));
+
+    let client = state.upstream.client(&block).map_err(|error| {
+        // 代理地址之类的出口细节不进用户能查到的表。
+        let user_message = sanitize_user_message(&error);
+        Failure::with_context(error, user_message, Some((block.id.clone(), upstream_key.id.clone())))
+    })?;
+
+    let context = Some((block.id.clone(), upstream_key.id.clone()));
+
+    // 并发闸门：与对话同一套规则——块配了上限就排队等位子。
+    let _permit = crate::proxy::acquire_gate(state, &block)
+        .await
+        .map_err(|error| {
+            let user_message = sanitize_user_message(&error);
+            Failure::with_context(error, user_message, context.clone())
+        })?;
+
+    let sent = crate::proxy::send(
+        &client,
+        &block,
+        &request,
+        AuthStyle::Bearer,
+        &upstream_key.secret,
+    )
+    .await;
+
+    let response = match sent {
+        Ok(response) => response,
+        Err(error) => {
+            // reqwest 的报错可能带 URL，不进用户能查到的表。
+            // 超时也走这里：生图没有单独的超时，与对话共用那条 120 秒总超时。
+            let user_message = sanitize_user_message(&error);
+            upstream::report_failure(
+                pool,
+                &upstream_key,
+                upstream::FailureKind::Transient,
+                &error.to_string(),
+                None,
+            )
+            .await;
+            return Err(Failure::with_context(error, user_message, context));
+        }
+    };
+
+    let UpstreamResponse {
+        status,
+        body: response_body,
+        retry_after,
+    } = response;
+
+    if status == 429 {
+        let detail = error_message(&response_body);
+        let wait = upstream::report_failure(
+            pool,
+            &upstream_key,
+            upstream::FailureKind::RateLimited,
+            &format!("上游返回 429 {detail}"),
+            retry_after,
+        )
+        .await;
+        // 上游没给提示时退回这把钥匙刚挂上的退避秒数；下游至少别比我们更早回头打。
+        return Err(Failure::with_context(
+            Error::RateLimited {
+                message: "上游限流，请稍后重试".to_string(),
+                retry_after: retry_after.or(wait),
+            },
+            "上游限流，请稍后重试".to_string(),
+            context,
+        )
+        // 对下游只能给句稳妥话；日志里要留下上游的原话。
+        .with_detail(format!("上游返回 429 {detail}")));
+    }
+
+    // 密钥被拒：下游绝不能收到 401/403——那是我们的钥匙坏了，
+    // 不是客户端凭证有问题；对他们来说是上游不可用。
+    if status == 401 || status == 403 {
+        let detail = error_message(&response_body);
+        upstream::report_failure(
+            pool,
+            &upstream_key,
+            upstream::FailureKind::Hard,
+            &format!("上游返回 {status} {detail}"),
+            // 硬失败不退避，上游提示（若有）也无处可用。
+            None,
+        )
+        .await;
+        return Err(Failure::with_context(
+            Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
+            format!("上游响应异常: 返回 {status}"),
+            context,
+        ));
+    }
+
+    // 上游自己的故障（5xx）不算密钥的账：退避但不停用。
+    if status >= 500 {
+        let detail = error_message(&response_body);
+        upstream::report_failure(
+            pool,
+            &upstream_key,
+            upstream::FailureKind::Transient,
+            &format!("上游返回 {status} {detail}"),
+            // 503 也常见带 Retry-After，有就照它等。
+            retry_after,
+        )
+        .await;
+        return Err(Failure::with_context(
+            Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
+            format!("上游响应异常: 返回 {status}"),
+            context,
+        ));
+    }
+
+    if !(200..300).contains(&status) {
+        // 请求本身的问题（参数、尺寸不支持等）：重发也不会好。
+        let detail = error_message(&response_body);
+        return Err(Failure::with_context(
+            Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
+            format!("上游响应异常: 返回 {status}"),
+            context,
+        ));
+    }
+
+    // 200 却没有 data，多半是网关吐了故障页。
+    let Some(data) = response_body.get("data").and_then(Value::as_array) else {
+        let error = Error::UpstreamUnavailable("上游响应里没有 data".to_string());
+        let user_message = sanitize_user_message(&error);
+        upstream::report_failure(
+            pool,
+            &upstream_key,
+            upstream::FailureKind::Transient,
+            &error.to_string(),
+            // 200 的响应没有可用的限流提示。
+            None,
+        )
+        .await;
+        return Err(Failure::with_context(error, user_message, context));
+    };
+
+    upstream::report_success(pool, &upstream_key.id).await;
+
+    // gpt-image-1 等新一代接口自带 usage；DALL-E 系列按张估算。
+    let usage = parse_usage(&response_body).unwrap_or_else(|| {
+        Usage::estimated(
+            estimate::estimate_text(body.get("prompt").and_then(Value::as_str).unwrap_or("")),
+            IMAGE_TOKENS_PER_PICTURE * data.len().max(1) as i64,
+        )
+    });
+
+    let charge = billing::charge(
+        pool,
+        key,
+        &block.id,
+        model,
+        usage,
+        block.multiplier_bp(model),
+        false,
+    )
+    .await
+    .map_err(|error| {
+        let user_message = sanitize_user_message(&error);
+        Failure::with_context(error, user_message, context)
+    })?;
+
+    tracing::info!(
+        model = %model,
+        block = %block.id,
+        pictures = data.len(),
+        tokens = charge.usage.total_tokens,
+        estimated = charge.usage.estimated,
+        credits = %charge.credits_scaled,
+        duration_ms = started.elapsed().as_millis() as u64,
+        "生图请求完成"
+    );
+
+    Ok(ImageOutcome {
+        response: response_body,
+        usage: charge.usage,
+        charge,
+        block_id: block.id,
+        upstream_key_id: upstream_key.id,
+    })
+}
+
+/// 上游错误体里的可读说明；错误体可能是 HTML、空体或没有这个字段，此时给空串。
+fn error_message(body: &Value) -> &str {
+    body.pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
 }
 
 /// gpt-image-1 等新一代生图接口会在响应里带 usage；没有则返回 None 走估算。

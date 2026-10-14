@@ -187,6 +187,33 @@ impl ChatRequest {
             .iter()
             .filter(|message| message.role != Role::System)
     }
+
+    /// 测试上游密钥用的最小请求：一句话、不带任何可选参数。
+    ///
+    /// **刻意不设输出上限**：`max_tokens` 与 `max_completion_tokens` 各有一批
+    /// 模型不认，加错了会让一把好钥匙被判成坏的——而「探测不该依赖上游支不
+    /// 支持某个字段」正是用真实请求替代列模型接口的出发点。代价是这次测试会
+    /// 真的消耗少量 token。
+    pub fn probe(model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentPart::text("ping")],
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+            }],
+            tools: Vec::new(),
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            max_tokens_field: TokenLimitField::default(),
+            reasoning: None,
+            stop: Vec::new(),
+        }
+    }
 }
 
 /// 结束原因。

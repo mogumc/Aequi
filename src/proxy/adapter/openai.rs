@@ -213,7 +213,11 @@ impl Adapter for OpenAiAdapter {
         })
     }
 
-    fn build_probe(&self) -> UpstreamRequest {
+    fn build_probe(&self, model: &str) -> UpstreamRequest {
+        self.build_chat(&ChatRequest::probe(model), model)
+    }
+
+    fn build_models_request(&self) -> UpstreamRequest {
         UpstreamRequest {
             path: MODELS_PATH.to_string(),
             body: None,

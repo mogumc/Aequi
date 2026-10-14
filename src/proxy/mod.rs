@@ -76,9 +76,12 @@ pub(crate) async fn acquire_gate(
 ///
 /// 管理员看到 `error` 全文，密钥侧只看到 `user_message`——
 /// 上游的原话（比如它对密钥的具体抱怨）不进密钥能查到的那张表。
-struct Failure {
+pub(crate) struct Failure {
     error: Error,
     user_message: String,
+    /// 管理员日志里这一轮失败的原因，可以带上游原话——与给下游看的
+    /// `error` 分开，因为限流那类错误对下游只能给一句稳妥的话。
+    detail: String,
     context: Option<(String, String)>,
 }
 
@@ -86,9 +89,11 @@ impl Failure {
     /// 无上下文的失败（还没选中块或密钥）。
     fn bare(error: Error) -> Self {
         let user_message = sanitize_user_message(&error);
+        let detail = error.to_string();
         Self {
             error,
             user_message,
+            detail,
             context: None,
         }
     }
@@ -103,13 +108,104 @@ impl Failure {
         } else {
             user_message
         };
+        let detail = error.to_string();
 
         Self {
             error,
             user_message,
+            detail,
             context,
         }
     }
+
+    /// 换掉管理员日志里的失败原因。
+    ///
+    /// 用在「错误本身只能是稳妥话术、但日志要留下上游原话」的场合——
+    /// 比如限流：对下游说「上游限流，请稍后重试」，对管理员记
+    /// 「上游返回 429 inference exceeds tpm/rpm limit」。
+    fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = detail.into();
+        self
+    }
+
+    /// 补上「块内最早的恢复时间」当等待提示。
+    ///
+    /// 用在块内密钥全在退避的时刻：上一轮那次限流本没带秒数，这里能拿到
+    /// 最早解除退避的时间，就补成对下游有用的 `Retry-After`。
+    fn with_wait_hint(mut self, hint: Option<i64>) -> Self {
+        self.error = self.error.with_retry_hint(hint);
+        self
+    }
+}
+
+/// 一次「换钥匙重试」的留痕。
+///
+/// 管理员要在日志里看出这次请求换过几把钥匙、每把为什么被换掉——只记最终
+/// 结果的话，「先被限流、换一把就成了」这种事在请求流水里完全不可见。
+#[derive(Debug, Clone)]
+pub(crate) struct AttemptNote {
+    block_id: String,
+    /// 为空表示这一轮还没选出密钥就失败了（块内没有可调度的密钥）。
+    upstream_key_id: String,
+    /// 这一轮的失败原因；上游原话只进管理员日志，不进密钥侧那张表。
+    reason: String,
+}
+
+impl AttemptNote {
+    pub(crate) fn new(block_id: &str, upstream_key_id: &str, reason: String) -> Self {
+        Self {
+            block_id: block_id.to_string(),
+            upstream_key_id: upstream_key_id.to_string(),
+            reason,
+        }
+    }
+}
+
+/// 给一次失败的尝试留痕，并把失败原样交还。
+///
+/// 包在 `Failure::with_context(..)` 外面用：`continue` 前一行就是这个——
+/// 免得每个分支各写一遍「记一笔」，也就不会漏记。
+pub(crate) fn record_retry(attempts: &mut Vec<AttemptNote>, failure: Failure) -> Failure {
+    let (block_id, upstream_key_id) = match failure.context.as_ref() {
+        Some((block, key)) => (block.as_str(), key.as_str()),
+        None => ("", ""),
+    };
+    attempts.push(AttemptNote::new(
+        block_id,
+        upstream_key_id,
+        failure.detail.clone(),
+    ));
+    failure
+}
+
+/// 把重试链拼成一句，塞进日志的 `error_detail`。
+///
+/// 每一轮失败都列出来（含「这一轮连密钥都选不出」），最后再接一句最终结局——
+/// 只记最终结果的话，「先被限流、换一把就成了」这种事在流水里完全不可见。
+fn render_attempts(attempts: &[AttemptNote]) -> Option<String> {
+    if attempts.is_empty() {
+        return None;
+    }
+
+    let mut text = format!("共 {} 次尝试：", attempts.len());
+    for (index, attempt) in attempts.iter().enumerate() {
+        if index > 0 {
+            text.push('；');
+        }
+        // 没选出密钥的那一轮没有密钥 id，只报块。
+        let position = if attempt.upstream_key_id.is_empty() {
+            format!("第{}次 {}", index + 1, attempt.block_id)
+        } else {
+            format!(
+                "第{}次 {}/{}",
+                index + 1,
+                attempt.block_id,
+                attempt.upstream_key_id
+            )
+        };
+        text.push_str(&format!("{position} {}", attempt.reason));
+    }
+    Some(text)
 }
 
 /// 密钥侧允许看到的错误描述。
@@ -124,6 +220,7 @@ fn sanitize_user_message(error: &Error) -> String {
         Error::BadRequest(_)
         | Error::NotFound(_)
         | Error::Forbidden(_)
+        | Error::RateLimited { .. }
         | Error::InsufficientCredits => error.to_string(),
         Error::UpstreamUnavailable(_) => "上游响应异常".to_string(),
         _ => "服务暂时不可用，请稍后重试".to_string(),
@@ -206,7 +303,25 @@ async fn chat_completion_inner(
     };
 
     // 解析目标：归一化模型名（剥掉块前缀），并记下是否锁定了某个块。
-    let target = upstream::resolve_with_header(pool, &request.model, header_block).await?;
+    let target = match upstream::resolve_with_header(pool, &request.model, header_block).await {
+        Ok(target) => target,
+        Err(error) => {
+            let failure = Failure::bare(error);
+            log_failure(
+                pool,
+                key,
+                ip,
+                user_agent,
+                &request.model,
+                started,
+                false,
+                &failure,
+                &[],
+            )
+            .await;
+            return Err(failure.error);
+        }
+    };
     request.model = target.model;
 
     // 余额为零（且不是无限额度）时直接拒绝，免得替用户白白消耗上游。
@@ -223,7 +338,18 @@ async fn chat_completion_inner(
         return Err(error);
     }
 
-    match dispatch(state, key, &request, started, target.block_id.as_deref()).await {
+    let mut attempts = Vec::new();
+
+    match dispatch(
+        state,
+        key,
+        &request,
+        started,
+        target.block_id.as_deref(),
+        &mut attempts,
+    )
+    .await
+    {
         Ok(outcome) => {
             write_log(
                 pool,
@@ -231,6 +357,7 @@ async fn chat_completion_inner(
                     .model(request.model.clone())
                     .block(&outcome.block_id)
                     .upstream_key(&outcome.upstream_key_id)
+                    .attempts(attempts)
                     .succeeded(outcome.response.usage, outcome.charge.credits_scaled)
                     .to_success_log(),
             )
@@ -249,31 +376,19 @@ async fn chat_completion_inner(
             ))
         }
         Err(failure) => {
-            // 失败也要留下痕迹：管理员看到细节，用户只看到脱敏描述。
-            // 块 id 要先取出来——`.failed_with_context()` 会把它移走。
-            let failed_block = failure.context.as_ref().map(|(block, _)| block.clone());
-            write_log(
+            // 失败也要留下痕迹：管理员看到细节（含重试链），用户只看到脱敏描述。
+            log_failure(
                 pool,
-                base_log(key, ip, user_agent, started)
-                    .model(request.model.clone())
-                    .failed_with_context(&failure.error, failure.context),
+                key,
+                ip,
+                user_agent,
+                &request.model,
+                started,
+                false,
+                &failure,
+                &attempts,
             )
             .await;
-
-            if let Err(log_error) = crate::db::usage::insert_error(
-                pool,
-                &key.id,
-                &request.model,
-                // 拿不到块（还没选中就失败）时降级为空，不影响记账。
-                failed_block.as_deref(),
-                &failure.user_message,
-                false,
-                time::now_secs(),
-            )
-            .await
-            {
-                tracing::warn!(error = %log_error, "写入失败用量记录失败");
-            }
 
             Err(failure.error)
         }
@@ -315,14 +430,67 @@ pub async fn chat_completion_stream(
     let started = Instant::now();
     let pool = &state.store.data;
 
-    let mut request = openai_in::parse_request(&body)?;
+    // 建流前就会失败的那几处也要落日志——参数错、模型没上游、余额为零
+    // 都是「请求进来了却没被服务」，流水里必须查得到。
+    let mut attempts: Vec<AttemptNote> = Vec::new();
+
+    let mut request = match openai_in::parse_request(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            let failure = Failure::bare(error);
+            log_failure(
+                pool,
+                &key,
+                &ip,
+                user_agent.as_deref(),
+                "",
+                started,
+                true,
+                &failure,
+                &attempts,
+            )
+            .await;
+            return Err(failure.error);
+        }
+    };
     // 解析目标：归一化模型名（剥掉块前缀），并记下是否锁定了某个块。
     let target =
-        upstream::resolve_with_header(pool, &request.model, header_block.as_deref()).await?;
+        match upstream::resolve_with_header(pool, &request.model, header_block.as_deref()).await {
+            Ok(target) => target,
+            Err(error) => {
+                let failure = Failure::bare(error);
+                log_failure(
+                    pool,
+                    &key,
+                    &ip,
+                    user_agent.as_deref(),
+                    &request.model,
+                    started,
+                    true,
+                    &failure,
+                    &attempts,
+                )
+                .await;
+                return Err(failure.error);
+            }
+        };
     request.model = target.model;
 
     if !key.unlimited && key.credits_scaled <= 0 {
-        return Err(Error::InsufficientCredits);
+        let failure = Failure::bare(Error::InsufficientCredits);
+        log_failure(
+            pool,
+            &key,
+            &ip,
+            user_agent.as_deref(),
+            &request.model,
+            started,
+            true,
+            &failure,
+            &attempts,
+        )
+        .await;
+        return Err(failure.error);
     }
 
     let only = target.block_id.as_deref();
@@ -332,7 +500,7 @@ pub async fn chat_completion_stream(
     let mut chosen: Option<(String, String, crate::model::ApiFormat)> = None;
     // 倍率取自最终选中的那个块的模型条目；块本身不会进到流里，这里先取出来。
     let mut multiplier_bp = credits::DEFAULT_MULTIPLIER_BP;
-    let mut last_failure = None;
+    let mut last_failure: Option<Failure> = None;
     // 并发闸门的位子：建流成功后要跟着流走（流占着上游连接直到结束），
     // 所以声明在循环外；失败轮次里它是循环内局部，随手释放。
     let mut stream_permit: Option<OwnedSemaphorePermit> = None;
@@ -341,11 +509,57 @@ pub async fn chat_completion_stream(
         let block =
             match upstream::select_block(pool, &state.upstream, &key, &request.model, only).await {
                 Ok(block) => block,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // 已经失败过就以那一轮为准（它才是这次为什么没成的答案）。
+                    let failure = last_failure.take().unwrap_or_else(|| Failure::bare(error));
+                    log_failure(
+                        pool,
+                        &key,
+                        &ip,
+                        user_agent.as_deref(),
+                        &request.model,
+                        started,
+                        true,
+                        &failure,
+                        &attempts,
+                    )
+                    .await;
+                    return Err(failure.error);
+                }
             };
         let upstream_key = match upstream::select_key(pool, &state.upstream, &block).await {
             Ok(key) => key,
-            Err(error) => return Err(error),
+            Err(error) => {
+                // 同非流式：上一轮那次失败才是答案，顺手补上等待提示；
+                // 首轮就选不出密钥则照实返回（配置问题 → 403，全在退避 → 429）。
+                let failure = match last_failure.take() {
+                    Some(previous) => {
+                        attempts.push(AttemptNote::new(&block.id, "", error.to_string()));
+                        previous.with_wait_hint(error.retry_hint())
+                    }
+                    None => {
+                        let message = sanitize_user_message(&error);
+                        Failure::with_context(
+                            error,
+                            message,
+                            Some((block.id.clone(), String::new())),
+                        )
+                    }
+                };
+                log_failure(
+                    pool,
+                    &key,
+                    &ip,
+                    user_agent.as_deref(),
+                    &request.model,
+                    started,
+                    true,
+                    &failure,
+                    &attempts,
+                )
+                .await;
+                return Err(failure.error);
+            }
         };
 
         let adapter = adapter_for(block.api_format);
@@ -361,7 +575,30 @@ pub async fn chat_completion_stream(
         {
             outgoing.inject_stream_usage();
         }
-        let client = state.upstream.client(&block)?;
+        let client = match state.upstream.client(&block) {
+            Ok(client) => client,
+            Err(error) => {
+                let message = sanitize_user_message(&error);
+                let failure = Failure::with_context(
+                    error,
+                    message,
+                    Some((block.id.clone(), upstream_key.id.clone())),
+                );
+                log_failure(
+                    pool,
+                    &key,
+                    &ip,
+                    user_agent.as_deref(),
+                    &request.model,
+                    started,
+                    true,
+                    &failure,
+                    &attempts,
+                )
+                .await;
+                return Err(failure.error);
+            }
+        };
 
         let context = Some((block.id.clone(), upstream_key.id.clone()));
 
@@ -378,23 +615,20 @@ pub async fn chat_completion_stream(
                     base_log(&key, &ip, user_agent.as_deref(), started)
                         .model(request.model.clone())
                         .block(&block.id)
+                        .attempts(attempts.clone())
                         .streaming()
                         .failed(&error),
                 )
                 .await;
-                if let Err(log_error) = crate::db::usage::insert_error(
+                record_usage_error(
                     pool,
                     &key.id,
                     &request.model,
                     Some(block.id.as_str()),
                     &user_message,
                     true,
-                    time::now_secs(),
                 )
-                .await
-                {
-                    tracing::warn!(error = %log_error, "写入失败用量记录失败");
-                }
+                .await;
                 return Err(error);
             }
         };
@@ -413,6 +647,10 @@ pub async fn chat_completion_stream(
             {
                 Ok(response) if response.status().is_success() => {
                     multiplier_bp = block.multiplier_bp(&request.model);
+                    // 上游用这把钥匙接下来并开始返回了：算一次成功使用。
+                    // 流式这条路以前漏了这一步——`last_used_at` 不更新、
+                    // 失败计数也不清零，只有非流式与生图在记。
+                    upstream::report_success(pool, &upstream_key.id).await;
                     upstream = Some(response);
                     chosen = Some((block.id, upstream_key.id, block.api_format));
                     // 位子移交给流：整条流占着这个上游连接，直到它结束。
@@ -420,6 +658,8 @@ pub async fn chat_completion_stream(
                     break 'attempt;
                 }
                 Ok(response) => {
+                    // 头要先读：下面 `.text()` 会把响应消费掉。
+                    let retry_after = retry_after_secs(response.headers());
                     let status = response.status().as_u16();
                     let detail = response
                         .text()
@@ -446,17 +686,26 @@ pub async fn chat_completion_stream(
                     }
 
                     if status == 429 {
-                        upstream::report_failure(
+                        let wait = upstream::report_failure(
                             pool,
                             &upstream_key,
                             upstream::FailureKind::RateLimited,
-                            "被限流，暂时退避",
+                            &format!("上游返回 429 {detail}"),
+                            retry_after,
                         )
                         .await;
-                        last_failure = Some(Failure::with_context(
-                            Error::UpstreamUnavailable("上游限流".to_string()),
-                            "上游限流".to_string(),
-                            context,
+                        last_failure = Some(record_retry(
+                            &mut attempts,
+                            Failure::with_context(
+                                Error::RateLimited {
+                                    message: "上游限流，请稍后重试".to_string(),
+                                    retry_after: retry_after.or(wait),
+                                },
+                                "上游限流，请稍后重试".to_string(),
+                                context,
+                            )
+                            // 对下游只能给句稳妥话；日志里要留下上游的原话。
+                            .with_detail(format!("上游返回 429 {detail}")),
                         ));
                         continue 'attempt;
                     }
@@ -466,12 +715,17 @@ pub async fn chat_completion_stream(
                             &upstream_key,
                             upstream::FailureKind::Hard,
                             &format!("上游返回 {status} {detail}"),
+                            // 硬失败不退避，上游提示（若有）也无处可用。
+                            None,
                         )
                         .await;
-                        last_failure = Some(Failure::with_context(
-                            Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
-                            format!("上游响应异常: 返回 {status}"),
-                            context,
+                        last_failure = Some(record_retry(
+                            &mut attempts,
+                            Failure::with_context(
+                                Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
+                                format!("上游响应异常: 返回 {status}"),
+                                context,
+                            ),
                         ));
                         continue 'attempt;
                     }
@@ -481,12 +735,17 @@ pub async fn chat_completion_stream(
                             &upstream_key,
                             upstream::FailureKind::Transient,
                             &format!("上游返回 {status} {detail}"),
+                            // 503 也常见带 Retry-After，有就照它等。
+                            retry_after,
                         )
                         .await;
-                        last_failure = Some(Failure::with_context(
-                            Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
-                            format!("上游响应异常: 返回 {status}"),
-                            context,
+                        last_failure = Some(record_retry(
+                            &mut attempts,
+                            Failure::with_context(
+                                Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
+                                format!("上游响应异常: 返回 {status}"),
+                                context,
+                            ),
                         ));
                         continue 'attempt;
                     }
@@ -503,19 +762,15 @@ pub async fn chat_completion_stream(
                             .failed(&Error::UpstreamUnavailable(message.clone())),
                     )
                     .await;
-                    if let Err(log_error) = crate::db::usage::insert_error(
+                    record_usage_error(
                         pool,
                         &key.id,
                         &request.model,
                         Some(block.id.as_str()),
                         &format!("上游响应异常: 返回 {status}"),
                         true,
-                        time::now_secs(),
                     )
-                    .await
-                    {
-                        tracing::warn!(error = %log_error, "写入失败用量记录失败");
-                    }
+                    .await;
                     return Err(Error::UpstreamUnavailable(message));
                 }
                 Err(error) => {
@@ -525,9 +780,14 @@ pub async fn chat_completion_stream(
                         &upstream_key,
                         upstream::FailureKind::Transient,
                         &error.to_string(),
+                        // 网络层失败没有响应头可用。
+                        None,
                     )
                     .await;
-                    last_failure = Some(Failure::with_context(error, user_message, context));
+                    last_failure = Some(record_retry(
+                        &mut attempts,
+                        Failure::with_context(error, user_message, context),
+                    ));
                     // 网络层失败：换一把密钥进入下一轮 attempt。
                     continue 'attempt;
                 }
@@ -538,29 +798,18 @@ pub async fn chat_completion_stream(
     let Some(response) = upstream else {
         let failure = last_failure
             .unwrap_or_else(|| Failure::bare(Error::UpstreamUnavailable("上游不可用".to_string())));
-        // 同上：块 id 要先取出来，`.failed_with_context()` 会移走 context。
-        let failed_block = failure.context.as_ref().map(|(block, _)| block.clone());
-        write_log(
+        log_failure(
             pool,
-            base_log(&key, &ip, user_agent.as_deref(), started)
-                .model(request.model.clone())
-                .streaming()
-                .failed_with_context(&failure.error, failure.context),
+            &key,
+            &ip,
+            user_agent.as_deref(),
+            &request.model,
+            started,
+            true,
+            &failure,
+            &attempts,
         )
         .await;
-        if let Err(error) = crate::db::usage::insert_error(
-            pool,
-            &key.id,
-            &request.model,
-            failed_block.as_deref(),
-            &failure.user_message,
-            true,
-            time::now_secs(),
-        )
-        .await
-        {
-            tracing::warn!(error = %error, "写入失败用量记录失败");
-        }
         return Err(failure.error);
     };
 
@@ -647,19 +896,15 @@ pub async fn chat_completion_stream(
                             .failed(&error),
                     )
                     .await;
-                    if let Err(log_error) = crate::db::usage::insert_error(
+                    record_usage_error(
                         pool,
                         &key.id,
                         &model,
                         Some(block_id.as_str()),
                         &user_message,
                         true,
-                        time::now_secs(),
                     )
-                    .await
-                    {
-                        tracing::warn!(error = %log_error, "写入失败用量记录失败");
-                    }
+                    .await;
                     // 客户端已经走了就别费劲发错误帧，但仍要把已产出的
                     // 内容按估算记上去——上游那部分额度是真花掉了的。
                     if !produced {
@@ -692,19 +937,15 @@ pub async fn chat_completion_stream(
                             .failed(&error),
                     )
                     .await;
-                    if let Err(log_error) = crate::db::usage::insert_error(
+                    record_usage_error(
                         pool,
                         &key.id,
                         &model,
                         Some(block_id.as_str()),
                         &user_message,
                         true,
-                        time::now_secs(),
                     )
-                    .await
-                    {
-                        tracing::warn!(error = %log_error, "写入失败用量记录失败");
-                    }
+                    .await;
                     if !produced {
                         let _ = tx.send(Ok(error_frame(&user_message))).await;
                         return;
@@ -821,19 +1062,15 @@ pub async fn chat_completion_stream(
                     .failed(&Error::UpstreamUnavailable(detail.clone())),
             )
             .await;
-            if let Err(log_error) = crate::db::usage::insert_error(
+            record_usage_error(
                 pool,
                 &key.id,
                 &model,
                 Some(block_id.as_str()),
                 "上游响应异常: 上游没有返回任何内容",
                 true,
-                time::now_secs(),
             )
-            .await
-            {
-                tracing::warn!(error = %log_error, "写入失败用量记录失败");
-            }
+            .await;
             // 给客户端的是不含内部细节的短句；原始载荷进日志供排障。
             let _ = tx
                 .send(Ok(error_frame("上游提前结束了响应且没有返回任何内容，请重试")))
@@ -877,6 +1114,7 @@ pub async fn chat_completion_stream(
                         .model(request.model.clone())
                         .block(&block_id)
                         .upstream_key(&upstream_key_id)
+                        .attempts(attempts)
                         .streaming()
                         .client_gone(client_gone)
                         .succeeded(charge.usage, charge.credits_scaled)
@@ -920,19 +1158,15 @@ pub async fn chat_completion_stream(
                         .failed_with_context(&error, Some((block_id, upstream_key_id))),
                 )
                 .await;
-                if let Err(log_error) = crate::db::usage::insert_error(
+                record_usage_error(
                     pool,
                     &key.id,
                     &model,
                     Some(failed_block.as_str()),
                     &user_message,
                     true,
-                    time::now_secs(),
                 )
-                .await
-                {
-                    tracing::warn!(error = %log_error, "写入失败用量记录失败");
-                }
+                .await;
                 if !client_gone {
                     let _ = tx.send(Ok(error_frame(&user_message))).await;
                 }
@@ -953,12 +1187,19 @@ async fn dispatch(
     started: Instant,
     // 请求里显式锁定的块；None 即按权重轮询所有能处理该模型的块。
     only: Option<&str>,
+    // 换钥匙重试的留痕，调用方拿去写日志。
+    attempts: &mut Vec<AttemptNote>,
 ) -> std::result::Result<DispatchOutcome, Failure> {
     let pool = &state.store.data;
-    let mut last_failure = None;
+    let mut last_failure: Option<Failure> = None;
 
     for _ in 0..MAX_ATTEMPTS {
         // 每一轮都重新挑：上一把密钥进入退避后，这里会自然落到下一把。
+        //
+        // 这里失败**直接返回、不留上一轮的失败**：`select_block` 的失败是
+        // 确定性的——模型没有可处理的上游、块不提供该模型、密钥无权用它，
+        // 重试不会改变结果。别顺手「对齐」成流式那样的保留上一轮，
+        // 那是给可重试失败准备的。
         let block =
             match upstream::select_block(pool, &state.upstream, &key, &request.model, only).await {
                 Ok(block) => block,
@@ -967,9 +1208,22 @@ async fn dispatch(
         let upstream_key = match upstream::select_key(pool, &state.upstream, &block).await {
             Ok(key) => key,
             Err(error) => {
-                let context = Some((block.id.clone(), String::new()));
+                // 上一轮失败过：块内已没有可调度的密钥，但「这次为什么没成」
+                // 的答案是上一轮那次失败（多半是被上游限流）。把它带出去，
+                // 顺手补上最早的恢复时间当等待提示；这一轮的内部错误也记一笔，
+                // 免得「没有可用密钥」这种现象在流水里无迹可寻。
+                if let Some(previous) = last_failure.take() {
+                    attempts.push(AttemptNote::new(&block.id, "", error.to_string()));
+                    return Err(previous.with_wait_hint(error.retry_hint()));
+                }
+                // 首轮就选不出密钥：照实返回（配置问题 → 403，
+                // 全在退避 → 429 + Retry-After）。
                 let user_message = sanitize_user_message(&error);
-                return Err(Failure::with_context(error, user_message, context));
+                return Err(Failure::with_context(
+                    error,
+                    user_message,
+                    Some((block.id.clone(), String::new())),
+                ));
             }
         };
 
@@ -1010,19 +1264,40 @@ async fn dispatch(
         let context = Some((block.id.clone(), upstream_key.id.clone()));
 
         match sent {
-            Ok((status, response_body)) => {
+            Ok(response) => {
+                let UpstreamResponse {
+                    status,
+                    body: response_body,
+                    retry_after,
+                } = response;
+
                 if status == 429 {
-                    upstream::report_failure(
+                    let detail = response_body
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let wait = upstream::report_failure(
                         pool,
                         &upstream_key,
                         upstream::FailureKind::RateLimited,
-                        "被限流，暂时退避",
+                        &format!("上游返回 429 {detail}"),
+                        retry_after,
                     )
                     .await;
-                    last_failure = Some(Failure::with_context(
-                        Error::UpstreamUnavailable("上游限流".to_string()),
-                        "上游限流".to_string(),
-                        context,
+                    // 上游没给提示时退回这把钥匙刚挂上的退避秒数——下游至少
+                    // 别比我们更早回头打。
+                    last_failure = Some(record_retry(
+                        attempts,
+                        Failure::with_context(
+                            Error::RateLimited {
+                                message: "上游限流，请稍后重试".to_string(),
+                                retry_after: retry_after.or(wait),
+                            },
+                            "上游限流，请稍后重试".to_string(),
+                            context,
+                        )
+                        // 对下游只能给句稳妥话；日志里要留下上游的原话。
+                        .with_detail(format!("上游返回 429 {detail}")),
                     ));
                     continue;
                 }
@@ -1039,17 +1314,24 @@ async fn dispatch(
                         &upstream_key,
                         upstream::FailureKind::Hard,
                         &format!("上游返回 {status} {detail}"),
+                        // 硬失败不退避，上游提示（若有）也无处可用。
+                        None,
                     )
                     .await;
-                    last_failure = Some(Failure::with_context(
-                        Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
-                        format!("上游响应异常: 返回 {status}"),
-                        context,
+                    // 下游绝不能收到 401/403——那是我们的钥匙坏了，不是
+                    // 客户端凭证有问题；对他们来说是上游不可用。
+                    last_failure = Some(record_retry(
+                        attempts,
+                        Failure::with_context(
+                            Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
+                            format!("上游响应异常: 返回 {status}"),
+                            context,
+                        ),
                     ));
                     continue;
                 }
 
-                // 上游自己的故障（5xx）不算密钥的账：指数退避后换一把，
+                // 上游自己的故障（5xx）不算密钥的账：退避后换一把，
                 // 不停用——上游打个嗝不该把好密钥永久禁掉。
                 if status >= 500 {
                     let detail = response_body
@@ -1061,12 +1343,17 @@ async fn dispatch(
                         &upstream_key,
                         upstream::FailureKind::Transient,
                         &format!("上游返回 {status} {detail}"),
+                        // 503 也常见带 Retry-After，有就照它等。
+                        retry_after,
                     )
                     .await;
-                    last_failure = Some(Failure::with_context(
-                        Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
-                        format!("上游响应异常: 返回 {status}"),
-                        context,
+                    last_failure = Some(record_retry(
+                        attempts,
+                        Failure::with_context(
+                            Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
+                            format!("上游响应异常: 返回 {status}"),
+                            context,
+                        ),
                     ));
                     continue;
                 }
@@ -1098,9 +1385,14 @@ async fn dispatch(
                             &upstream_key,
                             upstream::FailureKind::Transient,
                             &error.to_string(),
+                            // 200 的响应没有可用的限流提示。
+                            None,
                         )
                         .await;
-                        last_failure = Some(Failure::with_context(error, user_message, context));
+                        last_failure = Some(record_retry(
+                            attempts,
+                            Failure::with_context(error, user_message, context),
+                        ));
                         continue;
                     }
                 };
@@ -1162,9 +1454,14 @@ async fn dispatch(
                     &upstream_key,
                     upstream::FailureKind::Transient,
                     &error.to_string(),
+                    // 网络层失败没有响应头可用。
+                    None,
                 )
                 .await;
-                last_failure = Some(Failure::with_context(error, user_message, context));
+                last_failure = Some(record_retry(
+                    attempts,
+                    Failure::with_context(error, user_message, context),
+                ));
             }
         }
     }
@@ -1245,7 +1542,19 @@ pub(crate) fn prepare_request(
     Ok(builder)
 }
 
-/// 把请求发给上游，返回状态码与响应体。
+/// 上游的一次响应。
+///
+/// 除了状态码与响应体，还带出上游在头里给的「多久后再来」提示——
+/// 限流时它是判断该退避多久的最好依据，比本地阶梯准。
+pub struct UpstreamResponse {
+    pub status: u16,
+    /// 已解析的响应体；上游出错时可能给空体或 HTML，解析不出就是 `Null`。
+    pub body: Value,
+    /// `Retry-After` / `retry-after-ms` 解析出的等待秒数；没给则 `None`。
+    pub retry_after: Option<i64>,
+}
+
+/// 把请求发给上游，返回状态码、响应体与限流提示。
 ///
 /// 网络错误与超时都归为 Err；HTTP 状态码原样返回，由调用方分类处理——
 /// 429、401 与 5xx 的后续动作完全不同，不能在这里替调用方做决定。
@@ -1255,17 +1564,55 @@ pub async fn send(
     request: &UpstreamRequest,
     style: AuthStyle,
     key: &str,
-) -> Result<(u16, Value)> {
+) -> Result<UpstreamResponse> {
     let response = prepare_request(client, block, request, style, key)?
         .send()
         .await
         .map_err(|error| Error::UpstreamUnavailable(format!("请求上游失败: {error}")))?;
 
     let status = response.status().as_u16();
+    let retry_after = retry_after_secs(response.headers());
     // 上游在出错时可能返回空体或 HTML，解析不出就按空对象处理。
     let body = response.json::<Value>().await.unwrap_or(Value::Null);
 
-    Ok((status, body))
+    Ok(UpstreamResponse {
+        status,
+        body,
+        retry_after,
+    })
+}
+
+/// 从响应头里读出上游要求的等待秒数。
+///
+/// 先认标准的 `Retry-After`（非负整数秒，或 HTTP 日期），再退到
+/// `retry-after-ms`（毫秒，部分网关——如 Azure 系——用这个）。两者都没有、
+/// 或值不合规时返回 `None`，由调用方按失败次数走退避阶梯。
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<i64> {
+    if let Some(secs) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_retry_after(value.trim()))
+    {
+        return Some(secs);
+    }
+
+    headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        // 毫秒向上取整成秒：宁可多等一秒，也别为了半秒提前回头打。
+        .map(|ms| (ms.max(0) + 999) / 1000)
+}
+
+/// 解析 `Retry-After` 的两种合法写法：非负整数秒，或 HTTP 日期。
+fn parse_retry_after(value: &str) -> Option<i64> {
+    if let Ok(secs) = value.parse::<i64>() {
+        return Some(secs.max(0));
+    }
+
+    // HTTP-date（IMF-fixdate）与 RFC 2822 同形：算到那个时刻还剩多少秒。
+    let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some((when.timestamp() - time::now_secs()).max(0))
 }
 
 /// 建立流式上游请求，返回原始响应供调用方消费字节流。
@@ -1301,6 +1648,7 @@ fn base_log<'a>(
         credits_scaled: 0,
         stream: false,
         client_gone: false,
+        attempts: Vec::new(),
     }
 }
 
@@ -1318,6 +1666,8 @@ struct LogDraft<'a> {
     stream: bool,
     /// 客户端在流中途断开：账照扣，日志里要能看出原因。
     client_gone: bool,
+    /// 内部重试的留痕：成功的那次也要带上，否则前面几次失败在流水里消失。
+    attempts: Vec<AttemptNote>,
 }
 
 impl<'a> LogDraft<'a> {
@@ -1348,6 +1698,12 @@ impl<'a> LogDraft<'a> {
         self
     }
 
+    /// 附上内部重试的留痕。
+    fn attempts(mut self, attempts: Vec<AttemptNote>) -> Self {
+        self.attempts = attempts;
+        self
+    }
+
     fn succeeded(mut self, usage: crate::proxy::scheme::Usage, credits_scaled: i64) -> Self {
         self.usage = usage;
         self.credits_scaled = credits_scaled;
@@ -1365,6 +1721,27 @@ impl<'a> LogDraft<'a> {
             .map(|(block, key)| (Some(block), Some(key)))
             .unwrap_or((self.block_id.clone(), self.upstream_key_id.clone()));
 
+        // 详情里带上重试链：只写最终那句的话，前面几次失败（尤其是
+        // 「被限流后换钥匙」）在流水里查不到。
+        let detail = match render_attempts(&self.attempts) {
+            // 链尾那一轮往往就是这次失败本身（比如 5xx），总结句只是把同一句话
+            // 换个前缀再说一遍；真有额外信息（比如上游原话归到链里、总结句是
+            // 给下游看的那句）才追加。
+            Some(chain) => {
+                let error_text = error.to_string();
+                let restates = self
+                    .attempts
+                    .last()
+                    .is_some_and(|last| error_text.contains(&last.reason));
+                if restates {
+                    chain
+                } else {
+                    format!("{chain}；最终失败：{error_text}")
+                }
+            }
+            None => error.to_string(),
+        };
+
         NewProxyLog {
             access_key_id: self.key.id.clone(),
             block_id,
@@ -1373,7 +1750,7 @@ impl<'a> LogDraft<'a> {
             ip: Some(self.ip.to_string()),
             user_agent: self.user_agent.map(str::to_string),
             status: "error".to_string(),
-            error_detail: Some(truncate_detail(&error.to_string())),
+            error_detail: Some(truncate_detail(&detail)),
             duration_ms: self.started.elapsed().as_millis() as i64,
             prompt_tokens: self.usage.prompt_tokens,
             completion_tokens: self.usage.completion_tokens,
@@ -1389,10 +1766,18 @@ impl<'a> LogDraft<'a> {
     fn to_success_log(&self) -> NewProxyLog {
         // 客户端中断的流仍是成功账（上游确实出了 token），但错误列要留个
         // 记号，否则管理员看到成功记录却对不上客户端那边的体验。
-        let error_detail = if self.client_gone {
-            Some("客户端在流中途断开；已产出部分按估算计费".to_string())
-        } else {
+        // 重试过再成功同样要留痕，否则那几次失败就成了「查无此事」。
+        let mut notes = Vec::new();
+        if let Some(chain) = render_attempts(&self.attempts) {
+            notes.push(format!("{chain}；最终成功"));
+        }
+        if self.client_gone {
+            notes.push("客户端在流中途断开；已产出部分按估算计费".to_string());
+        }
+        let error_detail = if notes.is_empty() {
             None
+        } else {
+            Some(truncate_detail(&notes.join("；")))
         };
 
         NewProxyLog {
@@ -1420,6 +1805,74 @@ impl<'a> LogDraft<'a> {
 async fn write_log(pool: &sqlx::SqlitePool, log: NewProxyLog) {
     if let Err(error) = crate::db::proxy_log::insert(pool, &log).await {
         tracing::warn!(error = %error, "写入代理日志失败");
+    }
+}
+
+/// 请求还没被上游受理就失败时落两轨日志（管理员明细 + 密钥侧脱敏记录）。
+///
+/// 非流式路径由 `chat_completion_inner` 收口；流式路径的失败点分散在
+/// 建流前后，用这个助手保证每一次 `return Err(..)` 都留下痕迹——曾经
+/// 「块内没有可用密钥」这类平台内部错误在请求流水里查无此请求。
+pub(crate) async fn log_failure(
+    pool: &sqlx::SqlitePool,
+    key: &ApiKey,
+    ip: &str,
+    user_agent: Option<&str>,
+    model: &str,
+    started: Instant,
+    stream: bool,
+    failure: &Failure,
+    attempts: &[AttemptNote],
+) {
+    let failed_block = failure.context.as_ref().map(|(block, _)| block.clone());
+
+    let mut draft = base_log(key, ip, user_agent, started)
+        .model(model.to_string())
+        .attempts(attempts.to_vec());
+    if stream {
+        draft = draft.streaming();
+    }
+    write_log(
+        pool,
+        draft.failed_with_context(&failure.error, failure.context.clone()),
+    )
+    .await;
+
+    record_usage_error(
+        pool,
+        &key.id,
+        model,
+        failed_block.as_deref(),
+        &failure.user_message,
+        stream,
+    )
+    .await;
+}
+
+/// 写一条密钥侧的脱敏失败记录（管理员侧明细由调用方自行落）。
+///
+/// 流式路径的失败点分散在十来处，每处都手抄一遍 `insert_error` 的七个参数
+/// 既啰嗦又容易漏掉「失败也要留痕」这件事——收成一个入口，调用点只剩一行。
+async fn record_usage_error(
+    pool: &sqlx::SqlitePool,
+    key_id: &str,
+    model: &str,
+    block_id: Option<&str>,
+    user_message: &str,
+    stream: bool,
+) {
+    if let Err(error) = crate::db::usage::insert_error(
+        pool,
+        key_id,
+        model,
+        block_id,
+        user_message,
+        stream,
+        time::now_secs(),
+    )
+    .await
+    {
+        tracing::warn!(error = %error, "写入失败用量记录失败");
     }
 }
 
@@ -1569,5 +2022,32 @@ mod tests {
             prepare_request(&client, &block, &probe, AuthStyle::Bearer, "sk-demo-secret").is_err(),
             "非法头值必须报错"
         );
+    }
+
+    #[test]
+    fn retry_after_header_prefers_the_standard_and_reads_ms() {
+        use reqwest::header::HeaderValue;
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_secs(&headers), None, "没给提示就是 None");
+
+        headers.insert("retry-after", HeaderValue::from_static("120"));
+        assert_eq!(retry_after_secs(&headers), Some(120));
+
+        // 两个都给时以标准的 Retry-After 为准。
+        headers.insert("retry-after-ms", HeaderValue::from_static("1500"));
+        assert_eq!(retry_after_secs(&headers), Some(120));
+
+        headers.remove("retry-after");
+        assert_eq!(retry_after_secs(&headers), Some(2), "毫秒向上取整成秒");
+    }
+
+    #[test]
+    fn retry_after_understands_seconds_and_http_dates() {
+        assert_eq!(parse_retry_after("90"), Some(90));
+        assert_eq!(parse_retry_after("0"), Some(0));
+        // HTTP-date 形式：已经过去的时刻按 0 处理（仍算「上游给了提示」）。
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), Some(0));
+        assert_eq!(parse_retry_after("soon-ish"), None, "读不懂就别猜");
     }
 }

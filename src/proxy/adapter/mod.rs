@@ -1,7 +1,8 @@
 //! 上游 API 格式适配。
 //!
 //! 每个 adapter 负责三件事：把标准请求翻译成该家的请求体、把该家的响应翻译回
-//! 标准响应，以及给出一个**不消耗 token** 的探测请求供「测试密钥」使用。
+//! 标准响应，以及给出一次**最小真实对话请求**供「测试密钥」使用。
+//! 探测刻意不走列模型接口——不少上游没有实现它，会把好密钥误判成坏的。
 
 mod anthropic;
 mod google;
@@ -180,15 +181,27 @@ pub trait Adapter: Send + Sync {
     /// 解析对话响应。
     fn parse_chat(&self, body: &Value) -> Result<ChatResponse>;
 
-    /// 生成探测请求。
-    fn build_probe(&self) -> UpstreamRequest;
+    /// 生成探测请求：用指定模型发一次**最小真实对话**。
+    ///
+    /// 探测曾经走各家的列模型接口（`GET /v1/models`），但它不能证明密钥
+    /// 真能用：不少网关、中转站与自建代理根本没实现这个接口，于是「密钥
+    /// 有效」被误判成「密钥被拒」。真实请求才是唯一可信的判据，代价是
+    /// 这次测试会消耗少量 token。
+    fn build_probe(&self, model: &str) -> UpstreamRequest;
+
+    /// 生成列模型请求（`fetch_models` 专用）。
+    ///
+    /// 与密钥探测**不是一回事**：探测已改为真实对话请求，而「拉取上游
+    /// 可用模型列表」本来就得走这个接口——它没有别的替代。
+    fn build_models_request(&self) -> UpstreamRequest;
 
     /// 依据探测响应判断密钥状态。
     fn parse_probe(&self, status: u16, body: &Value) -> ProbeOutcome;
 
     /// 从列模型响应里提取模型名。
     ///
-    /// 探测请求走的就是列模型接口，所以同一份响应顺手就能给出可用模型列表。
+    /// 只在「拉取上游模型列表」那条路上用（`fetch_models`），与密钥探测无关——
+    /// 探测已改为真实对话请求，不再复用列模型接口。
     /// 默认按 OpenAI / Anthropic 的形状解析（`data[].id`）；Google 的形状不同，自行覆写。
     fn parse_models(&self, body: &Value) -> Vec<String> {
         body.get("data")
