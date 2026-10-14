@@ -928,6 +928,36 @@ pub async fn set_key_never_disable(
     Ok(())
 }
 
+/// 批量设置密钥的调度权重（块内平滑加权轮询的份额）。
+///
+/// 门卫是 `weight <= 0`（与块权重同一口径：非正一律拒，不看是 0 还是负）。
+/// 非正的候选在 [`UpstreamState::pick`] 里永远攒不到最大值，也就是
+/// 「看起来启用、实际再也选不中」——这种状态不该由一个手滑的数字造成。
+/// 要让一把密钥彻底不上岗，用暂停（那是显式意图，界面也看得见）。
+///
+/// 每次调度都从库里读权重，所以改完即刻生效，没有缓存要失效。
+pub async fn set_keys_weight(
+    pool: &SqlitePool,
+    block_id: &str,
+    ids: &[String],
+    weight: u32,
+) -> Result<()> {
+    if weight <= 0 {
+        return Err(Error::BadRequest(
+            "权重必须大于 0（要停用请用暂停）".to_string(),
+        ));
+    }
+
+    // 块不存在时给 404，别让「改了个不存在的块」静默成功。
+    get_block(pool, block_id).await?;
+
+    let now = time::now_secs();
+    for id in ids {
+        db::block::set_key_weight(pool, block_id, id, weight, now).await?;
+    }
+    Ok(())
+}
+
 /// 测试一把密钥：发一个不消耗 token 的请求。
 pub async fn test_key(
     pool: &SqlitePool,
@@ -1707,5 +1737,38 @@ mod tests {
         assert_eq!(fresh.failure_count, 0, "成功清零失败计数");
         assert_eq!(fresh.cooldown_until, None, "退避随之解除");
         assert_eq!(fresh.last_error, None);
+    }
+
+    #[tokio::test]
+    async fn set_keys_weight_persists_and_rejects_non_positive() {
+        let pool = test_pool().await;
+        let key = seed_key(&pool, false).await;
+        assert_eq!(key.weight, 1, "默认权重");
+
+        set_keys_weight(&pool, "demo-block", &[key.id.clone()], 5)
+            .await
+            .expect("设置权重应当成功");
+        assert_eq!(reload(&pool).await.weight, 5, "权重落库");
+
+        // 门卫是 `<= 0`（与块权重同一口径）。`u32` 上目前只有 0 能触达这一支，
+        // 但口径不写成 `== 0`：非正权重在轮询里永远攒不到最大值，等于
+        // 「启用中但永远选不中」，界面上看不出这种状态——要停用请用暂停。
+        let refused = set_keys_weight(&pool, "demo-block", &[key.id.clone()], 0)
+            .await
+            .expect_err("非正权重必须被拒");
+        assert!(
+            refused.to_string().contains("大于 0"),
+            "错误要说清为什么: {refused}"
+        );
+        assert_eq!(reload(&pool).await.weight, 5, "被拒的请求不该改动权重");
+
+        // 块不存在 → 404，而不是「改了 0 行还报成功」。
+        let missing = set_keys_weight(&pool, "demo-missing", &[key.id.clone()], 2)
+            .await
+            .expect_err("未知块必须报错");
+        assert!(
+            missing.to_string().contains("块不存在"),
+            "未知块要说清是块的问题: {missing}"
+        );
     }
 }

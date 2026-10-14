@@ -11,7 +11,7 @@ use crate::api::MessageResponse;
 use crate::error::Result;
 use crate::model::{
     BlockCreate, BlockTestResult, BlockUpdate, BlockView, KeyIdsRequest, KeyNeverDisableRequest,
-    UpstreamKeyCreate, UpstreamKeyView,
+    KeyWeightRequest, UpstreamKeyCreate, UpstreamKeyView,
 };
 use crate::service::upstream;
 
@@ -162,6 +162,24 @@ pub async fn never_disable_keys(
     } else {
         "已取消永不暂停".to_string()
     })))
+}
+
+/// `POST /api/blocks/{id}/keys/weight`
+///
+/// 批量设置密钥的调度权重（块内平滑加权轮询的份额）。权重每次调度都从库里读，
+/// 所以改完即刻生效。权重 0 会被服务层拒掉——那等于「启用中但永远选不中」，
+/// 想让它不上岗请用暂停。
+pub async fn set_keys_weight(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<KeyWeightRequest>,
+) -> Result<Json<MessageResponse>> {
+    upstream::set_keys_weight(&state.store.data, &id, &payload.ids, payload.weight).await?;
+    Ok(Json(MessageResponse::ok(format!(
+        "已把 {} 把密钥的权重设为 {}",
+        payload.ids.len(),
+        payload.weight
+    ))))
 }
 
 /// `POST /api/blocks/{id}/keys/{key_id}/test`

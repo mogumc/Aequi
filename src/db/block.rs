@@ -311,6 +311,31 @@ pub async fn set_key_never_disable(
     Ok(())
 }
 
+/// 设置密钥的调度权重，用于块内平滑加权轮询。
+///
+/// 与 [`set_key_never_disable`] 同一形状：带上 `block_id` 匹配，
+/// 密钥只应通过它所属的块来操作。权重每次调度都从库里读，
+/// 所以改完即刻生效，没有进程内的缓存要清。
+/// 合法区间由服务层把关（`<= 0` 一律拒），这里只管写。
+pub async fn set_key_weight(
+    pool: &SqlitePool,
+    block_id: &str,
+    key_id: &str,
+    weight: u32,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE upstream_keys SET weight = ?, updated_at = ? WHERE id = ? AND block_id = ?",
+    )
+    .bind(weight as i64)
+    .bind(now)
+    .bind(key_id)
+    .bind(block_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// 记录一次成功使用：清空失败计数、写最近使用时间。
 pub async fn mark_key_success(
     pool: &SqlitePool,

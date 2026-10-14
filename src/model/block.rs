@@ -362,6 +362,16 @@ fn default_enabled() -> bool {
     true
 }
 
+/// 批量设置调度权重的请求体。
+///
+/// 权重就是块内平滑加权轮询的份额，0 会让密钥永远选不中，
+/// 所以 `weight` 必填且由服务层挡住 0（要停用请用暂停）。
+#[derive(Debug, Deserialize)]
+pub struct KeyWeightRequest {
+    pub ids: Vec<String>,
+    pub weight: u32,
+}
+
 /// 块内单把密钥的测试结果。
 #[derive(Debug, Clone, Serialize)]
 pub struct KeyTestResult {

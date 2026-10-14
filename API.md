@@ -210,6 +210,7 @@ gpt-4o，短名请求却被轮询到 b」这种越权。数组为空表示不限
 | `POST` | `/api/blocks/{id}/keys/pause` | 批量暂停：`{ ids }` |
 | `POST` | `/api/blocks/{id}/keys/resume` | 批量恢复：`{ ids }`（同时清零失败计数） |
 | `POST` | `/api/blocks/{id}/keys/never-disable` | 批量设置「永不暂停」：`{ ids, enabled? }`，`enabled` 缺省 `true`（即「设上」） |
+| `POST` | `/api/blocks/{id}/keys/weight` | 批量设置调度权重：`{ ids, weight }`，`weight <= 0` 会被拒（要停用请用暂停） |
 | `POST` | `/api/blocks/{id}/keys/{key_id}/test` | 测试单把密钥（不耗 token），结果同步落库 |
 | `POST` | `/api/blocks/{id}/test` | **整块连通性测试**（见下） |
 | `POST` | `/api/blocks/{id}/models/fetch` | **从上游拉取可用模型列表**（见下） |
@@ -374,6 +375,13 @@ Google 的 `generationConfig` 这类更细的开关时，配在该模型的 `ext
   手动测试确认无效仍然停用。计数与 `last_error` 留痕照旧，后台看得见发生了什么。
 - 手工入口：`POST /api/blocks/{id}/keys/never-disable`，body `{ ids, enabled? }`，
   `enabled` 缺省 `true`；批量添加密钥时也可以带 `never_disable: true` 入库即生效。
+- **密钥权重（`weight`）**：块内多把密钥按平滑加权轮询分流，权重就是各自的份额
+  （默认 1）。新增时用 `POST /api/blocks/{id}/keys` 的 `weight` 定初值，之后用
+  `POST /api/blocks/{id}/keys/weight`（`{ ids, weight }`）改；每次调度都从库里读，
+  改完**即刻生效**，不用重启也不用等下一轮。
+  **门卫是 `weight <= 0`**（与块权重同一口径）：非正权重的候选在轮询里永远攒不到
+  最大值——也就是「状态是启用、实际再也选不中」，界面上完全看不出来。
+  要让一把密钥不上岗，用暂停（显式、可见）。
 
 ### 请求日志
 

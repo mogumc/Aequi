@@ -12,8 +12,8 @@ mod usage;
 pub use account::{Account, AccountView};
 pub use block::{
     ApiFormat, BlockCreate, BlockTestResult, BlockUpdate, BlockView, HeaderEntry, KeyIdsRequest,
-    KeyNeverDisableRequest, KeyStatus, KeyTestResult, ModelEntry, UpstreamBlock, UpstreamKey,
-    UpstreamKeyCreate, UpstreamKeyView,
+    KeyNeverDisableRequest, KeyStatus, KeyTestResult, KeyWeightRequest, ModelEntry, UpstreamBlock,
+    UpstreamKey, UpstreamKeyCreate, UpstreamKeyView,
 };
 pub use key::{ApiKey, KeyCreate, KeyCreditsUpdate, KeySelfView, KeyUpdate, KeyView};
 pub use log::{NewProxyLog, ProxyLog, ProxyLogView};
