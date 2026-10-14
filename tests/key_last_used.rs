@@ -256,7 +256,10 @@ async fn streaming_marks_the_key_as_used_and_clears_failures() {
 
     let (last_used_at, failure_count, last_error) = key_state(&app, &key_id).await;
     let used = last_used_at.expect("流式用过之后必须写下上次使用时间");
-    assert!(used >= before, "上次使用时间应当是刚刚，实际 {used} < {before}");
+    assert!(
+        used >= before,
+        "上次使用时间应当是刚刚，实际 {used} < {before}"
+    );
     assert_eq!(failure_count, 0, "一次成功要清零失败计数");
     assert_eq!(last_error, None, "成功要把旧的错误信息清掉");
 }
@@ -281,6 +284,9 @@ async fn non_streaming_marks_the_key_as_used_too() {
 
     let (last_used_at, failure_count, _) = key_state(&app, &key_id).await;
     let used = last_used_at.expect("用过之后必须写下上次使用时间");
-    assert!(used >= before, "上次使用时间应当是刚刚，实际 {used} < {before}");
+    assert!(
+        used >= before,
+        "上次使用时间应当是刚刚，实际 {used} < {before}"
+    );
     assert_eq!(failure_count, 0);
 }

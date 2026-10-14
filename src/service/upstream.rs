@@ -611,7 +611,7 @@ pub async fn fetch_models(
     let request = proxy::prepare_request(
         &client,
         &block,
-        &adapter.build_probe(),
+        &adapter.build_models_request(),
         adapter.auth_style(),
         &key.secret,
     )?;
@@ -977,20 +977,29 @@ pub async fn set_keys_weight(
     Ok(())
 }
 
-/// 测试一把密钥：发一个不消耗 token 的请求。
+/// 测试一把密钥：用指定模型发一次**最小真实对话**。
+///
+/// 曾经走各家的列模型接口（`GET /v1/models`），但它不能证明密钥真能用：
+/// 不少网关、中转站与自建代理根本没实现这个接口，于是「密钥有效」被误判成
+/// 「密钥被拒」并直接停用。真实请求才是唯一可信的判据——代价是这次测试
+/// 会真的消耗少量 token（前端会提示）。
 pub async fn test_key(
     pool: &SqlitePool,
     state: &UpstreamState,
     block_id: &str,
     key_id: &str,
+    model: &str,
 ) -> Result<ProbeOutcome> {
     let block = get_block(pool, block_id).await?;
     let key = db::block::find_key(pool, block_id, key_id)
         .await?
         .ok_or_else(|| Error::NotFound("密钥不存在".to_string()))?;
 
+    // 测试用的模型名要按块的转发配置换一次——否则配了 `forward` 的块
+    // 会拿对外名去打上游，明明是好的钥匙也会被判成坏的。
+    let target = block.target_model(model);
     let adapter = adapter_for(block.api_format);
-    let probe = adapter.build_probe();
+    let probe = adapter.build_probe(&target);
     let client = state.client(&block)?;
 
     let sent = proxy::send(&client, &block, &probe, adapter.auth_style(), &key.secret).await;
@@ -1014,6 +1023,23 @@ pub async fn test_key(
     }
 
     Ok(outcome)
+}
+
+/// 测试用的默认模型：块里配的第一个。
+///
+/// 批量测试（整块逐把）与「没指定模型」的单把测试都落到它上面——前端批量
+/// 测试用同一个模型，与这里保持一致，免得两处各挑各的。
+pub fn probe_model(block: &UpstreamBlock) -> Result<String> {
+    block
+        .models
+        .first()
+        .map(|entry| entry.name.clone())
+        .ok_or_else(|| {
+            Error::BadRequest(format!(
+                "块 {} 还没配置任何模型，无法测试密钥——先加一个模型再测",
+                block.id
+            ))
+        })
 }
 
 // ---------- 调度面 ----------
@@ -1334,18 +1360,27 @@ async fn disable_key(
 ///
 /// 结果口径与单把测试一致（有效则清零失败计数、无效则停用），
 /// 串行执行——块内密钥数量有限，并发打上游反而容易被限流。
+///
+/// `model` 为 `None` 时用块里配的第一个模型（见 [`probe_model`]）。
 pub async fn test_block(
     pool: &SqlitePool,
     state: &UpstreamState,
     block_id: &str,
+    model: Option<&str>,
 ) -> Result<crate::model::BlockTestResult> {
     let keys = db::block::list_keys(pool, block_id).await?;
+
+    // 模型只解析一次：整块测试的每一把都用同一个，免得逐把挑出不同的名字。
+    let model = match model {
+        Some(model) => model.to_string(),
+        None => probe_model(&get_block(pool, block_id).await?)?,
+    };
 
     let mut results = Vec::with_capacity(keys.len());
     let (mut valid, mut invalid, mut transient) = (0, 0, 0);
 
     for key in &keys {
-        let outcome = test_key(pool, state, block_id, &key.id).await?;
+        let outcome = test_key(pool, state, block_id, &key.id, &model).await?;
 
         let (label, detail) = match outcome {
             ProbeOutcome::Valid => {
