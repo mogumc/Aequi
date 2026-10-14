@@ -80,6 +80,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/blocks/{id}/keys/never-disable",
             post(blocks::never_disable_keys),
         )
+        .route("/blocks/{id}/keys/weight", post(blocks::set_keys_weight))
         .route("/blocks/{id}/keys/{key_id}/test", post(blocks::test_key))
         .route("/blocks/{id}/test", post(blocks::test_block))
         .route("/blocks/{id}/models/fetch", post(blocks::fetch_models))

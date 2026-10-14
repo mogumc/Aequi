@@ -250,9 +250,13 @@ impl Usage {
 }
 
 /// 标准对话响应。
+///
+/// 刻意**不带模型名**：对外响应里的 `model` 是「你请求的模型」，
+/// 由编排层把归一化后的对外名传给 `openai_in::render_response`。
+/// 上游回显不可靠（Google 没有这个字段、OpenAI 回的是转发名），
+/// 放在这里只会诱使出口去用它。
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
-    pub model: String,
     pub content: Vec<ContentPart>,
     /// 推理（思考）内容。与正文分开存放——客户端普遍按
     /// `reasoning_content` 区分展示，混进正文会让思考模型无法折叠显示。
@@ -337,7 +341,6 @@ mod tests {
     #[test]
     fn estimate_output_includes_reasoning_but_text_does_not() {
         let response = ChatResponse {
-            model: "m".into(),
             content: vec![ContentPart::text("答案")],
             reasoning: "推理过程".into(),
             tool_calls: vec![],

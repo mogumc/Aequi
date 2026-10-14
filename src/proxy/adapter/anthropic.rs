@@ -313,7 +313,6 @@ impl Adapter for AnthropicAdapter {
         }
 
         Ok(ChatResponse {
-            model: text_at(body, "model"),
             content,
             reasoning,
             tool_calls,

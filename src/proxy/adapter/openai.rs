@@ -205,7 +205,6 @@ impl Adapter for OpenAiAdapter {
             .unwrap_or_default();
 
         Ok(ChatResponse {
-            model: text_at(body, "model"),
             content,
             reasoning,
             tool_calls,
