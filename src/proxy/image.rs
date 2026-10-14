@@ -15,7 +15,9 @@ use crate::error::{Error, Result};
 use crate::model::ApiKey;
 use crate::proxy::adapter::{AuthStyle, EXTRA_BODY_KEY, UpstreamRequest};
 use crate::proxy::scheme::Usage;
-use crate::proxy::{Failure, MAX_ATTEMPTS, base_log, estimate, sanitize_user_message, write_log};
+use crate::proxy::{
+    Failure, MAX_ATTEMPTS, UpstreamResponse, base_log, estimate, sanitize_user_message, write_log,
+};
 use crate::service::{billing, upstream};
 use crate::utils::time;
 
@@ -247,13 +249,20 @@ async fn dispatch(
         )
         .await
         {
-            Ok((status, response_body)) => {
+            Ok(response) => {
+                let UpstreamResponse {
+                    status,
+                    body: response_body,
+                    retry_after,
+                } = response;
+
                 if status == 429 {
                     upstream::report_failure(
                         pool,
                         &upstream_key,
                         upstream::FailureKind::RateLimited,
                         "被限流，暂时退避",
+                        retry_after,
                     )
                     .await;
                     last_failure = Some(Failure::with_context(
@@ -274,6 +283,8 @@ async fn dispatch(
                         &upstream_key,
                         upstream::FailureKind::Hard,
                         &format!("上游返回 {status} {detail}"),
+                        // 硬失败不退避，上游提示（若有）也无处可用。
+                        None,
                     )
                     .await;
                     last_failure = Some(Failure::with_context(
@@ -294,6 +305,8 @@ async fn dispatch(
                         &upstream_key,
                         upstream::FailureKind::Transient,
                         &format!("上游返回 {status} {detail}"),
+                        // 503 也常见带 Retry-After，有就照它等。
+                        retry_after,
                     )
                     .await;
                     last_failure = Some(Failure::with_context(
@@ -328,6 +341,8 @@ async fn dispatch(
                             &upstream_key,
                             upstream::FailureKind::Transient,
                             &error.to_string(),
+                            // 200 的响应没有可用的限流提示。
+                            None,
                         )
                         .await;
                         last_failure = Some(Failure::with_context(error, user_message, context));
@@ -392,6 +407,8 @@ async fn dispatch(
                     &upstream_key,
                     upstream::FailureKind::Transient,
                     &error.to_string(),
+                    // 网络层失败没有响应头可用。
+                    None,
                 )
                 .await;
                 last_failure = Some(Failure::with_context(error, user_message, context));

@@ -149,7 +149,7 @@ pub async fn resume_keys(
 /// `POST /api/blocks/{id}/keys/never-disable`
 ///
 /// 批量设置「永不暂停」：免于被自动停用。连续失败只记录、不改状态；
-/// 429 与瞬时故障的指数退避照常生效（退避是临时避让，不是停用）。
+/// 429 与瞬时故障的退避照常生效（退避是临时避让，不是停用）。
 /// `enabled` 缺省为 true，传 false 取消豁免。
 pub async fn never_disable_keys(
     State(state): State<Arc<AppState>>,

@@ -420,6 +420,8 @@ pub async fn chat_completion_stream(
                     break 'attempt;
                 }
                 Ok(response) => {
+                    // 头要先读：下面 `.text()` 会把响应消费掉。
+                    let retry_after = retry_after_secs(response.headers());
                     let status = response.status().as_u16();
                     let detail = response
                         .text()
@@ -451,6 +453,7 @@ pub async fn chat_completion_stream(
                             &upstream_key,
                             upstream::FailureKind::RateLimited,
                             "被限流，暂时退避",
+                            retry_after,
                         )
                         .await;
                         last_failure = Some(Failure::with_context(
@@ -466,6 +469,8 @@ pub async fn chat_completion_stream(
                             &upstream_key,
                             upstream::FailureKind::Hard,
                             &format!("上游返回 {status} {detail}"),
+                            // 硬失败不退避，上游提示（若有）也无处可用。
+                            None,
                         )
                         .await;
                         last_failure = Some(Failure::with_context(
@@ -481,6 +486,8 @@ pub async fn chat_completion_stream(
                             &upstream_key,
                             upstream::FailureKind::Transient,
                             &format!("上游返回 {status} {detail}"),
+                            // 503 也常见带 Retry-After，有就照它等。
+                            retry_after,
                         )
                         .await;
                         last_failure = Some(Failure::with_context(
@@ -525,6 +532,8 @@ pub async fn chat_completion_stream(
                         &upstream_key,
                         upstream::FailureKind::Transient,
                         &error.to_string(),
+                        // 网络层失败没有响应头可用。
+                        None,
                     )
                     .await;
                     last_failure = Some(Failure::with_context(error, user_message, context));
@@ -1010,13 +1019,20 @@ async fn dispatch(
         let context = Some((block.id.clone(), upstream_key.id.clone()));
 
         match sent {
-            Ok((status, response_body)) => {
+            Ok(response) => {
+                let UpstreamResponse {
+                    status,
+                    body: response_body,
+                    retry_after,
+                } = response;
+
                 if status == 429 {
                     upstream::report_failure(
                         pool,
                         &upstream_key,
                         upstream::FailureKind::RateLimited,
                         "被限流，暂时退避",
+                        retry_after,
                     )
                     .await;
                     last_failure = Some(Failure::with_context(
@@ -1039,6 +1055,8 @@ async fn dispatch(
                         &upstream_key,
                         upstream::FailureKind::Hard,
                         &format!("上游返回 {status} {detail}"),
+                        // 硬失败不退避，上游提示（若有）也无处可用。
+                        None,
                     )
                     .await;
                     last_failure = Some(Failure::with_context(
@@ -1049,7 +1067,7 @@ async fn dispatch(
                     continue;
                 }
 
-                // 上游自己的故障（5xx）不算密钥的账：指数退避后换一把，
+                // 上游自己的故障（5xx）不算密钥的账：退避后换一把，
                 // 不停用——上游打个嗝不该把好密钥永久禁掉。
                 if status >= 500 {
                     let detail = response_body
@@ -1061,6 +1079,8 @@ async fn dispatch(
                         &upstream_key,
                         upstream::FailureKind::Transient,
                         &format!("上游返回 {status} {detail}"),
+                        // 503 也常见带 Retry-After，有就照它等。
+                        retry_after,
                     )
                     .await;
                     last_failure = Some(Failure::with_context(
@@ -1098,6 +1118,8 @@ async fn dispatch(
                             &upstream_key,
                             upstream::FailureKind::Transient,
                             &error.to_string(),
+                            // 200 的响应没有可用的限流提示。
+                            None,
                         )
                         .await;
                         last_failure = Some(Failure::with_context(error, user_message, context));
@@ -1162,6 +1184,8 @@ async fn dispatch(
                     &upstream_key,
                     upstream::FailureKind::Transient,
                     &error.to_string(),
+                    // 网络层失败没有响应头可用。
+                    None,
                 )
                 .await;
                 last_failure = Some(Failure::with_context(error, user_message, context));
@@ -1245,7 +1269,19 @@ pub(crate) fn prepare_request(
     Ok(builder)
 }
 
-/// 把请求发给上游，返回状态码与响应体。
+/// 上游的一次响应。
+///
+/// 除了状态码与响应体，还带出上游在头里给的「多久后再来」提示——
+/// 限流时它是判断该退避多久的最好依据，比本地阶梯准。
+pub struct UpstreamResponse {
+    pub status: u16,
+    /// 已解析的响应体；上游出错时可能给空体或 HTML，解析不出就是 `Null`。
+    pub body: Value,
+    /// `Retry-After` / `retry-after-ms` 解析出的等待秒数；没给则 `None`。
+    pub retry_after: Option<i64>,
+}
+
+/// 把请求发给上游，返回状态码、响应体与限流提示。
 ///
 /// 网络错误与超时都归为 Err；HTTP 状态码原样返回，由调用方分类处理——
 /// 429、401 与 5xx 的后续动作完全不同，不能在这里替调用方做决定。
@@ -1255,17 +1291,55 @@ pub async fn send(
     request: &UpstreamRequest,
     style: AuthStyle,
     key: &str,
-) -> Result<(u16, Value)> {
+) -> Result<UpstreamResponse> {
     let response = prepare_request(client, block, request, style, key)?
         .send()
         .await
         .map_err(|error| Error::UpstreamUnavailable(format!("请求上游失败: {error}")))?;
 
     let status = response.status().as_u16();
+    let retry_after = retry_after_secs(response.headers());
     // 上游在出错时可能返回空体或 HTML，解析不出就按空对象处理。
     let body = response.json::<Value>().await.unwrap_or(Value::Null);
 
-    Ok((status, body))
+    Ok(UpstreamResponse {
+        status,
+        body,
+        retry_after,
+    })
+}
+
+/// 从响应头里读出上游要求的等待秒数。
+///
+/// 先认标准的 `Retry-After`（非负整数秒，或 HTTP 日期），再退到
+/// `retry-after-ms`（毫秒，部分网关——如 Azure 系——用这个）。两者都没有、
+/// 或值不合规时返回 `None`，由调用方按失败次数走退避阶梯。
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<i64> {
+    if let Some(secs) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_retry_after(value.trim()))
+    {
+        return Some(secs);
+    }
+
+    headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        // 毫秒向上取整成秒：宁可多等一秒，也别为了半秒提前回头打。
+        .map(|ms| (ms.max(0) + 999) / 1000)
+}
+
+/// 解析 `Retry-After` 的两种合法写法：非负整数秒，或 HTTP 日期。
+fn parse_retry_after(value: &str) -> Option<i64> {
+    if let Ok(secs) = value.parse::<i64>() {
+        return Some(secs.max(0));
+    }
+
+    // HTTP-date（IMF-fixdate）与 RFC 2822 同形：算到那个时刻还剩多少秒。
+    let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some((when.timestamp() - time::now_secs()).max(0))
 }
 
 /// 建立流式上游请求，返回原始响应供调用方消费字节流。
@@ -1569,5 +1643,32 @@ mod tests {
             prepare_request(&client, &block, &probe, AuthStyle::Bearer, "sk-demo-secret").is_err(),
             "非法头值必须报错"
         );
+    }
+
+    #[test]
+    fn retry_after_header_prefers_the_standard_and_reads_ms() {
+        use reqwest::header::HeaderValue;
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_secs(&headers), None, "没给提示就是 None");
+
+        headers.insert("retry-after", HeaderValue::from_static("120"));
+        assert_eq!(retry_after_secs(&headers), Some(120));
+
+        // 两个都给时以标准的 Retry-After 为准。
+        headers.insert("retry-after-ms", HeaderValue::from_static("1500"));
+        assert_eq!(retry_after_secs(&headers), Some(120));
+
+        headers.remove("retry-after");
+        assert_eq!(retry_after_secs(&headers), Some(2), "毫秒向上取整成秒");
+    }
+
+    #[test]
+    fn retry_after_understands_seconds_and_http_dates() {
+        assert_eq!(parse_retry_after("90"), Some(90));
+        assert_eq!(parse_retry_after("0"), Some(0));
+        // HTTP-date 形式：已经过去的时刻按 0 处理（仍算「上游给了提示」）。
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), Some(0));
+        assert_eq!(parse_retry_after("soon-ish"), None, "读不懂就别猜");
     }
 }
