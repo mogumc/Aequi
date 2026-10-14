@@ -489,6 +489,24 @@ chunk 结构与 OpenAI 完全一致（`chat.completion.chunk`），流末尾依�
 `max_completion_tokens` 的定义即「含可见输出与推理 token」）：用高强度思考档时，
 按正文长度设的上限会被思考吃掉一部分，需要自己给足。
 
+**转换调整会留痕**：网关有若干处会替你改设置——档位取不到就近降级、超出值域封顶、
+入口不认的非标字段直接忽略。这些**都不静默**，统一以结构化告警落日志：
+`code` + 字段路径 + 模型名，可按 `code` 直接筛。
+
+被忽略的非标字段（逐个对应各家的真实拼写）：`thinking`、`enable_thinking`、`think`、
+`chat_template_kwargs`、`thinking_budget`、`thinking_token_budget`、`include_reasoning`，
+以及 `reasoning` 里除 `effort` 以外的键（`enabled` / `max_tokens` / `exclude`）。
+
+| `code` | 含义 |
+|---|---|
+| `effort_adjusted` | 档位被就近取到别的档（Anthropic 没有 `minimal`，落到 `low`——**比请求的更强**） |
+| `effort_capped` | 档位超出上游值域被封顶（Gemini 没有 `xhigh`，顶到 `HIGH`） |
+| `thinking_disable_unsupported` | 上游没有关闭思考的能力，降级为最省档（Gemini 的 `none` → `MINIMAL`） |
+| `reasoning_field_ignored` | 入口不认该字段，已忽略 |
+
+「不提交就不添加」说的是**不替你加**；而一旦你提交了、网关却用不上，就一定有一条记录
+——否则「设了 `high` 却只有 `medium` 的效果」这类问题在日志里查不出来。
+
 ### `POST /v1/images/generations`
 
 OpenAI 生图协议，与对话共用认证、调度、重试与双轨日志。

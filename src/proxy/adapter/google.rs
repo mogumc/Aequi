@@ -19,6 +19,7 @@ use serde_json::{json, Map, Value};
 
 use crate::error::{Error, Result};
 use crate::model::ApiFormat;
+use crate::proxy::diagnostics::{self, Adjustment};
 
 use super::{Adapter, AuthStyle, ProbeOutcome, UpstreamRequest};
 use crate::proxy::scheme::{
@@ -50,7 +51,7 @@ impl Adapter for GoogleAdapter {
     fn build_chat(&self, request: &ChatRequest, model: &str) -> UpstreamRequest {
         UpstreamRequest {
             path: format!("/v1beta/models/{model}:generateContent"),
-            body: Some(build_body(request)),
+            body: Some(build_body(request, model)),
         }
     }
 
@@ -58,7 +59,7 @@ impl Adapter for GoogleAdapter {
     fn build_chat_stream(&self, request: &ChatRequest, model: &str) -> UpstreamRequest {
         UpstreamRequest {
             path: format!("/v1beta/models/{model}:streamGenerateContent?alt=sse"),
-            body: Some(build_body(request)),
+            body: Some(build_body(request, model)),
         }
     }
 
@@ -328,7 +329,8 @@ fn parse_usage(value: Option<&Value>) -> Usage {
 /// `role:"user"` 的 content 里作为 functionResponse parts——连续的结果
 /// 合并进同一条 user content。generateContent 没有 Interactions 那套
 /// 「call 必须紧跟 user/result」的交错约束。
-fn build_body(request: &ChatRequest) -> Value {
+/// `model` 只为调整留痕而传（正常路径用不到它，模型名已经在 URL 里）。
+fn build_body(request: &ChatRequest, model: &str) -> Value {
     let mut contents: Vec<Value> = Vec::new();
     let mut system_parts: Vec<String> = Vec::new();
 
@@ -491,16 +493,12 @@ fn build_body(request: &ChatRequest) -> Value {
         // Gemini 3 起用 thinkingLevel 枚举。旧版的 thinkingBudget 在 Gemini 3 上
         // 已废弃、官方明说会产生间歇性 400 INVALID_ARGUMENT，两者同给直接报错——
         // 所以只给 level，不给预算数字。
-        if reasoning.is_disabled() {
-            // Gemini 没有真正的「关」：最省的 MINIMAL 官方也只说「与大多数查询的
-            // 不思考设置相当」，**不保证关闭**。降级并留痕——报错等于让 Gemini 的块
-            // 用不了「关思考」这个动作。
-            tracing::warn!("Gemini 无关闭思考的档位，已将 none 降级为 thinkingLevel=MINIMAL");
-        }
+        let (level, adjustment) = thinking_level(&reasoning.effort);
+        diagnostics::log(model, adjustment.as_slice());
         config.insert(
             "thinkingConfig".to_string(),
             json!({
-                "thinkingLevel": thinking_level(&reasoning.effort),
+                "thinkingLevel": level,
                 // 不写这个字段，思考 part 根本不会随响应回来，出口的
                 // reasoning_content 就永远是空的——响应侧早就按 thought 标志分流了。
                 "includeThoughts": true,
@@ -532,18 +530,46 @@ fn build_body(request: &ChatRequest) -> Value {
     body
 }
 
-/// OpenAI 档位 → Gemini 的 `thinkingLevel`。
+/// OpenAI 档位 → Gemini 的 `thinkingLevel`，附带「是否偏离了请求的档位」。
 ///
 /// 官方枚举就是 `MINIMAL/LOW/MEDIUM/HIGH`（REST 里写大写，见官方 curl 示例），
-/// 与 OpenAI 的档位基本一一对应；Gemini 没有 `xhigh`，封顶到 HIGH。
-/// `none` 落 MINIMAL——上游没有真正的关闭档（见 [`build_body`] 里的告警）。
-fn thinking_level(effort: &str) -> &'static str {
+/// 与 OpenAI 的档位基本一一对应。
+fn thinking_level(effort: &str) -> (&'static str, Option<Adjustment>) {
     match effort {
-        "none" | "minimal" => "MINIMAL",
-        "medium" => "MEDIUM",
-        "high" | "xhigh" => "HIGH",
-        // low 与认不出的值都落这里：给最省档，不把未知档位放大成默认强度。
-        _ => "LOW",
+        "minimal" => ("MINIMAL", None),
+        "low" => ("LOW", None),
+        "medium" => ("MEDIUM", None),
+        "high" => ("HIGH", None),
+        // Gemini 没有 xhigh，封顶到 HIGH（比请求的更省）。代价是「想更用力」的诉求
+        // 得不到满足，而客户端看不出来，所以留痕。
+        "xhigh" => (
+            "HIGH",
+            Some(Adjustment::new(
+                diagnostics::EFFORT_CAPPED,
+                "generationConfig.thinkingConfig.thinkingLevel",
+                "Gemini 没有 xhigh 档，已封顶为 HIGH",
+            )),
+        ),
+        // 上游没有真正的「关」：最省的 MINIMAL 官方也只说「与大多数查询的不思考设置
+        // 相当」，**不保证关闭**。报错等于让 Gemini 的块用不了这个动作，所以降级 + 留痕。
+        "none" => (
+            "MINIMAL",
+            Some(Adjustment::new(
+                diagnostics::DISABLE_UNSUPPORTED,
+                "generationConfig.thinkingConfig.thinkingLevel",
+                "Gemini 没有关闭思考的档位，已降级为 MINIMAL（不保证真的关闭）",
+            )),
+        ),
+        // 入口已经拦下非官方取值，这一臂正常走不到；真走到了说明入口放宽了，
+        // 那就更该留痕，而不是静默降级。
+        _ => (
+            "LOW",
+            Some(Adjustment::new(
+                diagnostics::EFFORT_ADJUSTED,
+                "generationConfig.thinkingConfig.thinkingLevel",
+                format!("档位 {effort} 无法识别，已退到最省的 LOW"),
+            )),
+        ),
     }
 }
 
@@ -730,6 +756,44 @@ mod tests {
     use super::*;
     use crate::proxy::scheme::{Message, TokenLimitField, ToolCall, ToolDefinition};
 
+    /// 用例里的模型名。只影响调整留痕，取一个普通的 Gemini 3 名即可。
+    const TEST_MODEL: &str = "gemini-3.5-flash-lite";
+
+    /// 免去每个用例都传模型名。
+    fn body_of(request: &ChatRequest) -> Value {
+        build_body(request, TEST_MODEL)
+    }
+
+    #[test]
+    fn only_degraded_levels_are_reported_as_adjustments() {
+        // 直译的档位不留痕——留痕太密会和噪音一样没人看。
+        for (effort, level) in [
+            ("minimal", "MINIMAL"),
+            ("low", "LOW"),
+            ("medium", "MEDIUM"),
+            ("high", "HIGH"),
+        ] {
+            let (name, adjustment) = thinking_level(effort);
+            assert_eq!(name, level);
+            assert!(adjustment.is_none(), "{effort} 不该被记成调整");
+        }
+
+        // xhigh 没有对应档，封顶；none 关不掉，降级。两者都必须留痕。
+        let (name, adjustment) = thinking_level("xhigh");
+        assert_eq!(name, "HIGH");
+        assert_eq!(
+            adjustment.expect("xhigh 必然是一次调整").code,
+            diagnostics::EFFORT_CAPPED
+        );
+
+        let (name, adjustment) = thinking_level("none");
+        assert_eq!(name, "MINIMAL");
+        assert_eq!(
+            adjustment.expect("none 必然是一次调整").code,
+            diagnostics::DISABLE_UNSUPPORTED
+        );
+    }
+
     fn request(messages: Vec<Message>) -> ChatRequest {
         ChatRequest {
             model: "gemini-3.5-flash-lite".to_string(),
@@ -789,7 +853,7 @@ mod tests {
             },
         ]);
 
-        let body = build_body(&request);
+        let body = body_of(&request);
         let contents = body["contents"].as_array().unwrap();
 
         assert_eq!(contents.len(), 3);
@@ -834,7 +898,7 @@ mod tests {
             name: None,
         }]);
 
-        let body = build_body(&request);
+        let body = body_of(&request);
         let parts = &body["contents"][0]["parts"];
 
         assert_eq!(parts.as_array().unwrap().len(), 2);
@@ -849,7 +913,7 @@ mod tests {
             ContentPart::text("这是结果"),
             ContentPart::text("![图](https://example.com/a.png)"),
         ])]);
-        let parts = &build_body(&with_image)["contents"][0]["parts"];
+        let parts = &body_of(&with_image)["contents"][0]["parts"];
         assert!(parts[0].get("thoughtSignature").is_none());
         assert_eq!(parts[1]["thoughtSignature"], THOUGHT_SIGNATURE_BYPASS);
 
@@ -858,7 +922,7 @@ mod tests {
             ContentPart::text("第一段"),
             ContentPart::text("第二段"),
         ])]);
-        let parts = &build_body(&plain)["contents"][0]["parts"];
+        let parts = &body_of(&plain)["contents"][0]["parts"];
         assert_eq!(parts[0]["thoughtSignature"], THOUGHT_SIGNATURE_BYPASS);
         assert!(parts[1].get("thoughtSignature").is_none());
     }
@@ -890,7 +954,7 @@ mod tests {
             },
         ]);
 
-        let body = build_body(&request);
+        let body = body_of(&request);
         let contents = body["contents"].as_array().unwrap();
         let response_part = &contents[2]["parts"][0];
         assert_eq!(response_part["functionResponse"]["name"], "WebSearch");
@@ -923,7 +987,7 @@ mod tests {
             },
         ]);
 
-        let body = build_body(&request);
+        let body = body_of(&request);
         let contents = body["contents"].as_array().unwrap();
         assert_eq!(contents[2]["parts"][0]["functionResponse"]["name"], "get_weather");
     }
@@ -968,7 +1032,7 @@ mod tests {
             },
         ]);
 
-        let body = build_body(&request);
+        let body = body_of(&request);
         let contents = body["contents"].as_array().unwrap();
         let responses: Vec<&serde_json::Value> = contents[2]["parts"]
             .as_array()

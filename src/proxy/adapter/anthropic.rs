@@ -7,6 +7,7 @@ use serde_json::{Map, Value, json};
 
 use crate::error::{Error, Result};
 use crate::model::ApiFormat;
+use crate::proxy::diagnostics::{self, Adjustment};
 
 use super::openai::text_at;
 use super::{
@@ -81,8 +82,10 @@ impl Adapter for AnthropicAdapter {
 
         if let Some(reasoning) = &request.reasoning {
             if reasoning.is_disabled() {
-                // 官方关闭写法。此时**不**碰 effort：关了就是关了，
-                // 顺手塞个档位只会把「输出预算」也一并压下去。
+                // 官方关闭写法。三家出口里只有 Anthropic 是**确定关掉**的
+                // （`thinking.disabled` 是官方契约，不存在「稀释成最小档」），
+                // 所以这里没有调整要留痕。
+                // 此时也不碰 effort：关了就是关了，顺手塞个档位只会把「输出预算」也一并压下去。
                 body.insert("thinking".into(), json!({ "type": "disabled" }));
             } else {
                 // 强度走官方顶层的 output_config.effort，值域与 OpenAI 基本同名
@@ -92,10 +95,9 @@ impl Adapter for AnthropicAdapter {
                 // 在新模型上已标废弃，而且还有「≥1024 且 < max_tokens」两条硬约束——
                 // 我们的 max_tokens 兜底是 4096，硬凑预算随时会把请求顶 400。
                 // 关掉显式开关后由模型按复杂度自决，官方说明低 effort 下本就会跳过思考。
-                body.insert(
-                    "output_config".into(),
-                    json!({ "effort": effort_name(&reasoning.effort) }),
-                );
+                let (effort, adjustment) = effort_name(&reasoning.effort);
+                body.insert("output_config".into(), json!({ "effort": effort }));
+                diagnostics::log(model, adjustment.as_slice());
             }
         }
 
@@ -451,19 +453,37 @@ fn convert_tool_choice(choice: &Value) -> Option<Value> {
     }
 }
 
-/// OpenAI 档位 → Anthropic 档位。
+/// OpenAI 档位 → Anthropic 档位，附带「是否偏离了请求的档位」。
 ///
 /// 两边几乎同名（low/medium/high/xhigh），只有 `minimal` 没有对应档——
 /// Anthropic 最省的一档就是 `low`，往下没有更细的（`none` 在上层已走关闭分支，
 /// 到不了这里）。`max` 是 Anthropic 独有，入口没有对应来源。
-fn effort_name(effort: &str) -> &'static str {
+fn effort_name(effort: &str) -> (&'static str, Option<Adjustment>) {
     match effort {
-        "medium" => "medium",
-        "high" => "high",
-        "xhigh" => "xhigh",
-        // low 与 minimal 都落这里。理论上到不了兜底分支（入口只放行官方六个值），
-        // 真到了也给最省档——不能把认不出的档位放大成默认的 high。
-        _ => "low",
+        "low" => ("low", None),
+        "medium" => ("medium", None),
+        "high" => ("high", None),
+        "xhigh" => ("xhigh", None),
+        // 唯一一个**方向朝上**的降级：客户端要最省，拿到的是更强的一档。
+        // 成本和延迟都会高于预期，必须留痕。
+        "minimal" => (
+            "low",
+            Some(Adjustment::new(
+                diagnostics::EFFORT_ADJUSTED,
+                "output_config.effort",
+                "Anthropic 没有 minimal 档，已取最近的 low（比请求的更强）",
+            )),
+        ),
+        // 入口已经拦下非官方取值，这一臂正常走不到；真走到了说明入口放宽了，
+        // 那就更该留痕，而不是静默降级。
+        _ => (
+            "low",
+            Some(Adjustment::new(
+                diagnostics::EFFORT_ADJUSTED,
+                "output_config.effort",
+                format!("档位 {effort} 无法识别，已退到最省的 low"),
+            )),
+        ),
     }
 }
 
@@ -520,5 +540,27 @@ fn parse_usage(value: Option<&Value>) -> Usage {
         total_tokens: prompt_tokens + completion_tokens,
         cache_tokens,
         estimated: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_minimal_is_reported_as_an_adjustment() {
+        // 同名档位直译，不该产生任何调整记录——留痕太密会和噪音一样没人看。
+        for effort in ["low", "medium", "high", "xhigh"] {
+            let (name, adjustment) = effort_name(effort);
+            assert_eq!(name, effort);
+            assert!(adjustment.is_none(), "{effort} 不该被记成调整");
+        }
+
+        // minimal 没有对应档，落到 low；而且方向朝上（比请求的更强），必须留痕。
+        let (name, adjustment) = effort_name("minimal");
+        assert_eq!(name, "low");
+        let adjustment = adjustment.expect("minimal 必然是一次调整");
+        assert_eq!(adjustment.code, diagnostics::EFFORT_ADJUSTED);
+        assert_eq!(adjustment.path, "output_config.effort");
     }
 }

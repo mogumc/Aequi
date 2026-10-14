@@ -6,6 +6,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::error::{Error, Result};
+use crate::proxy::diagnostics::{self, Adjustment};
 
 use super::scheme::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Reasoning, Role,
@@ -20,6 +21,12 @@ pub fn parse_request(body: &Value) -> Result<ChatRequest> {
         .filter(|model| !model.is_empty())
         .ok_or_else(|| Error::BadRequest("请求里缺少 model".to_string()))?
         .to_string();
+
+    // 入口不认的思考相关字段：不解析，但绝不静默丢掉。
+    //
+    // 放在所有参数校验**之前**：任何一个 400 都不该吞掉这条线索——
+    // 用户最需要排查的恰恰是没成功的那次请求。
+    diagnostics::log(&model, &ignored_reasoning_fields(body));
 
     let raw_messages = body
         .get("messages")
@@ -118,6 +125,57 @@ fn parse_reasoning(body: &Value) -> Result<Option<Reasoning>> {
             Reasoning::EFFORTS.join(" / ")
         ))
     })
+}
+
+/// 入口不认、但生态里确实在用的思考相关字段。
+///
+/// 网关对外只承诺 OpenAI 官方子集，这些厂商私有写法一律不解析——但**不能静默丢**：
+/// 用户以为开关生效、日志里什么都没有，是最难查的一类问题。
+/// 名单覆盖实际在用的几种：vLLM 的 `chat_template_kwargs`、Qwen / GLM 的
+/// `enable_thinking` / `thinking`、Ollama 的 `think`。
+///
+/// 只留痕，不改行为：真要支持这些写法，正确的形态是按块配置放行（见 API.md）。
+fn ignored_reasoning_fields(body: &Value) -> Vec<Adjustment> {
+    // 这些在入口都是**非标**字段：网关对外只有 OpenAI 一种协议，
+    // 客户端不该在这里用 Anthropic / GLM / vLLM / Ollama 的写法。
+    // 字段名逐字对应各家的真实拼写（vLLM 是 `thinking_token_budget`，
+    // 与 DashScope 的 `thinking_budget` 是两个东西，都要收）。
+    const FIELDS: [&str; 7] = [
+        "thinking",
+        "enable_thinking",
+        "think",
+        "chat_template_kwargs",
+        "thinking_budget",
+        "thinking_token_budget",
+        "include_reasoning",
+    ];
+    // `reasoning` 对象只读 `effort`（Responses 风格的兜底来源），其余键是 OpenRouter 语义。
+    const REASONING_KEYS: [&str; 3] = ["enabled", "max_tokens", "exclude"];
+
+    let mut adjustments = Vec::new();
+    for field in FIELDS {
+        if body.get(field).is_some() {
+            adjustments.push(Adjustment::new(
+                diagnostics::FIELD_IGNORED,
+                field,
+                format!("入口不支持 `{field}`，已忽略；要调思考请用 `reasoning_effort`"),
+            ));
+        }
+    }
+
+    if let Some(reasoning) = body.get("reasoning").and_then(Value::as_object) {
+        for key in REASONING_KEYS {
+            if reasoning.contains_key(key) {
+                adjustments.push(Adjustment::new(
+                    diagnostics::FIELD_IGNORED,
+                    "reasoning",
+                    format!("`reasoning` 只读取 `effort`，`{key}` 已忽略"),
+                ));
+            }
+        }
+    }
+
+    adjustments
 }
 
 /// 把标准响应封装成 OpenAI 的响应体。
@@ -495,6 +553,67 @@ mod tests {
             parse_request(&both).unwrap().reasoning.unwrap().effort,
             "medium"
         );
+    }
+
+    #[test]
+    fn unsupported_reasoning_fields_are_reported_not_silently_dropped() {
+        // 这些写法网关不解析，但必须在日志里留下痕迹——否则用户看到的是
+        // 「开关不生效、日志里什么都没有」。
+        let body = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "chat_template_kwargs": { "enable_thinking": false },
+            "enable_thinking": true,
+            "think": false,
+            "thinking_budget": 2048,
+            "thinking_token_budget": 2048,
+            "reasoning": { "effort": "high", "enabled": true }
+        });
+
+        let adjustments = ignored_reasoning_fields(&body);
+        let paths: Vec<&str> = adjustments.iter().map(|item| item.path).collect();
+        for expected in [
+            "chat_template_kwargs",
+            "enable_thinking",
+            "think",
+            "thinking_budget",
+            // vLLM 的拼写与 DashScope 不同，两个都得认。
+            "thinking_token_budget",
+            "reasoning",
+        ] {
+            assert!(paths.contains(&expected), "{expected} 必须留痕：{paths:?}");
+        }
+        // `reasoning.effort` 是支持的，只报其余键。
+        assert_eq!(
+            adjustments
+                .iter()
+                .filter(|item| item.path == "reasoning")
+                .count(),
+            1
+        );
+        // 统一用同一个 code，便于按码筛日志。
+        for adjustment in adjustments {
+            assert_eq!(adjustment.code, diagnostics::FIELD_IGNORED);
+        }
+    }
+
+    #[test]
+    fn supported_reasoning_fields_are_not_reported_as_ignored() {
+        // 只给官方字段时不该有任何「被忽略」的记录——留痕太密等于没有留痕。
+        let flat = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning_effort": "high"
+        });
+        assert!(ignored_reasoning_fields(&flat).is_empty());
+
+        // `reasoning` 只用 effort 是支持的（Responses 风格兜底）。
+        let nested = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning": { "effort": "low" }
+        });
+        assert!(ignored_reasoning_fields(&nested).is_empty());
     }
 
     #[test]
