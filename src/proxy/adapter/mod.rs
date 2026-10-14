@@ -209,7 +209,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    use crate::proxy::scheme::{ChatRequest, ContentPart, FinishReason, Message, Reasoning, Role};
+    use crate::proxy::scheme::{
+        ChatRequest, ContentPart, FinishReason, Message, Reasoning, Role, TokenLimitField,
+    };
     use crate::service::upstream::UpstreamState;
 
     /// 一个带 system、user、可选参数的标准请求。
@@ -237,6 +239,7 @@ mod tests {
             temperature: Some(0.7),
             top_p: None,
             max_tokens: Some(1024),
+            max_tokens_field: TokenLimitField::MaxTokens,
             reasoning: None,
             stop: vec![],
         }
@@ -563,6 +566,26 @@ mod tests {
             outgoing.body.as_ref().unwrap()["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "MINIMAL"
         );
+    }
+
+    #[test]
+    fn openai_keeps_the_token_limit_field_name_the_client_used() {
+        // 回归：o 系与 gpt-5 只认 max_completion_tokens，一律回写 max_tokens
+        // 会被上游判「不支持的参数」——客户端设的上限等于没设。
+        let mut request = sample_request();
+        request.max_tokens_field = TokenLimitField::MaxCompletionTokens;
+
+        let outgoing = adapter_for(ApiFormat::Openai).build_chat(&request, "gpt-real");
+        let body = outgoing.body.as_ref().unwrap();
+        assert_eq!(body["max_completion_tokens"], 1024);
+        assert!(body.get("max_tokens").is_none());
+
+        // 用旧名字时保持原样。
+        let request = sample_request();
+        let outgoing = adapter_for(ApiFormat::Openai).build_chat(&request, "gpt-real");
+        let body = outgoing.body.as_ref().unwrap();
+        assert_eq!(body["max_tokens"], 1024);
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]

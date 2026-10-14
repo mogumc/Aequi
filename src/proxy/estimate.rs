@@ -500,7 +500,7 @@ mod tests {
     // ── complete_usage：缺哪项补哪项 ──────────────────────────
 
     fn sample_request() -> ChatRequest {
-        use crate::proxy::scheme::{Message, Role};
+        use crate::proxy::scheme::{Message, Role, TokenLimitField};
         ChatRequest {
             model: "demo-model".to_string(),
             messages: vec![Message {
@@ -517,6 +517,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            max_tokens_field: TokenLimitField::MaxTokens,
             reasoning: None,
             stop: Vec::new(),
         }

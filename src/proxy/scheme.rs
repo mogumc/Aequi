@@ -119,6 +119,29 @@ impl Reasoning {
     }
 }
 
+/// 输出上限用的字段名。
+///
+/// OpenAI 有新旧两个名字，**值一样、名字不一样**：`max_tokens` 已 deprecated
+/// 且与 o 系模型不兼容，推理模型与 gpt-5 只认 `max_completion_tokens`。
+/// 所以必须记住客户端用的哪一个——按错的名字发出去，上游会判「不支持的参数」，
+/// 客户端设的上限等于没设，而账单和上下文都看不出异常。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TokenLimitField {
+    #[default]
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+impl TokenLimitField {
+    /// 写回上游请求体时用的字段名。
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
+}
+
 /// 标准对话请求。
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
@@ -130,6 +153,8 @@ pub struct ChatRequest {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<u32>,
+    /// 上面那个值在入口用的是哪个字段名。`max_tokens` 为 `None` 时无意义。
+    pub max_tokens_field: TokenLimitField,
     /// 思考开关与强度。`None` = 下游没提，**三家都不得写任何思考字段**。
     pub reasoning: Option<Reasoning>,
     pub stop: Vec<String>,

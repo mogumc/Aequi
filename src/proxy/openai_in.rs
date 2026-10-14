@@ -8,8 +8,8 @@ use serde_json::{Map, Value, json};
 use crate::error::{Error, Result};
 
 use super::scheme::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Reasoning, Role, ToolCall,
-    ToolCallDelta, ToolDefinition, Usage,
+    ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Reasoning, Role,
+    TokenLimitField, ToolCall, ToolCallDelta, ToolDefinition, Usage,
 };
 
 /// 解析用户发来的对话请求。
@@ -32,6 +32,7 @@ pub fn parse_request(body: &Value) -> Result<ChatRequest> {
         messages.push(parse_message(raw)?);
     }
 
+    let (max_tokens, max_tokens_field) = parse_max_tokens(body)?;
     let reasoning = parse_reasoning(body)?;
 
     Ok(ChatRequest {
@@ -41,15 +42,50 @@ pub fn parse_request(body: &Value) -> Result<ChatRequest> {
         tool_choice: body.get("tool_choice").cloned(),
         temperature: body.get("temperature").and_then(Value::as_f64),
         top_p: body.get("top_p").and_then(Value::as_f64),
-        // 新旧两套字段名都认。
-        max_tokens: body
-            .get("max_tokens")
-            .or_else(|| body.get("max_completion_tokens"))
-            .and_then(Value::as_u64)
-            .map(|value| value as u32),
+        max_tokens,
+        max_tokens_field,
         reasoning,
         stop: parse_stop(body.get("stop")),
     })
+}
+
+/// 解析输出上限，并记住客户端用的是哪个字段名。
+///
+/// 两个名字都认，但**不能合成一个就完事**：`max_tokens` 与 o 系模型不兼容，
+/// openai 格式的块必须按原名回写（见 [`TokenLimitField`]）。
+fn parse_max_tokens(body: &Value) -> Result<(Option<u32>, TokenLimitField)> {
+    let legacy = read_token_limit(body, "max_tokens")?;
+    let modern = read_token_limit(body, "max_completion_tokens")?;
+
+    match (legacy, modern) {
+        // 两个都给：`max_completion_tokens` 官方就是前者的别名，值相同说明
+        // 客户端在同时兼容新旧上游，按新字段走即可。值不同才是真的说不清。
+        (Some(legacy), Some(modern)) if legacy != modern => Err(Error::BadRequest(
+            "max_tokens 与 max_completion_tokens 取值不一致".to_string(),
+        )),
+        (_, Some(value)) => Ok((Some(value), TokenLimitField::MaxCompletionTokens)),
+        (Some(value), None) => Ok((Some(value), TokenLimitField::MaxTokens)),
+        (None, None) => Ok((None, TokenLimitField::MaxTokens)),
+    }
+}
+
+/// 读一个输出上限字段。
+///
+/// **字段存在但取值不可用时报错，不能当成「没给」**：静默降级会让用户以为
+/// 上限已经生效（实际用的是另一个值，甚至根本没有上限），而日志里什么都没有。
+/// 超出 `u32` 也一样拒绝——截断后发上去的上限会变成一个毫无关系的小数。
+fn read_token_limit(body: &Value, field: &str) -> Result<Option<u32>> {
+    let Some(value) = body.get(field) else {
+        return Ok(None);
+    };
+
+    let number = value
+        .as_u64()
+        .ok_or_else(|| Error::BadRequest(format!("{field} 必须是非负整数")))?;
+    let number = u32::try_from(number)
+        .map_err(|_| Error::BadRequest(format!("{field} 超出上限 {}", u32::MAX)))?;
+
+    Ok(Some(number))
 }
 
 /// 解析思考开关与强度。
@@ -491,6 +527,84 @@ mod tests {
             "reasoning": { "effort": "high" }
         });
         assert!(parse_request(&body).is_err());
+    }
+
+    #[test]
+    fn token_limit_keeps_the_field_name_the_client_used() {
+        // 回归：o 系与 gpt-5 只认 max_completion_tokens。把两个名字合成一个值、
+        // 却按 max_tokens 发出去，上游会判「不支持的参数」，上限等于没设。
+        let modern = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_completion_tokens": 256
+        });
+        let request = parse_request(&modern).unwrap();
+        assert_eq!(request.max_tokens, Some(256));
+        assert_eq!(
+            request.max_tokens_field,
+            TokenLimitField::MaxCompletionTokens
+        );
+
+        let legacy = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 256
+        });
+        let request = parse_request(&legacy).unwrap();
+        assert_eq!(request.max_tokens, Some(256));
+        assert_eq!(request.max_tokens_field, TokenLimitField::MaxTokens);
+
+        // 两个都给且值相同：官方说后者是前者的别名，兼容新旧上游的客户端
+        // 会两个都发，按新字段走即可。
+        let same = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 256,
+            "max_completion_tokens": 256
+        });
+        assert_eq!(
+            parse_request(&same).unwrap().max_tokens_field,
+            TokenLimitField::MaxCompletionTokens
+        );
+
+        // 两个都给但不一样：这才是真的说不清，拒绝而不是猜。
+        let conflict = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 256,
+            "max_completion_tokens": 512
+        });
+        assert!(parse_request(&conflict).is_err());
+    }
+
+    #[test]
+    fn unusable_token_limit_is_rejected_instead_of_treated_as_absent() {
+        // 字段给了但取值用不了时报错，不能当成「没给」——否则用户以为上限生效了，
+        // 实际用的是另一个值（甚至根本没有上限），而日志里什么都没有。
+        for value in [json!("256"), json!(256.5), json!(-1), json!(null)] {
+            let body = json!({
+                "model": "gpt-x",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "max_completion_tokens": value
+            });
+            assert!(parse_request(&body).is_err(), "{value} 应当被拒绝");
+        }
+
+        // 超出 u32 也不行：截断后发上去的上限会变成一个无关的小数。
+        let overflow = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_completion_tokens": 5_000_000_000u64
+        });
+        assert!(parse_request(&overflow).is_err());
+
+        // 一个给、另一个没给时不受影响（这些本来就走得通）。
+        let single = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 256
+        });
+        assert_eq!(parse_request(&single).unwrap().max_tokens, Some(256));
     }
 
     #[test]

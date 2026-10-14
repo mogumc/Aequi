@@ -479,6 +479,16 @@ chunk 结构与 OpenAI 完全一致（`chat.completion.chunk`），流末尾依�
   2.5 及更早只认已废弃的 `thinkingBudget`。网关同时会带 `includeThoughts: true`
   ——不写这个字段，思考内容不会随响应返回，出口的 `reasoning_content` 就是空的。
 
+**输出上限**：`max_tokens` 与 `max_completion_tokens` 都接受，**并记住用的是哪个**——
+`o` 系与 gpt-5 只认 `max_completion_tokens`，所以 `openai` 块按**原字段名**发往上游，
+不会把新名字改写成已 deprecated 的 `max_tokens`。两个都给了且**取值不同 → 400**；
+取值相同则按 `max_completion_tokens` 走。`anthropic` 块写 `max_tokens`（上游必填，
+缺省兜 4096），`google` 块写 `maxOutputTokens`。
+
+注意三家的输出上限都是**「思考 + 正文」共用一个池子**（官方对
+`max_completion_tokens` 的定义即「含可见输出与推理 token」）：用高强度思考档时，
+按正文长度设的上限会被思考吃掉一部分，需要自己给足。
+
 ### `POST /v1/images/generations`
 
 OpenAI 生图协议，与对话共用认证、调度、重试与双轨日志。

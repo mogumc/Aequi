@@ -45,7 +45,13 @@ impl Adapter for OpenAiAdapter {
             insert_if_present(&mut body, "top_p", json!(top_p));
         }
         if let Some(max_tokens) = request.max_tokens {
-            insert_if_present(&mut body, "max_tokens", json!(max_tokens));
+            // 按客户端用的字段名回写：o 系与 gpt-5 只认 max_completion_tokens，
+            // 一律写成 max_tokens 会被上游判「不支持的参数」，上限等于没设。
+            insert_if_present(
+                &mut body,
+                request.max_tokens_field.name(),
+                json!(max_tokens),
+            );
         }
         if let Some(reasoning) = &request.reasoning {
             // 本家格式一字不改地转发：网关不换算、也不添上游没要的字段。

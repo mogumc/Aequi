@@ -728,7 +728,7 @@ fn unwrap_json_content(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::scheme::{Message, ToolCall, ToolDefinition};
+    use crate::proxy::scheme::{Message, TokenLimitField, ToolCall, ToolDefinition};
 
     fn request(messages: Vec<Message>) -> ChatRequest {
         ChatRequest {
@@ -739,6 +739,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            max_tokens_field: TokenLimitField::MaxTokens,
             reasoning: None,
             stop: vec![],
         }
