@@ -361,6 +361,8 @@ Google 的 `generationConfig` 这类更细的开关时，配在该模型的 `ext
 
 `UpstreamKeyView`：`id`、`block_id`、`secret`（明文）、`status`（`active`/`paused`/`disabled`）、`never_disable`、`weight`、`failure_count`、`cooldown_until`、`last_error`、`last_used_at`、`created_at`。
 
+`last_used_at` 记的是**真实流量的最后一次成功使用**：对话（含流式）、生图三条路径在拿到上游 2xx 后写入，同时清零失败计数并解除退避——流式这条路曾经漏记，导致后台一直显示「从未」。
+
 #### 失败分类、退避与永不暂停
 
 密钥生命周期由**失败类型**驱动，不再是「任何失败都计数、够数就停用」：

@@ -651,6 +651,10 @@ pub async fn chat_completion_stream(
             {
                 Ok(response) if response.status().is_success() => {
                     multiplier_bp = block.multiplier_bp(&request.model);
+                    // 上游用这把钥匙接下来并开始返回了：算一次成功使用。
+                    // 流式这条路以前漏了这一步——`last_used_at` 不更新、
+                    // 失败计数也不清零，只有非流式与生图在记。
+                    upstream::report_success(pool, &upstream_key.id).await;
                     upstream = Some(response);
                     chosen = Some((block.id, upstream_key.id, block.api_format));
                     // 位子移交给流：整条流占着这个上游连接，直到它结束。
