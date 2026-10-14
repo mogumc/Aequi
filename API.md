@@ -521,6 +521,12 @@ claude-3」。两级都匹配不上就报 404，**不会静默回退到轮询**�
 
 对外协议**只有 OpenAI 一种**；上游格式由所在块的 `api_format` 决定，内部转换。
 
+**响应里的 `model` 一律是归一化后的对外模型名**（请求里写的那个模型名；带块前缀的
+写法会剥掉前缀）。流式分片与非流式响应给的是同一个值，与写进日志、用量的模型名同源。
+它**不是上游回显**——各家回显五花八门（Google 的 `generateContent` 压根没有这个字段、
+只有 `modelVersion`；OpenAI 块回的可能是 `forward` 转发名），照抄会把上游版本号、
+转发名或空串递给下游。
+
 **流式**：请求带 `"stream": true` 时返回 `text/event-stream`，逐字转发上游增量——
 chunk 结构与 OpenAI 完全一致（`chat.completion.chunk`），流末尾依次是 finish_reason chunk、
 只含 `usage` 的 chunk（choices 为空数组）与 `data: [DONE]`。三家上游均原生支持流式

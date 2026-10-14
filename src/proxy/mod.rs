@@ -239,7 +239,14 @@ async fn chat_completion_inner(
             let id = format!("chatcmpl-{}", random::string(24));
             let created = time::now_secs();
 
-            Ok(openai_in::render_response(&outcome.response, &id, created))
+            // 对外模型名（剥掉块前缀的那个）——与流式帧、日志、用量同一口径。
+            // 刻意不用上游回显：Google 的响应里根本没有模型名。
+            Ok(openai_in::render_response(
+                &outcome.response,
+                &id,
+                created,
+                &request.model,
+            ))
         }
         Err(failure) => {
             // 失败也要留下痕迹：管理员看到细节，用户只看到脱敏描述。

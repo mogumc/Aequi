@@ -213,7 +213,6 @@ impl Adapter for GoogleAdapter {
         let usage = parse_usage(body.get("usageMetadata"));
 
         Ok(ChatResponse {
-            model: String::new(),
             content,
             reasoning,
             tool_calls,

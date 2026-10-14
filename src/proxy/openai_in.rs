@@ -194,7 +194,12 @@ fn ignored_entry_fields(body: &Value) -> Vec<Adjustment> {
 }
 
 /// 把标准响应封装成 OpenAI 的响应体。
-pub fn render_response(response: &ChatResponse, id: &str, created: i64) -> Value {
+///
+/// `model` 是**对外模型名**（请求里写、路由时剥掉块前缀后的那个），由调用方传入。
+/// 不用上游回显：响应里的 `model` 语义是「你请求的模型」，而各家回显五花八门
+/// （Google 的 `generateContent` 压根没有这个字段，只有 `modelVersion`；
+/// OpenAI 回的是转发名）。流式路径一直传的就是这个对外名，这里与之对齐。
+pub fn render_response(response: &ChatResponse, id: &str, created: i64, model: &str) -> Value {
     let mut message = Map::new();
     message.insert("role".into(), json!("assistant"));
     message.insert("content".into(), json!(response.text()));
@@ -216,7 +221,7 @@ pub fn render_response(response: &ChatResponse, id: &str, created: i64) -> Value
         "id": id,
         "object": "chat.completion",
         "created": created,
-        "model": response.model,
+        "model": model,
         "choices": [{
             "index": 0,
             "message": Value::Object(message),
@@ -801,7 +806,6 @@ mod tests {
     #[test]
     fn response_renders_reasoning_content_in_message() {
         let response = ChatResponse {
-            model: "m".into(),
             content: vec![ContentPart::text("答案")],
             reasoning: "推理".into(),
             tool_calls: vec![],
@@ -809,9 +813,33 @@ mod tests {
             usage: Usage::default(),
         };
 
-        let rendered = render_response(&response, "id", 0);
+        let rendered = render_response(&response, "id", 0, "m");
         assert_eq!(rendered["choices"][0]["message"]["reasoning_content"], "推理");
         assert_eq!(rendered["choices"][0]["message"]["content"], "答案");
+    }
+
+    #[test]
+    fn both_paths_report_the_outward_model_name() {
+        // 响应里的 `model` = 请求里写的模型（路由时剥掉块前缀的那个），
+        // **不由上游回显决定**。Google 的 `generateContent` 根本没有模型名
+        // （只有 `modelVersion`），曾经因此非流式返回空串、而流式一直是对的——
+        // 两条路必须同一口径。
+        let response = ChatResponse {
+            content: vec![ContentPart::text("答案")],
+            reasoning: String::new(),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        };
+
+        let non_stream = render_response(&response, "id", 0, "gemini-3.5-flash-lite");
+        let stream = render_stream_usage("id", 0, "gemini-3.5-flash-lite", Usage::default());
+
+        assert_eq!(non_stream["model"], "gemini-3.5-flash-lite");
+        assert_eq!(
+            stream["model"], non_stream["model"],
+            "流式分片与非流式响应的 model 必须是同一个对外名"
+        );
     }
 
     #[test]
@@ -832,14 +860,13 @@ mod tests {
 
         // 非流式走同一个形状，不能只在流式里给。
         let response = ChatResponse {
-            model: "m".into(),
             content: vec![ContentPart::text("答案")],
             reasoning: String::new(),
             tool_calls: vec![],
             finish_reason: FinishReason::Stop,
             usage,
         };
-        let rendered = render_response(&response, "id", 0);
+        let rendered = render_response(&response, "id", 0, "m");
         assert_eq!(rendered["usage"]["prompt_tokens_details"]["cached_tokens"], 1500);
     }
 
