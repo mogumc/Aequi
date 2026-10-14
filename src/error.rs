@@ -4,7 +4,7 @@
 //! 前端只需处理一种错误结构。
 
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 /// 业务错误。
@@ -36,6 +36,19 @@ pub enum Error {
     #[error("上游响应异常: {0}")]
     UpstreamUnavailable(String),
 
+    /// 上游限流：本服务或上游短时间内不受理。
+    ///
+    /// 对下游就是 **429**，并把等待秒数写进 `Retry-After`——上游怎么限的
+    /// 就照实往下传，别翻成「无可用密钥」这类不相干的说法：下游要据此
+    /// 退避，而不是以为自己没权限。
+    #[error("{message}")]
+    RateLimited {
+        message: String,
+        /// 建议下游等多少秒再来；拿不到（上游没给提示）时为 `None`，
+        /// 此时不发 `Retry-After` 头。
+        retry_after: Option<i64>,
+    },
+
     #[error("{0}")]
     NotFound(String),
 
@@ -63,6 +76,8 @@ impl Error {
             Error::Forbidden(_) => StatusCode::FORBIDDEN,
             // 402 比 403 更贴切：不是没权限，是余额不够。
             Error::InsufficientCredits => StatusCode::PAYMENT_REQUIRED,
+            // 与上游同一口径：被限流就是 429，配 `Retry-After`。
+            Error::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             // 上游的问题用 502 表达，别让用户以为是我们坏了。
             Error::UpstreamUnavailable(_) => StatusCode::BAD_GATEWAY,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
@@ -80,10 +95,39 @@ impl Error {
             Error::InvalidTotp => "invalid_totp",
             Error::Forbidden(_) => "forbidden",
             Error::InsufficientCredits => "insufficient_credits",
+            Error::RateLimited { .. } => "rate_limited",
             Error::UpstreamUnavailable(_) => "upstream_unavailable",
             Error::NotFound(_) => "not_found",
             Error::Database(_) => "database_error",
             Error::Internal(_) => "internal_error",
+        }
+    }
+
+    /// 建议下游等多少秒再来（目前只有上游限流带这个信息）。
+    pub fn retry_hint(&self) -> Option<i64> {
+        match self {
+            Error::RateLimited { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    /// 补上等待提示；已有提示或不是限流类错误时原样返回。
+    ///
+    /// 用在「块内密钥全在退避」的时刻：上一轮的限流错误本来没带秒数，
+    /// 这里能拿到块内最早的恢复时间，就把它补成对下游有用的 `Retry-After`。
+    pub fn with_retry_hint(self, hint: Option<i64>) -> Self {
+        match (self, hint) {
+            (
+                Error::RateLimited {
+                    message,
+                    retry_after: None,
+                },
+                Some(secs),
+            ) => Error::RateLimited {
+                message,
+                retry_after: Some(secs),
+            },
+            (error, _) => error,
         }
     }
 }
@@ -105,6 +149,10 @@ impl IntoResponse for Error {
             self.to_string()
         };
 
+        // 上游限流要把「多久后再来」一并告诉下游——客户端据此退避，
+        // 比让它盲猜重试节奏靠谱得多。
+        let retry_after = self.retry_hint();
+
         let body = Json(serde_json::json!({
             "error": {
                 "type": self.kind(),
@@ -112,7 +160,13 @@ impl IntoResponse for Error {
             }
         }));
 
-        (status, body).into_response()
+        let mut response = (status, body).into_response();
+        if let Some(secs) = retry_after {
+            if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 

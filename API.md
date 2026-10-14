@@ -25,10 +25,16 @@
 ```
 
 `type` 取值：`bad_request`、`unauthorized`、`invalid_credentials`、`totp_required`、
-`invalid_totp`、`forbidden`、`insufficient_credits`、`upstream_unavailable`、
+`invalid_totp`、`forbidden`、`insufficient_credits`、`rate_limited`、`upstream_unavailable`、
 `not_found`、`database_error`、`internal_error`。
 
-状态码：400 参数、401 认证、402 余额不足、403 禁止、404 不存在、502 上游异常、500 内部错误。
+状态码：400 参数、401 认证、402 余额不足、403 禁止、404 不存在、429 被限流、
+502 上游异常、500 内部错误。
+
+**`rate_limited`（429）**：上游限流导致这次请求没做成时给出，并带 **`Retry-After`**
+响应头（秒）——有上游提示就用它，否则用块内最早解除退避的剩余秒数。
+上游怎么限的就照实往下传，不翻成「无可用密钥」这类不相干的说法：客户端该做的是退避重试，
+而不是换个密钥或怀疑自己的凭证。
 
 ### 其它约定
 
@@ -413,6 +419,14 @@ Google 的 `generationConfig` 这类更细的开关时，配在该模型的 `ext
 
 `ProxyLogView`：`id`、`created_at`、`access_key_id`、`block_id`、`upstream_key_id`、`model`、`ip`、`user_agent`、`status`（`success`/`error`）、`error_detail`（含上游原话，超 2000 字符截断）、`duration_ms`、`prompt_tokens`、`completion_tokens`、`cache_tokens`、`estimated`（true = 本地估算）、`stream`（true = 流式请求）、`credits`。
 
+一条请求始终只对应**一行**日志。换过密钥重试时，`error_detail` 里会带上一段
+**重试链**——`共 2 次尝试：第1次 <块>/<上游密钥> 上游返回 429 …；第2次 <块> 该上游的密钥都在退避中；最终失败：…`，
+每一轮都带上游原话（对下游只给稳妥话术，日志不省）；失败的行以 `；最终失败：…` 收尾，
+重试后成功的行以 `；最终成功` 收尾。只记最终结果的话，「先被限流、换一把就成了」
+这种事在流水里完全不可见。请求在还没选中块或密钥就失败（参数错、模型没上游、
+余额为零、块内没有可调度密钥）时同样**会落一行**，不会出现「客户端报错但流水里
+查无此请求」。
+
 ---
 
 ## 密钥自助接口
@@ -602,17 +616,20 @@ OpenAI 生图协议，与对话共用认证、调度、重试与双轨日志。
 - 请求体：`{ model, prompt, n?, size?, quality?, ... }`——除 `model` 会被替换成块内配置的转发名外，**原样透传**。
 - 响应：上游响应原样返回（`{ created, data: [{ url | b64_json }] }`）。
 - 上游限制：目前只有 `openai` 格式的块支持生图；请求被路由到 `google` / `anthropic` 块时返回 400。
+- **等待时间**：生图没有单独的超时，与对话共用同一条口径——单次上游请求**总超时 120 秒**，块配了并发上限时另有最多 30 秒排队（见下节）。生图本身耗时比对话长，慢上游或大尺寸出图可能顶到 120 秒；顶到就按网络故障处理（退避换密钥重试，最多 3 次），此时要留意**上游可能已经出图并计了费**。
 - 计费：gpt-image-1 等新一代接口自带 `usage`，按 token 计费；DALL-E 系列不报 usage，按每张 5000 token 本地估算（日志带 `estimated: true`）。
 
 ### 调度与重试行为（两个代理接口共用）
 
 1. 按模型在启用的块中做平滑加权轮询（权重 + 顺序）。
-2. 块内按权重选密钥；退避中、暂停、停用的密钥自动跳过。
+2. 块内按权重选密钥；退避中、暂停、停用的密钥自动跳过。块内**一把都选不出**时分两种：密钥全被暂停/停用（配置问题）→ 403 `forbidden`；只是全在退避里 → 429 `rate_limited` + `Retry-After`。
 3. 进入块内并发闸门：达到该块 `max_concurrency` 上限时**排队**（上限 30 秒，超时返回 502 且不重试）。
-4. 429 → 该密钥退避（优先采纳上游 `Retry-After` / `retry-after-ms`，没给则按失败次数取 10/15/30 秒阶梯、30 秒封顶）并换下一把，**不停用**；401/403 → 记硬失败，连续 3 次自动停用（`never_disable` 的密钥除外）；5xx、网络故障、200 但响应结构损坏 → 同样退避并换下一把，**不停用**；以上可恢复错误合计最多换 3 次密钥。
-5. 其它 4xx 是请求本身的问题（参数、模型名等），直接透传错误，不重试。
-6. 上游不报 usage 时按本地估算计费（CJK 每字 1 token、其余每 4 字符 1 token、图片每张 1000），估算结果在日志里带 `estimated: true`。
-7. 计费按对外模型名的倍率折算；缓存命中的 token **计入输入、按原价结算**（不做折扣），同时在用量里单独记一份便于算命中率。三家上游的口径已归一，两处易漏的输入都要自己补：**其一**，Anthropic 的 `input_tokens` 不含缓存，适配器会补上 `cache_read_input_tokens + cache_creation_input_tokens`；**其二**，Google 的 `toolUsePromptTokenCount`（工具执行结果回灌给模型的输入）不在 `promptTokenCount` 里——官方 `totalTokenCount` 是 `prompt + candidates + toolUsePrompt + thoughts` 四项相加，故适配器把它并入输入（OpenAI 的工具结果本就在 `messages` 里、Anthropic 的 `tool_result` 本就在 `input_tokens` 里，三家口径一致）。用量里的 `cache_tokens` 只记**读取命中**的部分——缓存**写入**（Anthropic 的 `cache_creation_input_tokens`、本次请求首次建缓存）要下次请求才可能被读到，本次不属于命中，因此计入输入但不计入 `cache_tokens`。余额为零的密钥在发请求前就被拒绝（402）——**无限额度的密钥除外**，它跳过余额判定但照常记账。
+4. 单次上游请求的**总超时 120 秒**（含连接、发送与读完响应，流式也按这 120 秒算整条流）。超时按网络故障处理——退避换密钥重试。
+5. 429 → 该密钥退避（优先采纳上游 `Retry-After` / `retry-after-ms`，没给则按失败次数取 10/15/30 秒阶梯、30 秒封顶）并换下一把，**不停用**；401/403 → 记硬失败，连续 3 次自动停用（`never_disable` 的密钥除外）；5xx、网络故障、200 但响应结构损坏 → 同样退避并换下一把，**不停用**；以上可恢复错误合计最多换 3 次密钥（重试之间不等待，等待是密钥退避的事）。
+6. 其它 4xx 是请求本身的问题（参数、模型名等），直接透传错误，不重试。
+7. 一轮都换不动了之后，下游拿到的错误按「这次为什么没做成」收口：上一轮是限流 → **429 `rate_limited` + `Retry-After`**；上一轮是 5xx/网络/坏结构 → **502 `upstream_unavailable`**；401/403 **绝不**透给下游（那是上游拒绝我们的密钥，不是客户端凭证有问题）。
+8. 上游不报 usage 时按本地估算计费（CJK 每字 1 token、其余每 4 字符 1 token、图片每张 1000），估算结果在日志里带 `estimated: true`。
+9. 计费按对外模型名的倍率折算；缓存命中的 token **计入输入、按原价结算**（不做折扣），同时在用量里单独记一份便于算命中率。三家上游的口径已归一，两处易漏的输入都要自己补：**其一**，Anthropic 的 `input_tokens` 不含缓存，适配器会补上 `cache_read_input_tokens + cache_creation_input_tokens`；**其二**，Google 的 `toolUsePromptTokenCount`（工具执行结果回灌给模型的输入）不在 `promptTokenCount` 里——官方 `totalTokenCount` 是 `prompt + candidates + toolUsePrompt + thoughts` 四项相加，故适配器把它并入输入（OpenAI 的工具结果本就在 `messages` 里、Anthropic 的 `tool_result` 本就在 `input_tokens` 里，三家口径一致）。用量里的 `cache_tokens` 只记**读取命中**的部分——缓存**写入**（Anthropic 的 `cache_creation_input_tokens`、本次请求首次建缓存）要下次请求才可能被读到，本次不属于命中，因此计入输入但不计入 `cache_tokens`。余额为零的密钥在发请求前就被拒绝（402）——**无限额度的密钥除外**，它跳过余额判定但照常记账。
 
 ---
 

@@ -1165,6 +1165,12 @@ pub async fn select_block(
 /// 在块内选出一把可用密钥。
 ///
 /// 只考虑启用、未停用、不在退避期内的密钥；权重轮询之外再按创建顺序打散。
+///
+/// 一把都选不出时分两种情况报错，因为下游该做的动作完全不同：
+/// 密钥全被暂停/停用是**配置问题**（平台内部，`Forbidden`）；
+/// 只是全在退避里则是**上游限流**的直接后果（`RateLimited`，带上最早的
+/// 恢复时间）——后者翻成前者，下游就会收到一句「没有可用密钥」的
+/// `forbidden`，既看不懂也做不了什么。
 pub async fn select_key(
     pool: &SqlitePool,
     state: &UpstreamState,
@@ -1180,6 +1186,12 @@ pub async fn select_key(
         .collect();
 
     if candidates.is_empty() {
+        if let Some(wait) = earliest_retry(&keys, now) {
+            return Err(Error::RateLimited {
+                message: "该上游的密钥都在退避中".to_string(),
+                retry_after: Some(wait),
+            });
+        }
         return Err(Error::Forbidden("该上游没有可用密钥".to_string()));
     }
 
@@ -1190,6 +1202,19 @@ pub async fn select_key(
     keys.into_iter()
         .find(|key| key.id == picked)
         .ok_or_else(|| Error::Internal(anyhow::anyhow!("被选中的密钥不在候选里")))
+}
+
+/// 块内最早的恢复时间（秒）：只在「启用的密钥全都还在退避」时给出。
+///
+/// 没有启用中的密钥、或它们都没在退避时返回 `None`——那种情况没有
+/// 「过多久就好」的答案，该报的是配置问题而不是限流。
+fn earliest_retry(keys: &[UpstreamKey], now: i64) -> Option<i64> {
+    keys.iter()
+        .filter(|key| key.status == KeyStatus::Active)
+        .filter_map(|key| key.cooldown_until)
+        .filter(|until| *until > now)
+        .min()
+        .map(|until| until - now)
 }
 
 /// 一次成功：清零失败计数。
@@ -1209,13 +1234,17 @@ pub async fn report_success(pool: &SqlitePool, key_id: &str) {
 ///   `retry-after-ms`），有就听它的、没有才走阶梯——它比我们更清楚
 ///   配额什么时候回来。
 /// - 三种都写 `last_error`：后台看得见最近一次失败的原因。
+///
+/// 返回这把密钥本次实际挂上的退避秒数（硬失败不退避、或已直接停用时为
+/// `None`）——调用方拿它当对下游的 `Retry-After`：既然这把钥匙要歇这么久，
+/// 客户端这会儿回头多半也讨不到好。
 pub async fn report_failure(
     pool: &SqlitePool,
     key: &UpstreamKey,
     kind: FailureKind,
     detail: &str,
     retry_after: Option<i64>,
-) {
+) -> Option<i64> {
     let failures = key.failure_count + 1;
     let now = time::now_secs();
 
@@ -1234,23 +1263,24 @@ pub async fn report_failure(
             } else {
                 tracing::warn!(key_id = %key.id, failures, "密钥连续被拒，已自动停用");
             }
-            return;
+            return None;
         }
     }
 
-    let cooldown_until = match kind {
+    let cooldown = match kind {
         // 硬失败不退避：它要么即将停用，要么该由人工看一眼，歇着没用。
         FailureKind::Hard => None,
         FailureKind::RateLimited | FailureKind::Transient => {
-            Some(now + cooldown_secs(failures, retry_after))
+            Some(cooldown_secs(failures, retry_after))
         }
     };
+    let cooldown_until = cooldown.map(|secs| now + secs);
 
     let mut connection = match pool.acquire().await {
         Ok(connection) => connection,
         Err(error) => {
             tracing::warn!(key_id = %key.id, error = %error, "获取连接失败");
-            return;
+            return cooldown;
         }
     };
 
@@ -1266,6 +1296,8 @@ pub async fn report_failure(
     {
         tracing::warn!(key_id = %key.id, error = %error, "记录密钥失败状态失败");
     }
+
+    cooldown
 }
 
 /// 停用一把密钥，并把停机原因写进 `last_error`。

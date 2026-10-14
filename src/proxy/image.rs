@@ -16,10 +16,10 @@ use crate::model::ApiKey;
 use crate::proxy::adapter::{AuthStyle, EXTRA_BODY_KEY, UpstreamRequest};
 use crate::proxy::scheme::Usage;
 use crate::proxy::{
-    Failure, MAX_ATTEMPTS, UpstreamResponse, base_log, estimate, sanitize_user_message, write_log,
+    AttemptNote, Failure, MAX_ATTEMPTS, UpstreamResponse, base_log, estimate, log_failure,
+    record_retry, sanitize_user_message, write_log,
 };
 use crate::service::{billing, upstream};
-use crate::utils::time;
 
 /// 生图接口的路径，与入口同名。
 const IMAGES_PATH: &str = "/v1/images/generations";
@@ -104,7 +104,25 @@ async fn dispatch_entry(
     };
 
     // 解析目标：归一化模型名（剥掉块前缀），并记下是否锁定了某个块。
-    let target = upstream::resolve_with_header(pool, &model, header_block).await?;
+    let target = match upstream::resolve_with_header(pool, &model, header_block).await {
+        Ok(target) => target,
+        Err(error) => {
+            let failure = Failure::bare(error);
+            log_failure(
+                pool,
+                key,
+                ip,
+                user_agent,
+                &model,
+                started,
+                false,
+                &failure,
+                &[],
+            )
+            .await;
+            return Err(failure.error);
+        }
+    };
     let model = &target.model;
     let only = target.block_id.as_deref();
 
@@ -121,7 +139,9 @@ async fn dispatch_entry(
         return Err(error);
     }
 
-    match dispatch(state, key, body, model, started, only).await {
+    let mut attempts = Vec::new();
+
+    match dispatch(state, key, body, model, started, only, &mut attempts).await {
         Ok(outcome) => {
             write_log(
                 pool,
@@ -129,6 +149,7 @@ async fn dispatch_entry(
                     .model(model.clone())
                     .block(&outcome.block_id)
                     .upstream_key(&outcome.upstream_key_id)
+                    .attempts(attempts)
                     .succeeded(outcome.usage, outcome.charge.credits_scaled)
                     .to_success_log(),
             )
@@ -137,29 +158,11 @@ async fn dispatch_entry(
             Ok(outcome.response)
         }
         Err(failure) => {
-            // 块 id 要先取出来——`.failed_with_context()` 会把它移走。
-            let failed_block = failure.context.as_ref().map(|(block, _)| block.clone());
-            write_log(
-                pool,
-                base_log(key, ip, user_agent, started)
-                    .model(model.clone())
-                    .failed_with_context(&failure.error, failure.context),
+            // 管理员看到细节（含重试链），密钥侧只看到脱敏描述。
+            log_failure(
+                pool, key, ip, user_agent, model, started, false, &failure, &attempts,
             )
             .await;
-
-            if let Err(log_error) = crate::db::usage::insert_error(
-                pool,
-                &key.id,
-                &model,
-                failed_block.as_deref(),
-                &failure.user_message,
-                false,
-                time::now_secs(),
-            )
-            .await
-            {
-                tracing::warn!(error = %log_error, "写入失败用量记录失败");
-            }
 
             Err(failure.error)
         }
@@ -175,9 +178,11 @@ async fn dispatch(
     started: Instant,
     // 请求里显式锁定的块；None 即按权重轮询所有能处理该模型的块。
     only: Option<&str>,
+    // 换钥匙重试的留痕，调用方拿去写日志。
+    attempts: &mut Vec<AttemptNote>,
 ) -> std::result::Result<ImageOutcome, Failure> {
     let pool = &state.store.data;
-    let mut last_failure = None;
+    let mut last_failure: Option<Failure> = None;
 
     for _ in 0..MAX_ATTEMPTS {
         let block = match upstream::select_block(pool, &state.upstream, key, model, only).await {
@@ -198,6 +203,13 @@ async fn dispatch(
         let upstream_key = match upstream::select_key(pool, &state.upstream, &block).await {
             Ok(key) => key,
             Err(error) => {
+                // 同对话路径：已经失败过就以那一轮为准（它才是答案），顺手补上
+                // 块内最早的恢复时间；首轮选不出则照实返回（配置问题 403 /
+                // 全在退避 429）。
+                if let Some(previous) = last_failure.take() {
+                    attempts.push(AttemptNote::new(&block.id, "", error.to_string()));
+                    return Err(previous.with_wait_hint(error.retry_hint()));
+                }
                 let context = Some((block.id.clone(), String::new()));
                 let user_message = sanitize_user_message(&error);
                 return Err(Failure::with_context(error, user_message, context));
@@ -257,18 +269,30 @@ async fn dispatch(
                 } = response;
 
                 if status == 429 {
-                    upstream::report_failure(
+                    let detail = response_body
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let wait = upstream::report_failure(
                         pool,
                         &upstream_key,
                         upstream::FailureKind::RateLimited,
-                        "被限流，暂时退避",
+                        &format!("上游返回 429 {detail}"),
                         retry_after,
                     )
                     .await;
-                    last_failure = Some(Failure::with_context(
-                        Error::UpstreamUnavailable("上游限流".to_string()),
-                        "上游限流".to_string(),
-                        context,
+                    last_failure = Some(record_retry(
+                        attempts,
+                        Failure::with_context(
+                            Error::RateLimited {
+                                message: "上游限流，请稍后重试".to_string(),
+                                retry_after: retry_after.or(wait),
+                            },
+                            "上游限流，请稍后重试".to_string(),
+                            context,
+                        )
+                        // 对下游只能给句稳妥话；日志里要留下上游的原话。
+                        .with_detail(format!("上游返回 429 {detail}")),
                     ));
                     continue;
                 }
@@ -287,10 +311,13 @@ async fn dispatch(
                         None,
                     )
                     .await;
-                    last_failure = Some(Failure::with_context(
-                        Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
-                        format!("上游响应异常: 返回 {status}"),
-                        context,
+                    last_failure = Some(record_retry(
+                        attempts,
+                        Failure::with_context(
+                            Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
+                            format!("上游响应异常: 返回 {status}"),
+                            context,
+                        ),
                     ));
                     continue;
                 }
@@ -309,10 +336,13 @@ async fn dispatch(
                         retry_after,
                     )
                     .await;
-                    last_failure = Some(Failure::with_context(
-                        Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
-                        format!("上游响应异常: 返回 {status}"),
-                        context,
+                    last_failure = Some(record_retry(
+                        attempts,
+                        Failure::with_context(
+                            Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
+                            format!("上游响应异常: 返回 {status}"),
+                            context,
+                        ),
                     ));
                     continue;
                 }
@@ -345,7 +375,10 @@ async fn dispatch(
                             None,
                         )
                         .await;
-                        last_failure = Some(Failure::with_context(error, user_message, context));
+                        last_failure = Some(record_retry(
+                            attempts,
+                            Failure::with_context(error, user_message, context),
+                        ));
                         continue;
                     }
                 };
@@ -411,7 +444,10 @@ async fn dispatch(
                     None,
                 )
                 .await;
-                last_failure = Some(Failure::with_context(error, user_message, context));
+                last_failure = Some(record_retry(
+                    attempts,
+                    Failure::with_context(error, user_message, context),
+                ));
             }
         }
     }
