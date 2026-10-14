@@ -8,6 +8,7 @@ use serde_json::{Map, Value, json};
 use crate::error::{Error, Result};
 use crate::proxy::diagnostics::{self, Adjustment};
 
+use super::adapter::EXTRA_BODY_KEY;
 use super::scheme::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Reasoning, Role,
     TokenLimitField, ToolCall, ToolCallDelta, ToolDefinition, Usage,
@@ -22,11 +23,11 @@ pub fn parse_request(body: &Value) -> Result<ChatRequest> {
         .ok_or_else(|| Error::BadRequest("请求里缺少 model".to_string()))?
         .to_string();
 
-    // 入口不认的思考相关字段：不解析，但绝不静默丢掉。
+    // 入口不认的字段：不解析，但绝不静默丢掉。
     //
     // 放在所有参数校验**之前**：任何一个 400 都不该吞掉这条线索——
     // 用户最需要排查的恰恰是没成功的那次请求。
-    diagnostics::log(&model, &ignored_reasoning_fields(body));
+    diagnostics::log(&model, &ignored_entry_fields(body));
 
     let raw_messages = body
         .get("messages")
@@ -127,15 +128,19 @@ fn parse_reasoning(body: &Value) -> Result<Option<Reasoning>> {
     })
 }
 
-/// 入口不认、但生态里确实在用的思考相关字段。
+/// 入口不认、但生态里确实在用的字段。
 ///
-/// 网关对外只承诺 OpenAI 官方子集，这些厂商私有写法一律不解析——但**不能静默丢**：
-/// 用户以为开关生效、日志里什么都没有，是最难查的一类问题。
-/// 名单覆盖实际在用的几种：vLLM 的 `chat_template_kwargs`、Qwen / GLM 的
-/// `enable_thinking` / `thinking`、Ollama 的 `think`。
+/// 两类：一是厂商私有的思考开关写法（网关对外只承诺 OpenAI 官方子集），
+/// 二是 `extra_body`——它只在**管理端**的块配置里生效，下游发了也白发。
+/// 两者都**不能静默丢**：用户以为开关生效、日志里什么都没有，是最难查的
+/// 一类问题。
 ///
-/// 只留痕，不改行为：真要支持这些写法，正确的形态是按块配置放行（见 API.md）。
-fn ignored_reasoning_fields(body: &Value) -> Vec<Adjustment> {
+/// 思考字段的名单覆盖实际在用的几种：vLLM 的 `chat_template_kwargs`、
+/// Qwen / GLM 的 `enable_thinking` / `thinking`、Ollama 的 `think`。
+///
+/// 只留痕，不改行为：真要支持这些写法，正确的形态是按块配置放行
+/// （思考字段暂无此出口；`extra_body` 就是它的通用形态）。
+fn ignored_entry_fields(body: &Value) -> Vec<Adjustment> {
     // 这些在入口都是**非标**字段：网关对外只有 OpenAI 一种协议，
     // 客户端不该在这里用 Anthropic / GLM / vLLM / Ollama 的写法。
     // 字段名逐字对应各家的真实拼写（vLLM 是 `thinking_token_budget`，
@@ -173,6 +178,16 @@ fn ignored_reasoning_fields(body: &Value) -> Vec<Adjustment> {
                 ));
             }
         }
+    }
+
+    // 额外请求体只在管理端的块配置里生效。下游发了也白发，但要说清为什么——
+    // 不然用户会以为网关已经把它转给上游了。
+    if body.get(EXTRA_BODY_KEY).is_some() {
+        adjustments.push(Adjustment::new(
+            diagnostics::FIELD_IGNORED,
+            EXTRA_BODY_KEY,
+            "`extra_body` 只能由管理员在块配置里设置，下游发送无效、已忽略".to_string(),
+        ));
     }
 
     adjustments
@@ -570,7 +585,7 @@ mod tests {
             "reasoning": { "effort": "high", "enabled": true }
         });
 
-        let adjustments = ignored_reasoning_fields(&body);
+        let adjustments = ignored_entry_fields(&body);
         let paths: Vec<&str> = adjustments.iter().map(|item| item.path).collect();
         for expected in [
             "chat_template_kwargs",
@@ -605,7 +620,7 @@ mod tests {
             "messages": [{ "role": "user", "content": "hi" }],
             "reasoning_effort": "high"
         });
-        assert!(ignored_reasoning_fields(&flat).is_empty());
+        assert!(ignored_entry_fields(&flat).is_empty());
 
         // `reasoning` 只用 effort 是支持的（Responses 风格兜底）。
         let nested = json!({
@@ -613,7 +628,29 @@ mod tests {
             "messages": [{ "role": "user", "content": "hi" }],
             "reasoning": { "effort": "low" }
         });
-        assert!(ignored_reasoning_fields(&nested).is_empty());
+        assert!(ignored_entry_fields(&nested).is_empty());
+    }
+
+    #[test]
+    fn downstream_extra_body_is_reported_as_ignored() {
+        // 下游发 `extra_body` 是无效的（它只在管理端配置里生效），但必须留痕——
+        // 静默丢掉会让用户以为网关已经把它转给上游了。
+        let body = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "extra_body": { "top_k": 40 }
+        });
+
+        let adjustments = ignored_entry_fields(&body);
+        let hit = adjustments
+            .iter()
+            .find(|item| item.path == "extra_body")
+            .expect("下游的 extra_body 必须留痕");
+        assert_eq!(hit.code, diagnostics::FIELD_IGNORED);
+
+        // 顺带确认它真的没进标准请求：解析只认白名单里的键。
+        let request = parse_request(&body).expect("请求本身是合法的");
+        assert_eq!(request.model, "gpt-x");
     }
 
     #[test]

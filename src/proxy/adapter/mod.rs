@@ -55,7 +55,54 @@ impl UpstreamRequest {
             }
         }
     }
+
+    /// 并入管理端配置的额外请求体（顶层浅合并）。
+    ///
+    /// 保护键一律跳过。配置期由 `validate_models` 拒掉，这里是第二道闸——
+    /// 挡的是绕过接口直接改库的老数据，以及将来别处新增的调用点。
+    pub fn apply_extra_body(&mut self, extra_body: Option<&Value>) {
+        let (Some(body), Some(extra)) = (self.body.as_mut(), extra_body) else {
+            return;
+        };
+        let (Some(object), Some(extra)) = (body.as_object_mut(), extra.as_object()) else {
+            return;
+        };
+
+        for (key, value) in extra {
+            if PROTECTED_BODY_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            object.insert(key.clone(), value.clone());
+        }
+    }
 }
+
+/// 下游请求体里表示「额外请求体」的键名。
+///
+/// 它只在**管理端**的块配置里有效（模型条目的 `extra_body`）。下游请求体
+/// 里带同名键一律丢弃——否则任何持有访问密钥的人都能绕过管理端，直接给
+/// 上游塞参数（对话入口的白名单解析天然丢弃，生图透传路径要显式删）。
+pub(crate) const EXTRA_BODY_KEY: &str = "extra_body";
+
+/// `extra_body` 不得覆盖的请求体键。
+///
+/// 这些键由网关的协议转换与计费逻辑掌管：
+/// - `model` 是计费与审计的依据——覆盖它等于用一个价跑另一个模型；
+/// - `messages` / `contents` / `input` / `system*` 是请求内容，由标准层翻译；
+/// - `tools` / `tool_choice` 是工具协议，三家形状不同；
+/// - `stream` / `stream_options` 牵着流式与用量上报，改了这个计费就不准了。
+pub(crate) const PROTECTED_BODY_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "contents",
+    "input",
+    "system",
+    "system_instruction",
+    "stream",
+    "stream_options",
+    "tools",
+    "tool_choice",
+];
 
 /// 密钥在请求里的位置。各家放法不同，由 adapter 自报。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -745,5 +792,43 @@ mod tests {
             ProbeOutcome::from_status(200, || String::new()),
             ProbeOutcome::Valid
         ));
+    }
+
+    #[test]
+    fn extra_body_merges_on_top_but_protected_keys_win() {
+        let mut request = UpstreamRequest {
+            path: "/v1/chat/completions".into(),
+            body: Some(json!({ "model": "real-model", "temperature": 0.5 })),
+        };
+
+        request.apply_extra_body(Some(&json!({
+            "top_k": 40,
+            "temperature": 0.9,
+            "generationConfig": { "seed": 7 },
+            "model": "hijack",
+            "messages": [{ "role": "user", "content": "注入" }],
+            "stream": true,
+        })));
+
+        let body = request.body.unwrap();
+        assert_eq!(body["top_k"], 40, "网关没暴露的参数应当并入");
+        assert_eq!(body["temperature"], 0.9, "普通键允许覆盖");
+        assert_eq!(body["generationConfig"]["seed"], 7, "嵌套对象整体并入");
+        assert_eq!(body["model"], "real-model", "model 由网关掌管，不许覆盖");
+        assert!(body.get("messages").is_none(), "请求内容不许注入");
+        assert!(body.get("stream").is_none(), "流式开关不许注入");
+    }
+
+    #[test]
+    fn extra_body_absent_or_empty_is_a_no_op() {
+        let original = json!({ "model": "m" });
+        let mut request = UpstreamRequest {
+            path: "/x".into(),
+            body: Some(original.clone()),
+        };
+
+        request.apply_extra_body(None);
+        request.apply_extra_body(Some(&json!({})));
+        assert_eq!(request.body.unwrap(), original);
     }
 }

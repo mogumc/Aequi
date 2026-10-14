@@ -1,0 +1,18 @@
+services:
+  gptload-rs:
+    image: ghcr.io/mogumc/aequi:latest
+    user: "${PUID:-10001}:${PGID:-10001}"
+    container_name: aequi
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    environment:
+      - RUST_LOG=info
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

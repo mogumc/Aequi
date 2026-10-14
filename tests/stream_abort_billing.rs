@@ -62,12 +62,14 @@ impl TestApp {
                 name: "demo".to_string(),
                 api_format: ApiFormat::Openai,
                 weight: 1,
+                max_concurrency: 0,
                 base_url: base_url.to_string(),
                 proxy: None,
                 models: vec![ModelEntry {
                     name: "demo-model".to_string(),
                     forward: None,
                     multiplier_bp: 10_000,
+                    extra_body: None,
                 }],
                 headers: Vec::new(),
             },
@@ -81,6 +83,7 @@ impl TestApp {
             UpstreamKeyCreate {
                 secrets: vec!["mock-upstream-secret".to_string()],
                 weight: 1,
+                never_disable: false,
             },
         )
         .await

@@ -197,20 +197,19 @@ gpt-4o，短名请求却被轮询到 b」这种越权。数组为空表示不限
 以及它对外接受的**模型列表**——模型属于块，计费倍率也跟着模型走，
 所以同一个模型名在不同块里可以有不同的价。
 
-块是代理的调度单位：**一个块只允许一种 API 格式**，内含一组上游密钥。
-
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/api/blocks` | 列表（每块带 `key_count` / `available_keys`） |
+| `GET` | `/api/blocks` | 列表（每块带 `key_count` / `available_keys`，以及实时并发负载 `in_flight` / `queued`） |
 | `POST` | `/api/blocks` | 创建 |
 | `GET` | `/api/blocks/{id}` | 详情 |
 | `PATCH` | `/api/blocks/{id}` | 更新（可含 `api_format`；`proxy` 传 `null` 表示清空；`headers` 传 `[]` 表示清空） |
 | `DELETE` | `/api/blocks/{id}` | 删除（密钥级联清理） |
 | `GET` | `/api/blocks/{id}/keys` | 块内密钥列表 |
-| `POST` | `/api/blocks/{id}/keys` | 批量添加：`{ secrets: ["..."], weight? }`；重复条目自动跳过，返回 `{ keys, skipped }` |
+| `POST` | `/api/blocks/{id}/keys` | 批量添加：`{ secrets: ["..."], weight?, never_disable? }`；重复条目自动跳过，返回 `{ keys, skipped }` |
 | `POST` | `/api/blocks/{id}/keys/remove` | 批量删除：`{ ids }` |
 | `POST` | `/api/blocks/{id}/keys/pause` | 批量暂停：`{ ids }` |
 | `POST` | `/api/blocks/{id}/keys/resume` | 批量恢复：`{ ids }`（同时清零失败计数） |
+| `POST` | `/api/blocks/{id}/keys/never-disable` | 批量设置「永不暂停」：`{ ids, enabled? }`，`enabled` 缺省 `true`（即「设上」） |
 | `POST` | `/api/blocks/{id}/keys/{key_id}/test` | 测试单把密钥（不耗 token），结果同步落库 |
 | `POST` | `/api/blocks/{id}/test` | **整块连通性测试**（见下） |
 | `POST` | `/api/blocks/{id}/models/fetch` | **从上游拉取可用模型列表**（见下） |
@@ -232,6 +231,7 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
   "name": "OpenAI 官方",
   "api_format": "openai",
   "weight": 1,
+  "max_concurrency": 4,
   "base_url": "https://api.openai.com",
   "proxy": "http://127.0.0.1:7890",
   "models": [
@@ -255,9 +255,57 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
 - **`id` 只允许小写字母、数字、点、下划线、连字符**（≤ 64 字符）。它会被当作
   请求里模型名的前缀（`块id/模型名`），含 `/` 或空格会直接破坏那条解析规则。
 - `models[]`：本块对外接受的模型；`forward` 缺省表示同名转发；
-  **`multiplier_bp` 是该模型的计费倍率（万分比整数，10000 = 1.0 倍，精度 0.01）**，缺省 1.0。
+  **`multiplier_bp` 是该模型的计费倍率（万分比整数，10000 = 1.0 倍，精度 0.01）**，缺省 1.0；
+  **`extra_body` 是该模型的额外请求体**（只许管理端配置），详见下节。
+- **`max_concurrency`：同时发往该上游的请求数上限**，缺省 0（不限制），最大 1024。
+  达到上限后新请求**排队**（FIFO）而不是被拒绝，详见下节。
 - `headers[]`：**自定义请求头**，缺省为空数组；详见下节。
-- 密钥生命周期自治：成功清零失败计数、429 退避 30 秒、连续失败 3 次自动停用。
+
+#### 块级并发与排队（`max_concurrency`）
+
+每个块独立配置同时发往该上游的请求数上限（`max_concurrency`，0 = 不限制）。
+超出的请求**排队等待**，不是拒绝——限流的目的是别把上游打爆，而不是把用户挡在门外。
+
+- **管的是三条流量路径**：对话、流式、生图都过同一个闸门。流式请求的位子
+  **持有到流结束**——流占着上游连接，那正是要限的对象。
+- **排队上限 30 秒**，超时返回 `502`（`UpstreamUnavailable`，详情「上游通道繁忙，
+  排队超时」），且**不进重试**——重试也过不了同一道闸门，只会把队列拖更长。
+- **调整即时生效**：调大立即放行；调小最多让已在队列里的请求按旧容量走完
+  （上界就是旧容量，不会持续超额）。删除块即撤掉闸门。
+- **管理面不排队**：测试密钥、整块测试、拉取模型是一次性人工动作，
+  不该被用户流量堵在队里。
+- **实时负载随块接口返回**：`BlockView` 带 `in_flight`（正在发往上游的请求数）
+  与 `queued`（排在闸门后的请求数），都是**读取瞬间的快照**，不是累计值；
+  块不限制并发（`max_concurrency` 为 0）时两者为 `null`——没有闸门，
+  就没有这两个数。`in_flight` 打满上限只是满负荷，`queued` 持续不降
+  才说明该调大上限或加块了。后台块列表每 5 秒刷一次，看的就是这两个数。
+
+#### 模型级额外请求体（`extra_body`）
+
+网关只暴露了常用参数。某个模型要 `top_k`、`seed`、`response_format`、
+Google 的 `generationConfig` 这类更细的开关时，配在该模型的 `extra_body` 里：
+
+```json
+{ "name": "gpt-4o", "extra_body": { "top_k": 40, "seed": 7 } }
+```
+
+- **按上游格式书写**：块绑定的是哪家格式就写哪家的键。`extra_body` **原样并入**
+  发往上游的请求体顶层，网关不做跨家映射——写错了上游会 400，错误会如实落进
+  `error_detail`。同一个模型在不同块可以带不同的额外参数（模型属于块）。
+- **顶层浅合并**：`extra_body` 的键直接写进上游请求体的顶层，**同名就覆盖**——
+  不论那个值来自网关生成还是客户端传入（比如配了 `temperature`，客户端传的会被盖掉）。
+  嵌套对象要整块给，不做递归深合并。**Google 的 `generationConfig` 是个大口袋**：
+  覆盖它会连同网关生成的 `thinkingConfig`（思考档位）与 `toolConfig`（工具约束）
+  一起替换掉——只想改其中一项时，其余的也要写全。
+- **只允许管理端设置**：这个字段只认块的模型条目。下游请求体里带同名键
+  （`extra_body`）一律**丢弃**并记一条诊断日志（`field_ignored`）——否则任何持有
+  访问密钥的人都能绕过管理端直接给上游塞参数。生图是透传路径，客户端传的
+  **顶层**参数仍照常转发（那是生图协议本身的自由度），但裹在 `extra_body` 里的
+  一样会被剥掉。
+- **网关掌管的键不许出现**（配置时就 400）：`model`、`messages`、`contents`、
+  `input`、`system`、`system_instruction`、`stream`、`stream_options`、`tools`、
+  `tool_choice`——覆盖它们等于绕过倍率计费或破坏协议转换。
+- 体积上限 **8 KiB**（序列化后）；空对象 `{}` 视同没配。
 
 #### 自定义请求头（`headers`）
 
@@ -283,7 +331,9 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
 #### `POST /api/blocks/{id}/test`
 
 逐把测试块内**全部**密钥，串行执行（并发打上游容易被限流）。
-结果与单把测试同口径：有效则清零失败计数，无效则自动停用。
+结果与单把测试同口径：有效则清零失败计数，无效则自动停用
+（**即使密钥设了永不暂停也停用**——手动测试是带证据的人工动作，
+豁免免的是自动规则，不是这个）。
 
 ```json
 {
@@ -302,7 +352,28 @@ OpenAI / Anthropic 取 `data[].id`，Google 取 `models[].name` 并剥掉 `model
 `outcome`：`valid`（可用）| `invalid`（密钥本身有问题，已停用）| `transient`（限流/上游故障，不算密钥的账）。
 `secret_prefix` 只给前 6 位——测试结果可能被贴进工单，完整密钥没必要外带。
 
-`UpstreamKeyView`：`id`、`block_id`、`secret`（明文）、`status`（`active`/`paused`/`disabled`）、`weight`、`failure_count`、`cooldown_until`、`last_error`、`last_used_at`、`created_at`。
+`UpstreamKeyView`：`id`、`block_id`、`secret`（明文）、`status`（`active`/`paused`/`disabled`）、`never_disable`、`weight`、`failure_count`、`cooldown_until`、`last_error`、`last_used_at`、`created_at`。
+
+#### 失败分类、退避与永不暂停
+
+密钥生命周期由**失败类型**驱动，不再是「任何失败都计数、够数就停用」：
+
+| 失败类型 | 判据 | 退避 | 自动停用 |
+| --- | --- | --- | --- |
+| `Hard`（密钥被拒） | 401 / 403 | 不退避 | 连续 3 次停用，`last_error` 写明原因 |
+| `RateLimited`（被限流） | 429 | 指数退避 | **永不停用** |
+| `Transient`（上游故障） | 5xx / 网络错误 / 200 但结构坏 | 指数退避 | **永不停用** |
+
+- **指数退避**：30 秒起步，每次连续失败翻倍（30 → 60 → 120 → 240 → 480），
+  480 秒封顶；退避期内的密钥不参与调度（`cooldown_until`），到期自动回队。
+- **任何成功都清零**失败计数并解除退避——故障过去后密钥自己恢复，不用人工干预。
+- **重试与退避是两件事**：可恢复错误（429/5xx/网络/坏结构）会换密钥重试，
+  最多 3 次；退避管的是这把钥匙**下一次**什么时候再上岗。
+- **`never_disable`（永不暂停）只免「自动停用」这一个动作**：429 与瞬时故障的
+  退避照常生效（那是几十秒级的临时避让，不是停用）；手动暂停/恢复不受影响；
+  手动测试确认无效仍然停用。计数与 `last_error` 留痕照旧，后台看得见发生了什么。
+- 手工入口：`POST /api/blocks/{id}/keys/never-disable`，body `{ ids, enabled? }`，
+  `enabled` 缺省 `true`；批量添加密钥时也可以带 `never_disable: true` 入库即生效。
 
 ### 请求日志
 
@@ -520,10 +591,11 @@ OpenAI 生图协议，与对话共用认证、调度、重试与双轨日志。
 
 1. 按模型在启用的块中做平滑加权轮询（权重 + 顺序）。
 2. 块内按权重选密钥；退避中、暂停、停用的密钥自动跳过。
-3. 429 → 该密钥退避 30 秒并换下一把；401/403/5xx、网络故障、200 但响应结构损坏 → 记失败并换下一把；最多 3 次。
-4. 其它 4xx 是请求本身的问题（参数、模型名等），直接透传错误，不重试。
-5. 上游不报 usage 时按本地估算计费（CJK 每字 1 token、其余每 4 字符 1 token、图片每张 1000），估算结果在日志里带 `estimated: true`。
-6. 计费按对外模型名的倍率折算；缓存命中的 token **计入输入、按原价结算**（不做折扣），同时在用量里单独记一份便于算命中率。三家上游的口径已归一，两处易漏的输入都要自己补：**其一**，Anthropic 的 `input_tokens` 不含缓存，适配器会补上 `cache_read_input_tokens + cache_creation_input_tokens`；**其二**，Google 的 `toolUsePromptTokenCount`（工具执行结果回灌给模型的输入）不在 `promptTokenCount` 里——官方 `totalTokenCount` 是 `prompt + candidates + toolUsePrompt + thoughts` 四项相加，故适配器把它并入输入（OpenAI 的工具结果本就在 `messages` 里、Anthropic 的 `tool_result` 本就在 `input_tokens` 里，三家口径一致）。用量里的 `cache_tokens` 只记**读取命中**的部分——缓存**写入**（Anthropic 的 `cache_creation_input_tokens`、本次请求首次建缓存）要下次请求才可能被读到，本次不属于命中，因此计入输入但不计入 `cache_tokens`。余额为零的密钥在发请求前就被拒绝（402）——**无限额度的密钥除外**，它跳过余额判定但照常记账。
+3. 进入块内并发闸门：达到该块 `max_concurrency` 上限时**排队**（上限 30 秒，超时返回 502 且不重试）。
+4. 429 → 该密钥指数退避（30 秒起步每次翻倍、480 秒封顶）并换下一把，**不停用**；401/403 → 记硬失败，连续 3 次自动停用（`never_disable` 的密钥除外）；5xx、网络故障、200 但响应结构损坏 → 指数退避并换下一把，**不停用**；以上可恢复错误合计最多换 3 次密钥。
+5. 其它 4xx 是请求本身的问题（参数、模型名等），直接透传错误，不重试。
+6. 上游不报 usage 时按本地估算计费（CJK 每字 1 token、其余每 4 字符 1 token、图片每张 1000），估算结果在日志里带 `estimated: true`。
+7. 计费按对外模型名的倍率折算；缓存命中的 token **计入输入、按原价结算**（不做折扣），同时在用量里单独记一份便于算命中率。三家上游的口径已归一，两处易漏的输入都要自己补：**其一**，Anthropic 的 `input_tokens` 不含缓存，适配器会补上 `cache_read_input_tokens + cache_creation_input_tokens`；**其二**，Google 的 `toolUsePromptTokenCount`（工具执行结果回灌给模型的输入）不在 `promptTokenCount` 里——官方 `totalTokenCount` 是 `prompt + candidates + toolUsePrompt + thoughts` 四项相加，故适配器把它并入输入（OpenAI 的工具结果本就在 `messages` 里、Anthropic 的 `tool_result` 本就在 `input_tokens` 里，三家口径一致）。用量里的 `cache_tokens` 只记**读取命中**的部分——缓存**写入**（Anthropic 的 `cache_creation_input_tokens`、本次请求首次建缓存）要下次请求才可能被读到，本次不属于命中，因此计入输入但不计入 `cache_tokens`。余额为零的密钥在发请求前就被拒绝（402）——**无限额度的密钥除外**，它跳过余额判定但照常记账。
 
 ---
 

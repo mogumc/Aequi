@@ -10,8 +10,8 @@ use crate::AppState;
 use crate::api::MessageResponse;
 use crate::error::Result;
 use crate::model::{
-    BlockCreate, BlockTestResult, BlockUpdate, BlockView, KeyIdsRequest, UpstreamKeyCreate,
-    UpstreamKeyView,
+    BlockCreate, BlockTestResult, BlockUpdate, BlockView, KeyIdsRequest, KeyNeverDisableRequest,
+    UpstreamKeyCreate, UpstreamKeyView,
 };
 use crate::service::upstream;
 
@@ -44,7 +44,7 @@ pub struct KeyListResponse {
 /// `GET /api/blocks`
 pub async fn list(State(state): State<Arc<AppState>>) -> Result<Json<BlockListResponse>> {
     Ok(Json(BlockListResponse {
-        blocks: upstream::list_blocks(&state.store.data).await?,
+        blocks: upstream::list_blocks(&state.store.data, &state.upstream).await?,
     }))
 }
 
@@ -55,7 +55,7 @@ pub async fn create(
 ) -> Result<Json<BlockView>> {
     let block = upstream::create_block(&state.store.data, payload).await?;
     Ok(Json(
-        upstream::block_view(&state.store.data, &block.id).await?,
+        upstream::block_view(&state.store.data, &state.upstream, &block.id).await?,
     ))
 }
 
@@ -64,7 +64,9 @@ pub async fn detail(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<BlockView>> {
-    Ok(Json(upstream::block_view(&state.store.data, &id).await?))
+    Ok(Json(
+        upstream::block_view(&state.store.data, &state.upstream, &id).await?,
+    ))
 }
 
 /// `PATCH /api/blocks/{id}`
@@ -74,7 +76,9 @@ pub async fn update(
     Json(payload): Json<BlockUpdate>,
 ) -> Result<Json<BlockView>> {
     upstream::update_block(&state.store.data, &state.upstream, &id, payload).await?;
-    Ok(Json(upstream::block_view(&state.store.data, &id).await?))
+    Ok(Json(
+        upstream::block_view(&state.store.data, &state.upstream, &id).await?,
+    ))
 }
 
 /// `DELETE /api/blocks/{id}`
@@ -140,6 +144,24 @@ pub async fn resume_keys(
 ) -> Result<Json<MessageResponse>> {
     upstream::resume_keys(&state.store.data, &id, &payload.ids).await?;
     Ok(Json(MessageResponse::ok("已恢复")))
+}
+
+/// `POST /api/blocks/{id}/keys/never-disable`
+///
+/// 批量设置「永不暂停」：免于被自动停用。连续失败只记录、不改状态；
+/// 429 与瞬时故障的指数退避照常生效（退避是临时避让，不是停用）。
+/// `enabled` 缺省为 true，传 false 取消豁免。
+pub async fn never_disable_keys(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<KeyNeverDisableRequest>,
+) -> Result<Json<MessageResponse>> {
+    upstream::set_key_never_disable(&state.store.data, &id, &payload.ids, payload.enabled).await?;
+    Ok(Json(MessageResponse::ok(if payload.enabled {
+        "已设为永不暂停".to_string()
+    } else {
+        "已取消永不暂停".to_string()
+    })))
 }
 
 /// `POST /api/blocks/{id}/keys/{key_id}/test`

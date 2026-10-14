@@ -16,6 +16,9 @@ fn map_block(row: &SqliteRow) -> UpstreamBlock {
         api_format: ApiFormat::parse(&row.get::<String, _>("api_format"))
             .unwrap_or(ApiFormat::Openai),
         weight: row.get::<i64, _>("weight") as u32,
+        // 库被手改出负数时按 0（不限制）读——它随后会撞上写入口的校验，
+        // 而不是变成一个巨大的无符号数把信号量撑爆。
+        max_concurrency: row.get::<i64, _>("max_concurrency").max(0) as u32,
         base_url: row.get("base_url"),
         proxy: row.get("proxy"),
         models: parse_models(row.get("models")),
@@ -49,6 +52,7 @@ fn map_key(row: &SqliteRow) -> UpstreamKey {
         block_id: row.get("block_id"),
         secret: row.get("secret"),
         status: KeyStatus::parse(&row.get::<String, _>("status")).unwrap_or(KeyStatus::Active),
+        never_disable: row.get::<i64, _>("never_disable") != 0,
         weight: row.get::<i64, _>("weight") as u32,
         failure_count: row.get::<i64, _>("failure_count") as u32,
         cooldown_until: row.get("cooldown_until"),
@@ -63,13 +67,14 @@ fn map_key(row: &SqliteRow) -> UpstreamKey {
 pub async fn insert_block(pool: &SqlitePool, block: &UpstreamBlock) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO upstream_blocks \
-         (id, name, api_format, weight, base_url, proxy, models, headers, enabled, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, name, api_format, weight, max_concurrency, base_url, proxy, models, headers, enabled, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&block.id)
     .bind(&block.name)
     .bind(block.api_format.as_str())
     .bind(block.weight as i64)
+    .bind(block.max_concurrency as i64)
     .bind(&block.base_url)
     .bind(&block.proxy)
     .bind(serde_json::to_string(&block.models).unwrap_or_else(|_| "[]".to_string()))
@@ -86,12 +91,13 @@ pub async fn insert_block(pool: &SqlitePool, block: &UpstreamBlock) -> Result<()
 pub async fn update_block(pool: &SqlitePool, block: &UpstreamBlock) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE upstream_blocks \
-         SET name = ?, api_format = ?, weight = ?, base_url = ?, proxy = ?, models = ?, headers = ?, enabled = ?, updated_at = ? \
+         SET name = ?, api_format = ?, weight = ?, max_concurrency = ?, base_url = ?, proxy = ?, models = ?, headers = ?, enabled = ?, updated_at = ? \
          WHERE id = ?",
     )
     .bind(&block.name)
     .bind(block.api_format.as_str())
     .bind(block.weight as i64)
+    .bind(block.max_concurrency as i64)
     .bind(&block.base_url)
     .bind(&block.proxy)
     .bind(serde_json::to_string(&block.models).unwrap_or_else(|_| "[]".to_string()))
@@ -106,23 +112,23 @@ pub async fn update_block(pool: &SqlitePool, block: &UpstreamBlock) -> Result<()
 
 /// 按 ID 查块。
 const SQL_FIND_BLOCK: &str = "\
-SELECT id, name, api_format, weight, base_url, proxy, models, headers, enabled, created_at, updated_at \
+SELECT id, name, api_format, weight, max_concurrency, base_url, proxy, models, headers, enabled, created_at, updated_at \
 FROM upstream_blocks WHERE id = ?";
 
 /// 全部块。
 const SQL_LIST_BLOCKS: &str = "\
-SELECT id, name, api_format, weight, base_url, proxy, models, headers, enabled, created_at, updated_at \
+SELECT id, name, api_format, weight, max_concurrency, base_url, proxy, models, headers, enabled, created_at, updated_at \
 FROM upstream_blocks ORDER BY created_at, id";
 
 /// 某块的全部密钥。
 const SQL_LIST_KEYS: &str = "\
-SELECT id, block_id, secret, status, weight, failure_count, cooldown_until, last_error, \
+SELECT id, block_id, secret, status, never_disable, weight, failure_count, cooldown_until, last_error, \
 last_used_at, created_at, updated_at \
 FROM upstream_keys WHERE block_id = ? ORDER BY created_at, id";
 
 /// 按块与密钥 ID 查一把密钥。
 const SQL_FIND_KEY: &str = "\
-SELECT id, block_id, secret, status, weight, failure_count, cooldown_until, last_error, \
+SELECT id, block_id, secret, status, never_disable, weight, failure_count, cooldown_until, last_error, \
 last_used_at, created_at, updated_at \
 FROM upstream_keys WHERE block_id = ? AND id = ?";
 
@@ -185,17 +191,19 @@ pub async fn insert_keys(
     entries: &[(String, String)],
     block_id: &str,
     weight: u32,
+    never_disable: bool,
     now: i64,
 ) -> Result<(), sqlx::Error> {
     for (id, secret) in entries {
         sqlx::query(
             "INSERT INTO upstream_keys \
-             (id, block_id, secret, status, weight, created_at, updated_at) \
-             VALUES (?, ?, ?, 'active', ?, ?, ?)",
+             (id, block_id, secret, status, never_disable, weight, created_at, updated_at) \
+             VALUES (?, ?, ?, 'active', ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(block_id)
         .bind(secret)
+        .bind(i64::from(never_disable))
         .bind(weight as i64)
         .bind(now)
         .bind(now)
@@ -275,6 +283,30 @@ pub async fn update_key_runtime(
     .bind(now)
     .bind(key_id)
     .execute(&mut *executor)
+    .await?;
+    Ok(())
+}
+
+/// 设置密钥的「永不暂停」开关（免自动停用）。
+///
+/// 带上 block_id 一起匹配：密钥只应通过它所属的块来操作。
+/// 只改这一个开关，不碰状态与计数——它是叠加在生命周期规则上的豁免，
+/// 不是一次状态变更。
+pub async fn set_key_never_disable(
+    pool: &SqlitePool,
+    block_id: &str,
+    key_id: &str,
+    enabled: bool,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE upstream_keys SET never_disable = ?, updated_at = ? WHERE id = ? AND block_id = ?",
+    )
+    .bind(i64::from(enabled))
+    .bind(now)
+    .bind(key_id)
+    .bind(block_id)
+    .execute(pool)
     .await?;
     Ok(())
 }

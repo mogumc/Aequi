@@ -92,12 +92,16 @@ pub async fn migrate_control(pool: &SqlitePool) -> anyhow::Result<()> {
 }
 
 /// 上游块。一个块只使用一种 API 格式，密钥的调度以块为范围。
+///
+/// `max_concurrency` 是该块同时发往上游的请求数上限：0 = 不限制。
+/// 上限按块配置——不同块的出口与配额彼此独立，挤在一起没有意义。
 const UPSTREAM_BLOCKS_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS upstream_blocks (
     id           TEXT    PRIMARY KEY,
     name         TEXT    NOT NULL DEFAULT '',
     api_format   TEXT    NOT NULL,
     weight       INTEGER NOT NULL DEFAULT 1,
+    max_concurrency INTEGER NOT NULL DEFAULT 0,
     base_url     TEXT    NOT NULL,
     proxy        TEXT,
     models       TEXT    NOT NULL DEFAULT '[]',
@@ -111,12 +115,17 @@ CREATE TABLE IF NOT EXISTS upstream_blocks (
 /// 上游密钥。明文保存（要与上游通信就必须能取回来，散列没有意义）。
 ///
 /// 同一块内密钥唯一：重复粘贴同一把不该变成双份调度。
+///
+/// `never_disable` = 免于被自动停用：连续失败只记录、不改状态，
+/// 手动暂停/恢复不受影响。短期故障（限流、上游 5xx）永久禁用好密钥
+/// 是这套生命周期规则里最疼的一种死法，由此留一个显式豁免。
 const UPSTREAM_KEYS_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS upstream_keys (
     id             TEXT    PRIMARY KEY,
     block_id       TEXT    NOT NULL REFERENCES upstream_blocks(id) ON DELETE CASCADE,
     secret         TEXT    NOT NULL,
     status         TEXT    NOT NULL DEFAULT 'active',
+    never_disable  INTEGER NOT NULL DEFAULT 0,
     weight         INTEGER NOT NULL DEFAULT 1,
     failure_count  INTEGER NOT NULL DEFAULT 0,
     cooldown_until INTEGER,
@@ -141,6 +150,9 @@ const USAGE_RECORDS_COLUMNS: &str = "SELECT name FROM pragma_table_info('usage_r
 /// `upstream_blocks` 的列清单，用于判断要不要补列。
 const UPSTREAM_BLOCKS_COLUMNS: &str = "SELECT name FROM pragma_table_info('upstream_blocks')";
 
+/// `upstream_keys` 的列清单，用于判断要不要补列。
+const UPSTREAM_KEYS_COLUMNS: &str = "SELECT name FROM pragma_table_info('upstream_keys')";
+
 /// 给**已存在**的库补上 `block_id`。
 ///
 /// `CREATE TABLE IF NOT EXISTS` 对已存在的表什么都不做，所以老库必须显式
@@ -158,6 +170,19 @@ const USAGE_RECORDS_ADD_BLOCK_ID: &str =
 /// 可回滚——旧二进制的 INSERT/UPDATE 都不列这一列，落的就是这个默认值。
 const UPSTREAM_BLOCKS_ADD_HEADERS: &str =
     "ALTER TABLE upstream_blocks ADD COLUMN headers TEXT NOT NULL DEFAULT '[]'";
+
+/// 给**已存在**的库补上 `upstream_blocks.max_concurrency`（每块并发上限）。
+///
+/// 缺省 0 = 不限制：老块的行为一字不变，上限要管理员显式配置才生效。
+/// 与 `headers` 同款理由——带常量默认值的加列可重入、可回滚。
+const UPSTREAM_BLOCKS_ADD_MAX_CONCURRENCY: &str =
+    "ALTER TABLE upstream_blocks ADD COLUMN max_concurrency INTEGER NOT NULL DEFAULT 0";
+
+/// 给**已存在**的库补上 `upstream_keys.never_disable`（免自动停用）。
+///
+/// 缺省 0 = 关闭：现有密钥的生命周期规则不变，豁免要显式开启。
+const UPSTREAM_KEYS_ADD_NEVER_DISABLE: &str =
+    "ALTER TABLE upstream_keys ADD COLUMN never_disable INTEGER NOT NULL DEFAULT 0";
 
 /// 一次「老库补列」迁移。
 struct ColumnMigration {
@@ -185,6 +210,18 @@ const COLUMN_MIGRATIONS: &[ColumnMigration] = &[
         column: "headers",
         columns_sql: UPSTREAM_BLOCKS_COLUMNS,
         alter_sql: UPSTREAM_BLOCKS_ADD_HEADERS,
+    },
+    ColumnMigration {
+        table: "upstream_blocks",
+        column: "max_concurrency",
+        columns_sql: UPSTREAM_BLOCKS_COLUMNS,
+        alter_sql: UPSTREAM_BLOCKS_ADD_MAX_CONCURRENCY,
+    },
+    ColumnMigration {
+        table: "upstream_keys",
+        column: "never_disable",
+        columns_sql: UPSTREAM_KEYS_COLUMNS,
+        alter_sql: UPSTREAM_KEYS_ADD_NEVER_DISABLE,
     },
 ];
 
@@ -443,7 +480,7 @@ CREATE TABLE IF NOT EXISTS usage_records (
 )
 "#;
 
-    /// 老版 upstream_blocks 的建表语句：当前 DDL 去掉 headers 那一行。
+    /// 老版 upstream_blocks 的建表语句：当前 DDL 去掉 headers 与 max_concurrency 两行。
     ///
     /// 同样用字面量，并在下面钉住与 `UPSTREAM_BLOCKS_DDL` 的一致性。
     const LEGACY_UPSTREAM_BLOCKS_DDL: &str = r#"
@@ -461,10 +498,28 @@ CREATE TABLE IF NOT EXISTS upstream_blocks (
 )
 "#;
 
+    /// 老版 upstream_keys 的建表语句：当前 DDL 去掉 never_disable 那一行。
+    const LEGACY_UPSTREAM_KEYS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS upstream_keys (
+    id             TEXT    PRIMARY KEY,
+    block_id       TEXT    NOT NULL REFERENCES upstream_blocks(id) ON DELETE CASCADE,
+    secret         TEXT    NOT NULL,
+    status         TEXT    NOT NULL DEFAULT 'active',
+    weight         INTEGER NOT NULL DEFAULT 1,
+    failure_count  INTEGER NOT NULL DEFAULT 0,
+    cooldown_until INTEGER,
+    last_error     TEXT,
+    last_used_at   INTEGER,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    UNIQUE(block_id, secret)
+)
+"#;
+
     /// 造一张「老版」数据面的库：usage_records 没有 block_id，
-    /// upstream_blocks 没有 headers。
+    /// upstream_blocks 没有 headers 与 max_concurrency，upstream_keys 没有 never_disable。
     ///
-    /// 两张表都要建——补列是照着真实表名跑的，老库里本来就都有它们；
+    /// 三张表都要建——补列是照着真实表名跑的，老库里本来就都有它们；
     /// 只建一张测的就不是「老库能不能被补上」，而是「表不存在时会怎样」。
     async fn legacy_pool() -> SqlitePool {
         assert_eq!(
@@ -474,14 +529,25 @@ CREATE TABLE IF NOT EXISTS upstream_blocks (
         );
         assert_eq!(
             LEGACY_UPSTREAM_BLOCKS_DDL,
-            UPSTREAM_BLOCKS_DDL.replace("    headers      TEXT    NOT NULL DEFAULT '[]',\n", ""),
-            "老 DDL 与「当前 DDL 去掉 headers」已经不一致，测试夹具该更新了"
+            UPSTREAM_BLOCKS_DDL
+                .replace("    headers      TEXT    NOT NULL DEFAULT '[]',\n", "")
+                .replace("    max_concurrency INTEGER NOT NULL DEFAULT 0,\n", ""),
+            "老 DDL 与「当前 DDL 去掉 headers 与 max_concurrency」已经不一致，测试夹具该更新了"
+        );
+        assert_eq!(
+            LEGACY_UPSTREAM_KEYS_DDL,
+            UPSTREAM_KEYS_DDL.replace("    never_disable  INTEGER NOT NULL DEFAULT 0,\n", ""),
+            "老 DDL 与「当前 DDL 去掉 never_disable」已经不一致，测试夹具该更新了"
         );
 
         let pool = SqlitePool::connect("sqlite::memory:")
             .await
             .expect("打开内存库");
-        for ddl in [LEGACY_USAGE_RECORDS_DDL, LEGACY_UPSTREAM_BLOCKS_DDL] {
+        for ddl in [
+            LEGACY_USAGE_RECORDS_DDL,
+            LEGACY_UPSTREAM_BLOCKS_DDL,
+            LEGACY_UPSTREAM_KEYS_DDL,
+        ] {
             sqlx::raw_sql(ddl).execute(&pool).await.expect("建老表");
         }
         pool
@@ -542,6 +608,77 @@ CREATE TABLE IF NOT EXISTS upstream_blocks (
         assert_eq!(headers, "[]", "老块的自定义头应当补成空数组，而不是 NULL");
 
         // 可重入。
+        add_missing_columns(&pool).await.expect("第二次应当跳过");
+    }
+
+    #[tokio::test]
+    async fn adds_never_disable_to_a_legacy_key_table() {
+        let pool = legacy_pool().await;
+        let columns: Vec<String> = sqlx::query_scalar(UPSTREAM_KEYS_COLUMNS)
+            .fetch_all(&pool)
+            .await
+            .expect("读列信息");
+        assert!(
+            !columns.iter().any(|c| c == "never_disable"),
+            "老表本来就不该有 never_disable"
+        );
+
+        // 老库里先有块、再有密钥——补列之后它必须读到「未开启豁免」，而不是报错。
+        sqlx::query(
+            "INSERT INTO upstream_blocks (id, api_format, base_url, created_at, updated_at) \
+             VALUES ('block-a', 'openai', 'https://demo-upstream.invalid', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("写入老块");
+        sqlx::query(
+            "INSERT INTO upstream_keys (id, block_id, secret, created_at, updated_at) \
+             VALUES ('key-1', 'block-a', 'sk-demo', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("写入老密钥");
+
+        add_missing_columns(&pool).await.expect("补列");
+
+        let flag: i64 = sqlx::query_scalar("SELECT never_disable FROM upstream_keys")
+            .fetch_one(&pool)
+            .await
+            .expect("新列可读");
+        assert_eq!(flag, 0, "老密钥的永不暂停开关应当补成关闭");
+
+        // 可重入。
+        add_missing_columns(&pool).await.expect("第二次应当跳过");
+    }
+
+    #[tokio::test]
+    async fn adds_max_concurrency_to_a_legacy_block_table() {
+        let pool = legacy_pool().await;
+        let columns: Vec<String> = sqlx::query_scalar(UPSTREAM_BLOCKS_COLUMNS)
+            .fetch_all(&pool)
+            .await
+            .expect("读列信息");
+        assert!(
+            !columns.iter().any(|c| c == "max_concurrency"),
+            "老表本来就不该有 max_concurrency"
+        );
+
+        sqlx::query(
+            "INSERT INTO upstream_blocks (id, api_format, base_url, created_at, updated_at) \
+             VALUES ('block-a', 'openai', 'https://demo-upstream.invalid', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("写入老块");
+
+        add_missing_columns(&pool).await.expect("补列");
+
+        let cap: i64 = sqlx::query_scalar("SELECT max_concurrency FROM upstream_blocks")
+            .fetch_one(&pool)
+            .await
+            .expect("新列可读");
+        assert_eq!(cap, 0, "老块的并发上限应当补成 0（不限制）");
+
         add_missing_columns(&pool).await.expect("第二次应当跳过");
     }
 

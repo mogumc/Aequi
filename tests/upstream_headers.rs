@@ -58,12 +58,14 @@ impl TestApp {
                 name: "demo".to_string(),
                 api_format: ApiFormat::Openai,
                 weight: 1,
+                max_concurrency: 0,
                 base_url: base_url.to_string(),
                 proxy: None,
                 models: vec![ModelEntry {
                     name: "demo-model".to_string(),
                     forward: None,
                     multiplier_bp: 10_000,
+                    extra_body: None,
                 }],
                 headers,
             },
@@ -77,6 +79,7 @@ impl TestApp {
             UpstreamKeyCreate {
                 secrets: vec!["mock-upstream-secret".to_string()],
                 weight: 1,
+                never_disable: false,
             },
         )
         .await
@@ -214,7 +217,7 @@ async fn headers_survive_create_update_and_clear() {
     )
     .await;
 
-    let view = upstream_service::block_view(app.data(), "demo-block")
+    let view = upstream_service::block_view(app.data(), &app.state.upstream, "demo-block")
         .await
         .expect("读块失败");
     assert_eq!(view.headers.len(), 2, "建块时的自定义头要存下来");
@@ -232,7 +235,7 @@ async fn headers_survive_create_update_and_clear() {
     )
     .await
     .expect("改名失败");
-    let view = upstream_service::block_view(app.data(), "demo-block")
+    let view = upstream_service::block_view(app.data(), &app.state.upstream, "demo-block")
         .await
         .expect("读块失败");
     assert_eq!(view.name, "demo-renamed");
@@ -250,7 +253,7 @@ async fn headers_survive_create_update_and_clear() {
     )
     .await
     .expect("清空失败");
-    let view = upstream_service::block_view(app.data(), "demo-block")
+    let view = upstream_service::block_view(app.data(), &app.state.upstream, "demo-block")
         .await
         .expect("读块失败");
     assert!(view.headers.is_empty(), "传 [] 应当清空");
@@ -273,7 +276,7 @@ async fn headers_survive_create_update_and_clear() {
         "错误要说清为什么: {error}"
     );
 
-    let view = upstream_service::block_view(app.data(), "demo-block")
+    let view = upstream_service::block_view(app.data(), &app.state.upstream, "demo-block")
         .await
         .expect("读块失败");
     assert!(view.headers.is_empty(), "被拒的配置不该写进库");
