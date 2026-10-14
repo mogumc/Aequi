@@ -343,6 +343,9 @@ pub async fn chat_completion_stream(
 
         let adapter = adapter_for(block.api_format);
         let mut outgoing = adapter.build_chat_stream(&request, &block.target_model(&request.model));
+        // 额外请求体只来自管理端的块配置；下游请求体里的同名键在入口解析层
+        // 就被丢了（`openai_in::parse_request` 是白名单解析）。
+        outgoing.apply_extra_body(block.extra_body(&request.model));
         // OpenAI 系流式必须带 stream_options.include_usage 上游才会在流末尾
         // 回 usage chunk，否则只能估算计费。默认注入；上游不认识这个字段时
         // 会 400，此时拉黑该块并剥离重试（自动降级，替代旧版的配置白名单）。
@@ -964,7 +967,9 @@ async fn dispatch(
         };
 
         let adapter = adapter_for(block.api_format);
-        let outgoing = adapter.build_chat(request, &block.target_model(&request.model));
+        let mut outgoing = adapter.build_chat(request, &block.target_model(&request.model));
+        // 同流式：额外请求体只认管理端配置（下游键已被白名单解析丢弃）。
+        outgoing.apply_extra_body(block.extra_body(&request.model));
         let client = match state.upstream.client(&block) {
             Ok(client) => client,
             Err(error) => {

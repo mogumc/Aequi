@@ -59,6 +59,11 @@ pub const GATE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// 单机网关到不了这个量级，纯粹挡住「多打一个零」这种配置事故。
 const MAX_BLOCK_CONCURRENCY: u32 = 1024;
+/// 模型级额外请求体的体积上限（序列化后的字节数）。
+///
+/// 它逐请求并入上游请求体，配得太大等于给每个请求加负担；顺带挡住
+/// 把块配置当草稿纸用。
+const EXTRA_BODY_MAX_BYTES: usize = 8 * 1024;
 /// 发往上游的请求超时。
 /// 整个请求（含读流）的总时长上限。思考型模型输出慢，给足余量。
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(120);
@@ -361,7 +366,47 @@ fn validate_models(models: &[ModelEntry]) -> Result<()> {
                 entry.name
             )));
         }
+        validate_extra_body(entry)?;
     }
+    Ok(())
+}
+
+/// 校验模型级额外请求体（`extra_body`）。
+///
+/// 三条规矩都在配置期挡住，别留到请求期——一个坏配置会让该模型的每个
+/// 请求都 400，从上游看过来像是网关坏了。
+///
+/// 1. 必须是 JSON 对象（数组、标量都没法并入请求体）；
+/// 2. 不含网关掌管的键（见 [`crate::proxy::adapter::PROTECTED_BODY_KEYS`]）；
+/// 3. 体积不超过 [`EXTRA_BODY_MAX_BYTES`]。
+fn validate_extra_body(entry: &ModelEntry) -> Result<()> {
+    let Some(extra) = &entry.extra_body else {
+        return Ok(());
+    };
+    let Some(object) = extra.as_object() else {
+        return Err(Error::BadRequest(format!(
+            "模型 {} 的 extra_body 必须是 JSON 对象",
+            entry.name
+        )));
+    };
+
+    for key in object.keys() {
+        if crate::proxy::adapter::PROTECTED_BODY_KEYS.contains(&key.as_str()) {
+            return Err(Error::BadRequest(format!(
+                "模型 {} 的 extra_body 不允许包含 `{key}`（该字段由网关掌管）",
+                entry.name
+            )));
+        }
+    }
+
+    let size = extra.to_string().len();
+    if size > EXTRA_BODY_MAX_BYTES {
+        return Err(Error::BadRequest(format!(
+            "模型 {} 的 extra_body 过大（{size} 字节，上限 {EXTRA_BODY_MAX_BYTES}）",
+            entry.name
+        )));
+    }
+
     Ok(())
 }
 
@@ -1270,6 +1315,8 @@ pub async fn list_keys(pool: &SqlitePool, block_id: &str) -> Result<Vec<Upstream
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     fn header(name: &str, value: &str) -> HeaderEntry {
@@ -1277,6 +1324,46 @@ mod tests {
             name: name.to_string(),
             value: value.to_string(),
         }
+    }
+
+    /// 造一个带指定额外请求体的模型条目。
+    fn model_entry(extra_body: Option<serde_json::Value>) -> ModelEntry {
+        ModelEntry {
+            name: "demo-model".to_string(),
+            forward: None,
+            multiplier_bp: 10_000,
+            extra_body,
+        }
+    }
+
+    #[test]
+    fn extra_body_must_be_an_object() {
+        // 没配、配空对象、配正经对象都放行；数组和标量并入不了请求体。
+        assert!(validate_extra_body(&model_entry(None)).is_ok());
+        assert!(validate_extra_body(&model_entry(Some(json!({})))).is_ok());
+        assert!(validate_extra_body(&model_entry(Some(json!({ "top_k": 40 })))).is_ok());
+        assert!(validate_extra_body(&model_entry(Some(json!([1, 2])))).is_err());
+        assert!(validate_extra_body(&model_entry(Some(json!("nope")))).is_err());
+    }
+
+    #[test]
+    fn extra_body_rejects_keys_the_gateway_owns() {
+        let error = validate_extra_body(&model_entry(Some(json!({ "model": "other" }))))
+            .expect_err("model 是网关掌管的键");
+        assert!(
+            error.to_string().contains("model"),
+            "错误要说清是哪个键：{error}"
+        );
+        assert!(
+            validate_extra_body(&model_entry(Some(json!({ "stream_options": {} })))).is_err(),
+            "流式用量开关同样不许覆盖"
+        );
+    }
+
+    #[test]
+    fn extra_body_has_a_size_cap() {
+        let huge = json!({ "blob": "x".repeat(EXTRA_BODY_MAX_BYTES) });
+        assert!(validate_extra_body(&model_entry(Some(huge))).is_err());
     }
 
     #[test]

@@ -59,6 +59,7 @@ impl TestApp {
                         name: name.to_string(),
                         forward: None,
                         multiplier_bp: 10_000,
+                        extra_body: None,
                     })
                     .collect(),
                 headers: Vec::new(),

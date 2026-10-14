@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::error::{Error, Result};
 use crate::model::ApiKey;
-use crate::proxy::adapter::{AuthStyle, UpstreamRequest};
+use crate::proxy::adapter::{AuthStyle, EXTRA_BODY_KEY, UpstreamRequest};
 use crate::proxy::scheme::Usage;
 use crate::proxy::{Failure, MAX_ATTEMPTS, base_log, estimate, sanitize_user_message, write_log};
 use crate::service::{billing, upstream};
@@ -205,11 +205,17 @@ async fn dispatch(
         // 模型名替换成块里配置的转发名，其余字段原样透传。
         let mut outgoing = body.clone();
         outgoing["model"] = json!(block.target_model(model));
+        // 额外请求体只认管理端配置的。生图是透传路径，下游塞的同名键
+        // 不会被任何白名单解析挡住，必须显式丢掉。
+        if let Some(object) = outgoing.as_object_mut() {
+            object.remove(EXTRA_BODY_KEY);
+        }
 
-        let request = UpstreamRequest {
+        let mut request = UpstreamRequest {
             path: IMAGES_PATH.to_string(),
             body: Some(outgoing),
         };
+        request.apply_extra_body(block.extra_body(model));
         let client = match state.upstream.client(&block) {
             Ok(client) => client,
             Err(error) => {

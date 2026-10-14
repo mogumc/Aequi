@@ -49,6 +49,14 @@ pub struct ModelEntry {
     /// 可以有不同的价。旧数据缺这个字段时按 1.0 处理。
     #[serde(default = "default_multiplier_bp")]
     pub multiplier_bp: i64,
+    /// 额外请求体：只允许**管理端**在这里配置，下游请求体里的同名键一律丢弃。
+    ///
+    /// 按**上游格式**书写（块绑定的是哪家就写哪家），原样并入发往上游的
+    /// 请求体顶层，用于网关没暴露的参数（`top_k`、`seed`、Google 的
+    /// `generationConfig` 等）。`model` / 消息内容 / 工具 / `stream*`
+    /// 这些由网关掌管的键不允许出现，`validate_models` 会拒。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_body: Option<serde_json::Value>,
 }
 
 /// 未配置倍率时的默认值：1.0 倍。
@@ -133,6 +141,17 @@ impl UpstreamBlock {
             .find(|entry| entry.name == model)
             .map(|entry| entry.multiplier_bp)
             .unwrap_or(crate::model::credits::DEFAULT_MULTIPLIER_BP)
+    }
+
+    /// 该模型在本块的额外请求体（管理端配置）。
+    ///
+    /// 只从块配置里取——下游请求体里的同名键在入口解析层就被丢弃，
+    /// 这里不做任何合并判断，交给 `UpstreamRequest::apply_extra_body`。
+    pub fn extra_body(&self, model: &str) -> Option<&serde_json::Value> {
+        self.models
+            .iter()
+            .find(|entry| entry.name == model)
+            .and_then(|entry| entry.extra_body.as_ref())
     }
 }
 

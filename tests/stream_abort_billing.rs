@@ -69,6 +69,7 @@ impl TestApp {
                     name: "demo-model".to_string(),
                     forward: None,
                     multiplier_bp: 10_000,
+                    extra_body: None,
                 }],
                 headers: Vec::new(),
             },
