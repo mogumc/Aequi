@@ -76,6 +76,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/blocks/{id}/keys/remove", post(blocks::remove_keys))
         .route("/blocks/{id}/keys/pause", post(blocks::pause_keys))
         .route("/blocks/{id}/keys/resume", post(blocks::resume_keys))
+        .route(
+            "/blocks/{id}/keys/never-disable",
+            post(blocks::never_disable_keys),
+        )
         .route("/blocks/{id}/keys/{key_id}/test", post(blocks::test_key))
         .route("/blocks/{id}/test", post(blocks::test_block))
         .route("/blocks/{id}/models/fetch", post(blocks::fetch_models))

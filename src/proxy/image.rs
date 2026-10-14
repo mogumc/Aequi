@@ -222,6 +222,16 @@ async fn dispatch(
 
         let context = Some((block.id.clone(), upstream_key.id.clone()));
 
+        // 并发闸门：与对话同一套规则——块配了上限就排队等位子，
+        // 位子持有到本轮结束（重试换块时先释放）。
+        let _permit = match crate::proxy::acquire_gate(state, &block).await {
+            Ok(permit) => permit,
+            Err(error) => {
+                let user_message = sanitize_user_message(&error);
+                return Err(Failure::with_context(error, user_message, context));
+            }
+        };
+
         match crate::proxy::send(
             &client,
             &block,
@@ -233,7 +243,13 @@ async fn dispatch(
         {
             Ok((status, response_body)) => {
                 if status == 429 {
-                    upstream::report_rate_limited(pool, &upstream_key).await;
+                    upstream::report_failure(
+                        pool,
+                        &upstream_key,
+                        upstream::FailureKind::RateLimited,
+                        "被限流，暂时退避",
+                    )
+                    .await;
                     last_failure = Some(Failure::with_context(
                         Error::UpstreamUnavailable("上游限流".to_string()),
                         "上游限流".to_string(),
@@ -242,7 +258,7 @@ async fn dispatch(
                     continue;
                 }
 
-                if status == 401 || status == 403 || status >= 500 {
+                if status == 401 || status == 403 {
                     let detail = response_body
                         .pointer("/error/message")
                         .and_then(Value::as_str)
@@ -250,6 +266,27 @@ async fn dispatch(
                     upstream::report_failure(
                         pool,
                         &upstream_key,
+                        upstream::FailureKind::Hard,
+                        &format!("上游返回 {status} {detail}"),
+                    )
+                    .await;
+                    last_failure = Some(Failure::with_context(
+                        Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
+                        format!("上游响应异常: 返回 {status}"),
+                        context,
+                    ));
+                    continue;
+                }
+
+                if status >= 500 {
+                    let detail = response_body
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    upstream::report_failure(
+                        pool,
+                        &upstream_key,
+                        upstream::FailureKind::Transient,
                         &format!("上游返回 {status} {detail}"),
                     )
                     .await;
@@ -280,7 +317,13 @@ async fn dispatch(
                     None => {
                         let error = Error::UpstreamUnavailable("上游响应里没有 data".to_string());
                         let user_message = sanitize_user_message(&error);
-                        upstream::report_failure(pool, &upstream_key, &error.to_string()).await;
+                        upstream::report_failure(
+                            pool,
+                            &upstream_key,
+                            upstream::FailureKind::Transient,
+                            &error.to_string(),
+                        )
+                        .await;
                         last_failure = Some(Failure::with_context(error, user_message, context));
                         continue;
                     }
@@ -338,7 +381,13 @@ async fn dispatch(
             Err(error) => {
                 // reqwest 的报错可能带 URL，不进用户能查到的表。
                 let user_message = sanitize_user_message(&error);
-                upstream::report_failure(pool, &upstream_key, &error.to_string()).await;
+                upstream::report_failure(
+                    pool,
+                    &upstream_key,
+                    upstream::FailureKind::Transient,
+                    &error.to_string(),
+                )
+                .await;
                 last_failure = Some(Failure::with_context(error, user_message, context));
             }
         }

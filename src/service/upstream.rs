@@ -3,14 +3,18 @@
 //! 管理面（增删改查、暂停、恢复、测试）在这里；调度面只有两个入口——
 //! 按模型挑块、块内挑密钥，都走平滑加权轮询。
 //!
-//! 密钥的生命周期是自治的：请求成功清零失败计数；429 进入退避；
-//! 连续失败达到阈值自动停用，等管理员确认后恢复。
+//! 密钥的生命周期是自治的：请求成功清零失败计数；可恢复的失败按连续
+//! 次数指数退避；只有密钥被上游明确拒绝（401/403）累计到阈值才自动
+//! 停用——限流、上游 5xx、网络抖动这类短期故障不该把好密钥永久禁掉。
+//! `never_disable` 的密钥连自动停用也免掉。
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sqlx::SqlitePool;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::db;
 use crate::error::{Error, Result};
@@ -22,10 +26,39 @@ use crate::proxy;
 use crate::proxy::adapter::{ProbeOutcome, adapter_for};
 use crate::utils::{random, time};
 
+/// 失败的分类，决定后续动作。
+///
+/// - [`Hard`](FailureKind::Hard)：密钥本身被上游拒绝（401/403）。换密钥也救不了，
+///   累计到阈值就自动停用。
+/// - [`RateLimited`](FailureKind::RateLimited)：被限流（429）。指数退避避让，永不停用。
+/// - [`Transient`](FailureKind::Transient)：上游瞬时故障（5xx、网络、200 但结构不对）。
+///   同样指数退避，但**不计入停用**——上游打个嗝不该把好密钥永久禁掉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    Hard,
+    RateLimited,
+    Transient,
+}
+
 /// 连续失败达到该次数后自动停用密钥。
+///
+/// 只数 [`FailureKind::Hard`]；限流与瞬时故障走退避，不碰停用判定。
 const FAILURE_THRESHOLD: u32 = 3;
-/// 429 退避时长（秒）。
-const RATE_LIMIT_COOLDOWN: i64 = 30;
+/// 退避基础时长（秒）：第一次可恢复失败后休息这么久。
+const BACKOFF_BASE_SECS: i64 = 30;
+/// 退避时长上限（秒）：指数到顶就不再涨，免得一把密钥被雪藏太久。
+const BACKOFF_MAX_SECS: i64 = 480;
+/// 指数退避的最大移位：30s × 2^4 = 480s 到顶。
+const BACKOFF_MAX_SHIFT: u32 = 4;
+/// 排队等位的最长时间。
+///
+/// 等不到就明说「通道繁忙」，别把客户端无限期挂住——它那头的超时
+/// 比我们更短，挂着只是让两边都说不清发生了什么。
+pub const GATE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// 块并发上限的防呆上限。
+///
+/// 单机网关到不了这个量级，纯粹挡住「多打一个零」这种配置事故。
+const MAX_BLOCK_CONCURRENCY: u32 = 1024;
 /// 发往上游的请求超时。
 /// 整个请求（含读流）的总时长上限。思考型模型输出慢，给足余量。
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(120);
@@ -33,7 +66,16 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(120);
 /// 复用到它就会表现为「响应读到一半流就没了」且概率性出现。
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 上游的运行时状态：轮询累积值与每块的 HTTP 客户端。
+/// 这一次该退避多久：按连续失败次数指数增长，到顶封顶。
+///
+/// `failures` 是含本次在内的连续失败次数：第一次 30s，之后每多一次
+/// 翻一倍，第五次起固定 480s。
+fn backoff_secs(failures: u32) -> i64 {
+    let shift = failures.saturating_sub(1).min(BACKOFF_MAX_SHIFT);
+    (BACKOFF_BASE_SECS << shift).min(BACKOFF_MAX_SECS)
+}
+
+/// 上游的运行时状态：轮询累积值、每块的 HTTP 客户端与并发闸门。
 #[derive(Default)]
 pub struct UpstreamState {
     /// 平滑加权轮询的累积值。键是块或密钥的 id。
@@ -43,6 +85,90 @@ pub struct UpstreamState {
     /// 被「不认识 stream_options」的上游拉黑的块：对这些块不再注入
     /// include_usage。进程内记录，重启后重新试探——降级是自动的。
     no_usage_inject: Mutex<HashMap<String, ()>>,
+    /// 每块的并发闸门：键是块 id。
+    ///
+    /// 容量为 0（不限制）的块不建门。容量变化时换一个新门：已在
+    /// 旧门后排队的请求按旧容量放行（上界就是旧容量，不会超额），
+    /// 新请求立即按新容量走——调大立即生效，调小最多让老队列的人走完。
+    gates: Mutex<HashMap<String, Arc<BlockGate>>>,
+}
+
+/// 一个块的并发闸门。
+///
+/// tokio 的信号量不暴露「有多少人在等」，而排队数正是运维最想看的数字
+/// 之一——在飞数打满可能只是忙，排队数持续不降才是真堵了，所以自己数。
+pub struct BlockGate {
+    /// 建门时的容量，与块的 `max_concurrency` 一致。
+    capacity: u32,
+    semaphore: Arc<Semaphore>,
+    /// 等位子的人数：进闸门前 +1，拿到位子或放弃后 -1。
+    queued: Arc<AtomicUsize>,
+}
+
+impl BlockGate {
+    fn new(capacity: u32) -> Arc<Self> {
+        Arc::new(Self {
+            capacity,
+            semaphore: Arc::new(Semaphore::new(capacity as usize)),
+            queued: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    /// 正在发往上游的请求数：容量扣掉剩余位子。
+    pub fn in_flight(&self) -> u32 {
+        self.capacity
+            .saturating_sub(self.semaphore.available_permits() as u32)
+    }
+
+    /// 排在闸门后的请求数。
+    pub fn queued(&self) -> u32 {
+        self.queued.load(Ordering::Relaxed) as u32
+    }
+
+    /// 等一个位子，排队期间计数。
+    ///
+    /// 计数由 [`QueuedGuard`] 在丢弃时收回，所以**超时取消也安全**——
+    /// 调用方（`proxy::acquire_gate` 的 `timeout`）丢下这个 future 时，
+    /// 排队数照样减回去，不会虚高。
+    ///
+    /// 返回的位子与闸门同生命周期：调用方持有多久，在飞数就记多久。
+    pub async fn acquire(&self) -> Result<OwnedSemaphorePermit> {
+        let _queued = QueuedGuard::enter(&self.queued);
+        self.semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| Error::Internal(anyhow::anyhow!("并发闸门异常: {error}")))
+    }
+}
+
+/// 排队计数守卫：构造时 +1，丢弃时 -1（无论原因）。
+struct QueuedGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl QueuedGuard {
+    fn enter(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self {
+            counter: Arc::clone(counter),
+        }
+    }
+}
+
+impl Drop for QueuedGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// 块的实时并发负载快照。
+#[derive(Debug, Clone, Copy)]
+pub struct BlockLoad {
+    /// 正在发往上游的请求数。
+    pub in_flight: u32,
+    /// 排在闸门后的请求数。
+    pub queued: u32,
 }
 
 impl UpstreamState {
@@ -106,6 +232,48 @@ impl UpstreamState {
                     "上游不认识 stream_options，已停止对该块注入 include_usage"
                 );
             }
+        }
+    }
+
+    /// 取该块的并发闸门。块不限制并发（`max_concurrency` 为 0）时返回 `None`。
+    ///
+    /// 容量与缓存不一致就换一个新门（见结构体注释）：调大立即生效，
+    /// 调小只影响后续请求。调用方拿到的是 `Arc`，队列里排着的人不受换门影响。
+    pub fn gate(&self, block: &UpstreamBlock) -> Option<Arc<BlockGate>> {
+        if block.max_concurrency == 0 {
+            return None;
+        }
+
+        let mut gates = self.gates.lock().ok()?;
+        let entry = gates
+            .entry(block.id.clone())
+            .or_insert_with(|| BlockGate::new(block.max_concurrency));
+        if entry.capacity != block.max_concurrency {
+            *entry = BlockGate::new(block.max_concurrency);
+        }
+        Some(Arc::clone(entry))
+    }
+
+    /// 该块的实时并发负载。没有闸门（不限制并发）时返回 `None`。
+    ///
+    /// 给管理面板看的快照：调用即建门（有限额的块迟早要有门），
+    /// 所以有限额的块即使没有流量也报 `0 / 0`，不会忽有忽无。
+    pub fn load(&self, block: &UpstreamBlock) -> Option<BlockLoad> {
+        let gate = self.gate(block)?;
+        Some(BlockLoad {
+            in_flight: gate.in_flight(),
+            queued: gate.queued(),
+        })
+    }
+
+    /// 块删除时清掉它的闸门。
+    ///
+    /// 删除时仍在飞的请求持有旧信号量的 `Arc`，跑完才释放；重建同 id 的块
+    /// 会拿到一个满容量的新门——最坏情况是「删了又在飞的块又原地重建」这个
+    /// 窗口里新旧流量短暂叠加，上界是旧门的容量，随后自然收敛。
+    pub fn invalidate_gate(&self, block_id: &str) {
+        if let Ok(mut gates) = self.gates.lock() {
+            gates.remove(block_id);
         }
     }
 
@@ -193,6 +361,19 @@ fn validate_models(models: &[ModelEntry]) -> Result<()> {
                 entry.name
             )));
         }
+    }
+    Ok(())
+}
+
+/// 校验块的同时发往上游的请求数上限。
+///
+/// 0 = 不限制（缺省）；上限只为防呆——「多打一个零」会让整台机器
+/// 的出口连接全部押到这个块上，而这种错误在日志里看一个月也看不出来。
+fn validate_concurrency(max_concurrency: u32) -> Result<()> {
+    if max_concurrency > MAX_BLOCK_CONCURRENCY {
+        return Err(Error::BadRequest(format!(
+            "块的并发上限不能超过 {MAX_BLOCK_CONCURRENCY}（0 表示不限制）"
+        )));
     }
     Ok(())
 }
@@ -414,6 +595,7 @@ pub async fn create_block(pool: &SqlitePool, payload: BlockCreate) -> Result<Ups
         return Err(Error::BadRequest("base_url 不能为空".to_string()));
     }
     validate_models(&payload.models)?;
+    validate_concurrency(payload.max_concurrency)?;
     let headers = normalize_headers(payload.headers)?;
 
     let now = time::now_secs();
@@ -422,6 +604,7 @@ pub async fn create_block(pool: &SqlitePool, payload: BlockCreate) -> Result<Ups
         name: payload.name.trim().to_string(),
         api_format: payload.api_format,
         weight: payload.weight,
+        max_concurrency: payload.max_concurrency,
         base_url: payload.base_url.trim().trim_end_matches('/').to_string(),
         proxy: payload.proxy,
         models: payload.models,
@@ -454,6 +637,7 @@ pub async fn update_block(
         name,
         api_format,
         weight,
+        max_concurrency,
         base_url,
         proxy,
         models,
@@ -463,6 +647,9 @@ pub async fn update_block(
 
     if let Some(models) = &models {
         validate_models(models)?;
+    }
+    if let Some(max_concurrency) = max_concurrency {
+        validate_concurrency(max_concurrency)?;
     }
     // 整份替换：传 `[]` 就是清空，不做按名字的增量合并（那是猜）。
     let headers = match headers {
@@ -481,6 +668,9 @@ pub async fn update_block(
     }
     if let Some(weight) = weight {
         block.weight = weight;
+    }
+    if let Some(max_concurrency) = max_concurrency {
+        block.max_concurrency = max_concurrency;
     }
     if let Some(base_url) = base_url {
         block.base_url = base_url.trim().trim_end_matches('/').to_string();
@@ -515,6 +705,7 @@ pub async fn delete_block(pool: &SqlitePool, state: &UpstreamState, id: &str) ->
 
     state.forget(&[id.to_string()]);
     state.invalidate_client(id);
+    state.invalidate_gate(id);
     Ok(())
 }
 
@@ -525,35 +716,41 @@ pub async fn get_block(pool: &SqlitePool, id: &str) -> Result<UpstreamBlock> {
         .ok_or_else(|| Error::NotFound("块不存在".to_string()))
 }
 
-/// 列出块，附带密钥统计。
-pub async fn list_blocks(pool: &SqlitePool) -> Result<Vec<BlockView>> {
+/// 列出块，附带密钥统计与实时并发负载。
+pub async fn list_blocks(pool: &SqlitePool, state: &UpstreamState) -> Result<Vec<BlockView>> {
     let blocks = db::block::list_blocks(pool).await?;
 
     let mut views = Vec::with_capacity(blocks.len());
     for block in &blocks {
-        views.push(block_view_of(pool, block).await?);
+        views.push(block_view_of(pool, state, block).await?);
     }
 
     Ok(views)
 }
 
 /// 单个块的视图。
-pub async fn block_view(pool: &SqlitePool, id: &str) -> Result<BlockView> {
+pub async fn block_view(pool: &SqlitePool, state: &UpstreamState, id: &str) -> Result<BlockView> {
     let block = get_block(pool, id).await?;
-    block_view_of(pool, &block).await
+    block_view_of(pool, state, &block).await
 }
 
-/// 由块记录生成视图，顺带统计密钥的可用情况。
-async fn block_view_of(pool: &SqlitePool, block: &UpstreamBlock) -> Result<BlockView> {
+/// 由块记录生成视图，顺带统计密钥的可用情况与并发负载。
+async fn block_view_of(
+    pool: &SqlitePool,
+    state: &UpstreamState,
+    block: &UpstreamBlock,
+) -> Result<BlockView> {
     let keys = db::block::list_keys(pool, &block.id).await?;
     let now = time::now_secs();
     let available = keys.iter().filter(|key| key.is_selectable(now)).count();
+    let load = state.load(block);
 
     Ok(BlockView {
         id: block.id.clone(),
         name: block.name.clone(),
         api_format: block.api_format,
         weight: block.weight,
+        max_concurrency: block.max_concurrency,
         base_url: block.base_url.clone(),
         proxy: block.proxy.clone(),
         models: block.models.clone(),
@@ -561,6 +758,8 @@ async fn block_view_of(pool: &SqlitePool, block: &UpstreamBlock) -> Result<Block
         enabled: block.enabled,
         key_count: keys.len(),
         available_keys: available,
+        in_flight: load.map(|load| load.in_flight),
+        queued: load.map(|load| load.queued),
         created_at: block.created_at,
         updated_at: block.updated_at,
     })
@@ -616,7 +815,15 @@ pub async fn add_keys(
     }
 
     let mut tx = pool.begin().await?;
-    db::block::insert_keys(&mut *tx, &entries, block_id, payload.weight, now).await?;
+    db::block::insert_keys(
+        &mut *tx,
+        &entries,
+        block_id,
+        payload.weight,
+        payload.never_disable,
+        now,
+    )
+    .await?;
     tx.commit().await?;
 
     let mut views = Vec::with_capacity(entries.len());
@@ -661,6 +868,21 @@ pub async fn resume_keys(pool: &SqlitePool, block_id: &str, ids: &[String]) -> R
     Ok(())
 }
 
+/// 批量设置「永不暂停」：免于被自动停用。
+///
+/// 只叠加一个豁免，不改状态也不清计数——想让它重新上岗用 resume。
+pub async fn set_key_never_disable(
+    pool: &SqlitePool,
+    block_id: &str,
+    ids: &[String],
+    enabled: bool,
+) -> Result<()> {
+    for id in ids {
+        db::block::set_key_never_disable(pool, block_id, id, enabled, time::now_secs()).await?;
+    }
+    Ok(())
+}
+
 /// 测试一把密钥：发一个不消耗 token 的请求。
 pub async fn test_key(
     pool: &SqlitePool,
@@ -690,7 +912,9 @@ pub async fn test_key(
             db::block::mark_key_success(pool, &key.id, time::now_secs()).await?;
         }
         ProbeOutcome::Invalid(detail) => {
-            disable_key(pool, &key, detail).await?;
+            // 手动测试是带证据的人工动作：即使密钥设了永不暂停，
+            // 确认无效也停用——豁免免的是自动规则，不是这个。
+            disable_key(pool, &key, key.failure_count + 1, detail).await?;
         }
         ProbeOutcome::Transient(_) => {}
     }
@@ -881,18 +1105,42 @@ pub async fn report_success(pool: &SqlitePool, key_id: &str) {
     }
 }
 
-/// 一次失败：累计失败计数，达到阈值自动停用。
-pub async fn report_failure(pool: &SqlitePool, key: &UpstreamKey, detail: &str) {
+/// 一次失败：按类型决定退避与停用。
+///
+/// - 硬失败（密钥被上游拒绝）累计到阈值自动停用；`never_disable` 的密钥
+///   除外——计数、留痕照旧，状态不动。
+/// - 限流与瞬时故障按连续失败次数指数退避（30s 起步、480s 封顶），
+///   **不停用**：上游打个嗝不该把好密钥永久禁掉，等管理员发现时
+///   故障早就过去了。
+/// - 三种都写 `last_error`：后台看得见最近一次失败的原因。
+pub async fn report_failure(pool: &SqlitePool, key: &UpstreamKey, kind: FailureKind, detail: &str) {
     let failures = key.failure_count + 1;
     let now = time::now_secs();
 
-    if failures >= FAILURE_THRESHOLD {
-        tracing::warn!(key_id = %key.id, failures, "密钥连续失败，已自动停用");
-        if let Err(error) = disable_key(pool, key, detail).await {
-            tracing::warn!(key_id = %key.id, error = %error, "停用密钥失败");
+    if kind == FailureKind::Hard && failures >= FAILURE_THRESHOLD {
+        if key.never_disable {
+            tracing::info!(
+                key_id = %key.id,
+                failures,
+                "密钥连续被拒，但已设为永不暂停，仅记录不停用"
+            );
+        } else {
+            // 留痕与停用一把做完：Disabled 是终态，停机原因要跟着落库，
+            // 否则后台只看到「停了」，看不到「为什么停」。
+            if let Err(error) = disable_key(pool, key, failures, detail).await {
+                tracing::warn!(key_id = %key.id, error = %error, "停用密钥失败");
+            } else {
+                tracing::warn!(key_id = %key.id, failures, "密钥连续被拒，已自动停用");
+            }
+            return;
         }
-        return;
     }
+
+    let cooldown_until = match kind {
+        // 硬失败不退避：它要么即将停用，要么该由人工看一眼，歇着没用。
+        FailureKind::Hard => None,
+        FailureKind::RateLimited | FailureKind::Transient => Some(now + backoff_secs(failures)),
+    };
 
     let mut connection = match pool.acquire().await {
         Ok(connection) => connection,
@@ -902,7 +1150,36 @@ pub async fn report_failure(pool: &SqlitePool, key: &UpstreamKey, detail: &str) 
         }
     };
 
-    let result = db::block::update_key_runtime(
+    if let Err(error) = db::block::update_key_runtime(
+        connection.as_mut(),
+        &key.id,
+        failures,
+        cooldown_until,
+        Some(detail.to_string()),
+        now,
+    )
+    .await
+    {
+        tracing::warn!(key_id = %key.id, error = %error, "记录密钥失败状态失败");
+    }
+}
+
+/// 停用一把密钥，并把停机原因写进 `last_error`。
+///
+/// 连续失败达标与手动测试确认无效走的是同一条路：结果都是「这把钥匙
+/// 不能用了」，后台要能看出是哪一次失败送它下线的。
+async fn disable_key(
+    pool: &SqlitePool,
+    key: &UpstreamKey,
+    failures: u32,
+    detail: &str,
+) -> Result<()> {
+    let now = time::now_secs();
+
+    let mut connection = pool.acquire().await?;
+    // `set_key_status` 只在转 active 时清场，disabled 原样保留——所以这里
+    // 写下去的计数与原因就是后台看到的最终值。
+    db::block::update_key_runtime(
         connection.as_mut(),
         &key.id,
         failures,
@@ -910,52 +1187,10 @@ pub async fn report_failure(pool: &SqlitePool, key: &UpstreamKey, detail: &str) 
         Some(detail.to_string()),
         now,
     )
-    .await;
-
-    if let Err(error) = result {
-        tracing::warn!(key_id = %key.id, error = %error, "记录密钥失败状态失败");
-    }
-}
-
-/// 被限流：密钥进入退避期，期间不再参与调度。
-pub async fn report_rate_limited(pool: &SqlitePool, key: &UpstreamKey) {
-    let now = time::now_secs();
-    let until = now + RATE_LIMIT_COOLDOWN;
-
-    let mut connection = match pool.acquire().await {
-        Ok(connection) => connection,
-        Err(error) => {
-            tracing::warn!(key_id = %key.id, error = %error, "获取连接失败");
-            return;
-        }
-    };
-
-    let result = db::block::update_key_runtime(
-        connection.as_mut(),
-        &key.id,
-        key.failure_count,
-        Some(until),
-        Some("被限流，暂时退避".to_string()),
-        now,
-    )
-    .await;
-
-    if let Err(error) = result {
-        tracing::warn!(key_id = %key.id, error = %error, "设置密钥退避失败");
-    }
-}
-
-/// 停用一把密钥。
-async fn disable_key(pool: &SqlitePool, key: &UpstreamKey, detail: &str) -> Result<()> {
-    db::block::set_key_status(
-        pool,
-        &key.block_id,
-        &key.id,
-        KeyStatus::Disabled,
-        time::now_secs(),
-    )
     .await?;
-    let _ = detail;
+    drop(connection);
+
+    db::block::set_key_status(pool, &key.block_id, &key.id, KeyStatus::Disabled, now).await?;
     Ok(())
 }
 
@@ -1017,6 +1252,7 @@ fn view_key(key: &UpstreamKey) -> UpstreamKeyView {
         block_id: key.block_id.clone(),
         secret: key.secret.clone(),
         status: key.status,
+        never_disable: key.never_disable,
         weight: key.weight,
         failure_count: key.failure_count,
         cooldown_until: key.cooldown_until,
@@ -1105,5 +1341,284 @@ mod tests {
             normalize_headers(many).is_err(),
             "超过 {MAX_HEADERS} 条要挡住，免得整坨 JSON 粘进来"
         );
+    }
+
+    // ---------- 并发上限与闸门 ----------
+
+    #[test]
+    fn concurrency_limit_is_validated() {
+        assert!(validate_concurrency(0).is_ok(), "0 = 不限制");
+        assert!(validate_concurrency(MAX_BLOCK_CONCURRENCY).is_ok());
+        let error =
+            validate_concurrency(MAX_BLOCK_CONCURRENCY + 1).expect_err("超过防呆上限必须被拒");
+        assert!(
+            error.to_string().contains("并发上限"),
+            "错误要说清超的是什么: {error}"
+        );
+    }
+
+    /// 造一个只差运行时分数的块（测试不联网）。
+    fn demo_block(max_concurrency: u32) -> UpstreamBlock {
+        UpstreamBlock {
+            id: "demo-block".to_string(),
+            name: "demo".to_string(),
+            api_format: crate::model::ApiFormat::Openai,
+            weight: 1,
+            max_concurrency,
+            base_url: "https://demo-upstream.invalid".to_string(),
+            proxy: None,
+            models: Vec::new(),
+            headers: Vec::new(),
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_hands_out_permits_and_queues_when_full() {
+        let state = UpstreamState::default();
+
+        // 不限制的块没有闸门
+        assert!(
+            state.gate(&demo_block(0)).is_none(),
+            "max_concurrency 为 0 时不该建闸门"
+        );
+
+        let gate = state.gate(&demo_block(2)).expect("配了上限就应当有闸门");
+        assert_eq!(gate.in_flight(), 0);
+
+        let first = gate.acquire().await.expect("拿第一个位子");
+        let second = gate.acquire().await.expect("拿第二个位子");
+        assert_eq!(gate.in_flight(), 2, "位子发完就该堵住");
+
+        // 第三个等不到：50ms 超时（线上口径是 GATE_WAIT_TIMEOUT）。
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), gate.acquire())
+                .await
+                .is_err(),
+            "闸门满了必须排队，而不是放行超额请求"
+        );
+        assert_eq!(gate.queued(), 0, "超时取消也要把排队数收回去，不能虚高");
+
+        drop(first);
+        assert_eq!(gate.in_flight(), 1, "释放一个还一个");
+        drop(second);
+
+        // 容量调小：换一个新门，新请求按新容量走（旧门上的排队者不受影响）。
+        let smaller = state.gate(&demo_block(1)).expect("换门");
+        assert_eq!(smaller.in_flight(), 0, "新门按新容量发放位子");
+        assert_eq!(smaller.queued(), 0);
+
+        // 删除后重建同 id 的块：拿到的是满容量的新门。
+        state.invalidate_gate("demo-block");
+        assert_eq!(
+            state.gate(&demo_block(3)).expect("重建后的门").in_flight(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn load_reports_in_flight_and_queued() {
+        let state = UpstreamState::default();
+
+        // 不限制并发的块没有负载可报：没有闸门，就没有这两个数。
+        assert!(
+            state.load(&demo_block(0)).is_none(),
+            "max_concurrency 为 0 时不该报负载"
+        );
+
+        let gate = state.gate(&demo_block(1)).expect("配了上限就应当有闸门");
+        let held = gate.acquire().await.expect("占住唯一的位子");
+
+        // 第二个请求开始排队：在飞 1、排队 1。
+        let waiter = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move { gate.acquire().await }
+        });
+        // spawn 到真正 +1 之间有调度窗口，等它落秤。
+        for _ in 0..100 {
+            if gate.queued() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let load = state.load(&demo_block(1)).expect("有限额的块要报负载");
+        assert_eq!(load.in_flight, 1, "在飞数要算上占着位子的请求");
+        assert_eq!(load.queued, 1, "排队数要算上等位子的请求");
+
+        // 放走在飞的请求，排队者补位：在飞仍是 1，排队归零。
+        drop(held);
+        // 位子一路持有到测试结束——在飞数要的正是「补位者还在飞」。
+        let _permit = waiter
+            .await
+            .expect("排队任务不该 panic")
+            .expect("位子终会等到");
+        assert_eq!(gate.in_flight(), 1, "补位的请求接住在飞数里");
+        assert_eq!(gate.queued(), 0, "等到位子就不再算排队");
+    }
+
+    // ---------- 密钥生命周期与退避 ----------
+
+    /// 一张只有数据面表的内存库。
+    async fn test_pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("打开内存库");
+        crate::db::migrate_data(&pool)
+            .await
+            .expect("建数据面表失败");
+        pool
+    }
+
+    /// 建一个块并放一把密钥，返回读出来的密钥记录。
+    async fn seed_key(pool: &SqlitePool, never_disable: bool) -> UpstreamKey {
+        sqlx::query(
+            "INSERT INTO upstream_blocks \
+             (id, name, api_format, weight, max_concurrency, base_url, created_at, updated_at) \
+             VALUES ('demo-block', 'demo', 'openai', 1, 0, 'https://demo-upstream.invalid', 1, 1)",
+        )
+        .execute(pool)
+        .await
+        .expect("建块失败");
+        sqlx::query(
+            "INSERT INTO upstream_keys \
+             (id, block_id, secret, never_disable, created_at, updated_at) \
+             VALUES ('key-1', 'demo-block', 'sk-demo', ?, 1, 1)",
+        )
+        .bind(i64::from(never_disable))
+        .execute(pool)
+        .await
+        .expect("建密钥失败");
+
+        db::block::find_key(pool, "demo-block", "key-1")
+            .await
+            .expect("读密钥失败")
+            .expect("密钥应当存在")
+    }
+
+    /// 重新读库里那把密钥——`report_failure` 按传入记录的计数累加，
+    /// 连续报告必须每轮换最新的记录，否则测的是「同一份旧数据加五次」。
+    async fn reload(pool: &SqlitePool) -> UpstreamKey {
+        db::block::find_key(pool, "demo-block", "key-1")
+            .await
+            .expect("读密钥失败")
+            .expect("密钥应当存在")
+    }
+
+    #[test]
+    fn backoff_doubles_each_failure_and_caps() {
+        assert_eq!(backoff_secs(1), 30, "第一次失败休息基础时长");
+        assert_eq!(backoff_secs(2), 60, "之后每多一次翻倍");
+        assert_eq!(backoff_secs(3), 120);
+        assert_eq!(backoff_secs(4), 240);
+        assert_eq!(backoff_secs(5), 480, "到顶封顶");
+        assert_eq!(backoff_secs(99), 480, "之后不再涨——雪藏太久等于停用");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_only_backs_off_never_disables() {
+        let pool = test_pool().await;
+        let mut key = seed_key(&pool, false).await;
+
+        // 连吃 5 个 429：一次都不该停用，退避一路涨到顶。
+        for expected in 1..=5u32 {
+            let before = time::now_secs();
+            report_failure(&pool, &key, FailureKind::RateLimited, "被限流，暂时退避").await;
+            key = reload(&pool).await;
+
+            assert_eq!(key.failure_count, expected, "计数逐次累计");
+            assert_eq!(key.status, KeyStatus::Active, "限流永不停用密钥");
+            let cooldown = key.cooldown_until.expect("限流必须退避");
+            assert!(
+                cooldown >= before + backoff_secs(expected)
+                    && cooldown <= time::now_secs() + backoff_secs(expected),
+                "第 {expected} 次限流的退避应当是 {} 秒，实际截止 {cooldown}",
+                backoff_secs(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_failures_do_not_disable() {
+        // 上游 5xx / 网络抖动连吃 5 次：只退避，不停用——
+        // 「短期错误把好密钥永久禁掉」正是要避免的那种死法。
+        let pool = test_pool().await;
+        let mut key = seed_key(&pool, false).await;
+
+        for _ in 0..5 {
+            report_failure(&pool, &key, FailureKind::Transient, "上游返回 502").await;
+            key = reload(&pool).await;
+        }
+
+        assert_eq!(key.failure_count, 5);
+        assert_eq!(key.status, KeyStatus::Active, "上游故障不该停用密钥");
+        assert!(key.cooldown_until.is_some(), "瞬时故障也要退避");
+        assert_eq!(key.last_error.as_deref(), Some("上游返回 502"));
+    }
+
+    #[tokio::test]
+    async fn hard_failures_disable_at_threshold_with_a_reason() {
+        let pool = test_pool().await;
+        let mut key = seed_key(&pool, false).await;
+
+        for _ in 0..FAILURE_THRESHOLD {
+            report_failure(&pool, &key, FailureKind::Hard, "上游返回 401 密钥无效").await;
+            key = reload(&pool).await;
+        }
+
+        assert_eq!(key.failure_count, FAILURE_THRESHOLD);
+        assert_eq!(key.status, KeyStatus::Disabled, "连续被拒到达阈值必须停用");
+        assert_eq!(
+            key.last_error.as_deref(),
+            Some("上游返回 401 密钥无效"),
+            "停机原因要留痕，否则后台只看到「停了」"
+        );
+        assert!(key.cooldown_until.is_none(), "硬失败不退避");
+    }
+
+    #[tokio::test]
+    async fn a_single_hard_failure_does_not_disable() {
+        // 阈值是 3：一次被拒（上游打个嗹、限流误报）不该把密钥停掉。
+        let pool = test_pool().await;
+        let key = seed_key(&pool, false).await;
+
+        report_failure(&pool, &key, FailureKind::Hard, "上游返回 401").await;
+
+        let fresh = reload(&pool).await;
+        assert_eq!(fresh.status, KeyStatus::Active);
+        assert_eq!(fresh.failure_count, 1);
+    }
+
+    #[tokio::test]
+    async fn never_disable_survives_hard_failures() {
+        let pool = test_pool().await;
+        let mut key = seed_key(&pool, true).await;
+
+        for _ in 0..5 {
+            report_failure(&pool, &key, FailureKind::Hard, "上游返回 401").await;
+            key = reload(&pool).await;
+        }
+
+        assert_eq!(
+            key.failure_count, 5,
+            "计数照记——后台看得见它在连续被拒，只是不停用"
+        );
+        assert_eq!(key.status, KeyStatus::Active, "永不暂停：只记录，不改状态");
+        assert!(key.cooldown_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn success_clears_count_cooldown_and_error() {
+        let pool = test_pool().await;
+        let key = seed_key(&pool, false).await;
+
+        report_failure(&pool, &key, FailureKind::RateLimited, "被限流，暂时退避").await;
+        report_success(&pool, &key.id).await;
+
+        let fresh = reload(&pool).await;
+        assert_eq!(fresh.failure_count, 0, "成功清零失败计数");
+        assert_eq!(fresh.cooldown_until, None, "退避随之解除");
+        assert_eq!(fresh.last_error, None);
     }
 }

@@ -87,6 +87,12 @@ pub struct UpstreamBlock {
     pub api_format: ApiFormat,
     /// 调度权重：同一个模型挂在多个块上时，按平滑加权轮询分配流量。
     pub weight: u32,
+    /// 同时发往该上游的请求数上限。0 = 不限制。
+    ///
+    /// 按块配置：每个块的出口与配额彼此独立，上限也该各自权衡。
+    /// 达到上限后新请求在本块内排队（FIFO），等太久会明确失败，
+    /// 不会把客户端无限期挂住。
+    pub max_concurrency: u32,
     pub base_url: String,
     /// 该块出网使用的代理，例如 `http://127.0.0.1:7890`。
     pub proxy: Option<String>,
@@ -169,6 +175,12 @@ pub struct UpstreamKey {
     /// 明文保存：上游密钥需要能取回来发给上游，散列没有意义。
     pub secret: String,
     pub status: KeyStatus,
+    /// 免于被自动停用。
+    ///
+    /// 连续失败只记录、不改状态；429 与瞬时故障的指数退避照常生效
+    /// （退避是几十秒级的临时避让，不是停用）。手动暂停/恢复不受影响。
+    /// 管理员测试确认无效时仍会停用——那是带证据的人工动作，不是自动规则。
+    pub never_disable: bool,
     pub weight: u32,
     /// 连续失败次数，成功后清零。
     pub failure_count: u32,
@@ -200,6 +212,8 @@ pub struct BlockView {
     pub name: String,
     pub api_format: ApiFormat,
     pub weight: u32,
+    /// 同时发往该上游的请求数上限。0 = 不限制。
+    pub max_concurrency: u32,
     pub base_url: String,
     pub proxy: Option<String>,
     pub models: Vec<ModelEntry>,
@@ -210,6 +224,14 @@ pub struct BlockView {
     pub key_count: usize,
     /// 当前可调度的密钥数。
     pub available_keys: usize,
+    /// 正在发往上游的请求数（读取瞬间的快照）。
+    ///
+    /// 块不限制并发（`max_concurrency` 为 0）时为 `None`——没有闸门，
+    /// 也就没有「在飞数」这个数。
+    pub in_flight: Option<u32>,
+    /// 排在并发闸门后的请求数（快照）。涨说明在飞数常年打满，
+    /// 该考虑调大上限或加块了。
+    pub queued: Option<u32>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -223,6 +245,8 @@ pub struct UpstreamKeyView {
     pub block_id: String,
     pub secret: String,
     pub status: KeyStatus,
+    /// 免于被自动停用（失败只记录，不改状态）。
+    pub never_disable: bool,
     pub weight: u32,
     pub failure_count: u32,
     pub cooldown_until: Option<i64>,
@@ -241,6 +265,9 @@ pub struct BlockCreate {
     pub api_format: ApiFormat,
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// 同时发往该上游的请求数上限。缺省 0（不限制）。
+    #[serde(default)]
+    pub max_concurrency: u32,
     pub base_url: String,
     #[serde(default)]
     pub proxy: Option<String>,
@@ -257,6 +284,8 @@ pub struct BlockUpdate {
     pub name: Option<String>,
     pub api_format: Option<ApiFormat>,
     pub weight: Option<u32>,
+    /// 并发上限；0 表示不限制。不传则保持原值。
+    pub max_concurrency: Option<u32>,
     pub base_url: Option<String>,
     /// 显式传 `null` 表示清空代理，不传则保持原值。
     #[serde(default, deserialize_with = "double_option")]
@@ -286,6 +315,9 @@ pub struct UpstreamKeyCreate {
     pub secrets: Vec<String>,
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// 入库即免于被自动停用。缺省关闭。
+    #[serde(default)]
+    pub never_disable: bool,
 }
 
 fn default_weight() -> u32 {
@@ -296,6 +328,19 @@ fn default_weight() -> u32 {
 #[derive(Debug, Deserialize)]
 pub struct KeyIdsRequest {
     pub ids: Vec<String>,
+}
+
+/// 批量设置「永不暂停」的请求体。
+#[derive(Debug, Deserialize)]
+pub struct KeyNeverDisableRequest {
+    pub ids: Vec<String>,
+    /// 开启还是关闭；缺省开启——不带参数的请求就是「设上」。
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 /// 块内单把密钥的测试结果。

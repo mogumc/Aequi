@@ -21,6 +21,7 @@ use std::time::Instant;
 
 use futures_util::{Stream as FutureStream, StreamExt};
 use serde_json::{Value, json};
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::AppState;
 use crate::error::{Error, Result};
@@ -44,6 +45,32 @@ pub mod sse;
 ///
 /// 只为可恢复的错误重试（限流、上游 5xx、网络故障）；请求本身有问题时换密钥没有意义。
 const MAX_ATTEMPTS: usize = 3;
+
+/// 在块的并发闸门前排队等一个位子。
+///
+/// 块没配上限（`max_concurrency` 为 0）时不等，直接放行。等不到就明说
+/// 「通道繁忙」——客户端已经等了 [`upstream::GATE_WAIT_TIMEOUT`]，再重试
+/// 一遍无非是再等一遍，不如让它带着明确的错误回去。
+///
+/// 返回的位子与调用方的动作同生命周期：非流式请求持有到响应解析完，
+/// 流式请求一直持有到流结束（流占着上游连接，那正是要限流的东西）。
+pub(crate) async fn acquire_gate(
+    state: &AppState,
+    block: &UpstreamBlock,
+) -> Result<Option<OwnedSemaphorePermit>> {
+    let Some(gate) = state.upstream.gate(block) else {
+        return Ok(None);
+    };
+
+    match tokio::time::timeout(upstream::GATE_WAIT_TIMEOUT, gate.acquire()).await {
+        Ok(Ok(permit)) => Ok(Some(permit)),
+        // 超时会连排队计数一起收（守卫靠 Drop 结账），面板上的排队数不会虚高。
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(Error::UpstreamUnavailable(
+            "上游通道繁忙，排队超时".to_string(),
+        )),
+    }
+}
 
 /// 一次失败的结构化描述。
 ///
@@ -299,6 +326,9 @@ pub async fn chat_completion_stream(
     // 倍率取自最终选中的那个块的模型条目；块本身不会进到流里，这里先取出来。
     let mut multiplier_bp = credits::DEFAULT_MULTIPLIER_BP;
     let mut last_failure = None;
+    // 并发闸门的位子：建流成功后要跟着流走（流占着上游连接直到结束），
+    // 所以声明在循环外；失败轮次里它是循环内局部，随手释放。
+    let mut stream_permit: Option<OwnedSemaphorePermit> = None;
 
     'attempt: for _ in 0..MAX_ATTEMPTS {
         let block =
@@ -325,6 +355,40 @@ pub async fn chat_completion_stream(
 
         let context = Some((block.id.clone(), upstream_key.id.clone()));
 
+        // 并发闸门：块配了上限就在这里排队。位子跟本轮 attempt 同生死——
+        // 失败换块时先释放，新一轮重新排；成功则移交给流（见下方）。
+        let permit = match acquire_gate(&state, &block).await {
+            Ok(permit) => permit,
+            Err(error) => {
+                // 排队超时也落两轨日志：请求进来了却没被服务，排障时
+                // 要能看出是块堵了，而不是上游病了。
+                let user_message = sanitize_user_message(&error);
+                write_log(
+                    pool,
+                    base_log(&key, &ip, user_agent.as_deref(), started)
+                        .model(request.model.clone())
+                        .block(&block.id)
+                        .streaming()
+                        .failed(&error),
+                )
+                .await;
+                if let Err(log_error) = crate::db::usage::insert_error(
+                    pool,
+                    &key.id,
+                    &request.model,
+                    Some(block.id.as_str()),
+                    &user_message,
+                    true,
+                    time::now_secs(),
+                )
+                .await
+                {
+                    tracing::warn!(error = %log_error, "写入失败用量记录失败");
+                }
+                return Err(error);
+            }
+        };
+
         // 发送当前尝试；注入字段被上游 400 拒绝时剥离后原样重发一次
         //（'send 循环），不消耗重试名额。
         'send: loop {
@@ -341,7 +405,9 @@ pub async fn chat_completion_stream(
                     multiplier_bp = block.multiplier_bp(&request.model);
                     upstream = Some(response);
                     chosen = Some((block.id, upstream_key.id, block.api_format));
-                    break;
+                    // 位子移交给流：整条流占着这个上游连接，直到它结束。
+                    stream_permit = permit;
+                    break 'attempt;
                 }
                 Ok(response) => {
                     let status = response.status().as_u16();
@@ -370,7 +436,13 @@ pub async fn chat_completion_stream(
                     }
 
                     if status == 429 {
-                        upstream::report_rate_limited(pool, &upstream_key).await;
+                        upstream::report_failure(
+                            pool,
+                            &upstream_key,
+                            upstream::FailureKind::RateLimited,
+                            "被限流，暂时退避",
+                        )
+                        .await;
                         last_failure = Some(Failure::with_context(
                             Error::UpstreamUnavailable("上游限流".to_string()),
                             "上游限流".to_string(),
@@ -378,10 +450,26 @@ pub async fn chat_completion_stream(
                         ));
                         continue 'attempt;
                     }
-                    if status == 401 || status == 403 || status >= 500 {
+                    if status == 401 || status == 403 {
                         upstream::report_failure(
                             pool,
                             &upstream_key,
+                            upstream::FailureKind::Hard,
+                            &format!("上游返回 {status} {detail}"),
+                        )
+                        .await;
+                        last_failure = Some(Failure::with_context(
+                            Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
+                            format!("上游响应异常: 返回 {status}"),
+                            context,
+                        ));
+                        continue 'attempt;
+                    }
+                    if status >= 500 {
+                        upstream::report_failure(
+                            pool,
+                            &upstream_key,
+                            upstream::FailureKind::Transient,
                             &format!("上游返回 {status} {detail}"),
                         )
                         .await;
@@ -422,7 +510,13 @@ pub async fn chat_completion_stream(
                 }
                 Err(error) => {
                     let user_message = sanitize_user_message(&error);
-                    upstream::report_failure(pool, &upstream_key, &error.to_string()).await;
+                    upstream::report_failure(
+                        pool,
+                        &upstream_key,
+                        upstream::FailureKind::Transient,
+                        &error.to_string(),
+                    )
+                    .await;
                     last_failure = Some(Failure::with_context(error, user_message, context));
                     // 网络层失败：换一把密钥进入下一轮 attempt。
                     continue 'attempt;
@@ -484,6 +578,9 @@ pub async fn chat_completion_stream(
     let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Vec<u8>, std::io::Error>>(32);
 
     tokio::spawn(async move {
+        // 并发闸门的位子跟着流走：整条流结束（或客户端断开、转发停止）
+        // 才释放。提前 drop 会让后面的请求挤占一个还在飞的上游连接。
+        let _stream_permit = stream_permit;
         let pool = &state.store.data;
         let mut text_acc = String::new();
         // 推理内容单独累计：估算用量时与正文一起算（思考 token 也是输出
@@ -878,6 +975,17 @@ async fn dispatch(
             }
         };
 
+        // 并发闸门：块配了上限就排队等位子，位子持有到本轮结束——
+        // 重试换块时旧位子先释放，下一轮重新排。
+        let _permit = match acquire_gate(state, &block).await {
+            Ok(permit) => permit,
+            Err(error) => {
+                let context = Some((block.id.clone(), upstream_key.id.clone()));
+                let user_message = sanitize_user_message(&error);
+                return Err(Failure::with_context(error, user_message, context));
+            }
+        };
+
         let sent = send(
             &client,
             &block,
@@ -892,7 +1000,13 @@ async fn dispatch(
         match sent {
             Ok((status, response_body)) => {
                 if status == 429 {
-                    upstream::report_rate_limited(pool, &upstream_key).await;
+                    upstream::report_failure(
+                        pool,
+                        &upstream_key,
+                        upstream::FailureKind::RateLimited,
+                        "被限流，暂时退避",
+                    )
+                    .await;
                     last_failure = Some(Failure::with_context(
                         Error::UpstreamUnavailable("上游限流".to_string()),
                         "上游限流".to_string(),
@@ -903,7 +1017,7 @@ async fn dispatch(
 
                 // 密钥被拒或上游故障：记一次失败，换一把再试。
                 // 上游的原话只进管理员日志，密钥侧只看到状态码。
-                if status == 401 || status == 403 || status >= 500 {
+                if status == 401 || status == 403 {
                     let detail = response_body
                         .pointer("/error/message")
                         .and_then(Value::as_str)
@@ -911,6 +1025,29 @@ async fn dispatch(
                     upstream::report_failure(
                         pool,
                         &upstream_key,
+                        upstream::FailureKind::Hard,
+                        &format!("上游返回 {status} {detail}"),
+                    )
+                    .await;
+                    last_failure = Some(Failure::with_context(
+                        Error::UpstreamUnavailable(format!("上游返回 {status} {detail}")),
+                        format!("上游响应异常: 返回 {status}"),
+                        context,
+                    ));
+                    continue;
+                }
+
+                // 上游自己的故障（5xx）不算密钥的账：指数退避后换一把，
+                // 不停用——上游打个嗝不该把好密钥永久禁掉。
+                if status >= 500 {
+                    let detail = response_body
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    upstream::report_failure(
+                        pool,
+                        &upstream_key,
+                        upstream::FailureKind::Transient,
                         &format!("上游返回 {status} {detail}"),
                     )
                     .await;
@@ -944,7 +1081,13 @@ async fn dispatch(
                         // 200 却解析不出内容，多半是上游网关吐了故障页——
                         // 这属于上游的问题，记一次失败并换一把再试。
                         let user_message = sanitize_user_message(&error);
-                        upstream::report_failure(pool, &upstream_key, &error.to_string()).await;
+                        upstream::report_failure(
+                            pool,
+                            &upstream_key,
+                            upstream::FailureKind::Transient,
+                            &error.to_string(),
+                        )
+                        .await;
                         last_failure = Some(Failure::with_context(error, user_message, context));
                         continue;
                     }
@@ -1002,7 +1145,13 @@ async fn dispatch(
                 // 网络层面的失败同样换一把再试；reqwest 的报错可能带 URL，
                 // 不进用户能查到的表。
                 let user_message = sanitize_user_message(&error);
-                upstream::report_failure(pool, &upstream_key, &error.to_string()).await;
+                upstream::report_failure(
+                    pool,
+                    &upstream_key,
+                    upstream::FailureKind::Transient,
+                    &error.to_string(),
+                )
+                .await;
                 last_failure = Some(Failure::with_context(error, user_message, context));
             }
         }
@@ -1274,6 +1423,7 @@ mod tests {
             name: "demo".to_string(),
             api_format: format,
             weight: 1,
+            max_concurrency: 0,
             base_url: "https://demo-upstream.invalid".to_string(),
             proxy: None,
             models: Vec::new(),

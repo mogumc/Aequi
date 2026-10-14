@@ -50,6 +50,7 @@ impl TestApp {
                 name: id.to_string(),
                 api_format: ApiFormat::Openai,
                 weight: 1,
+                max_concurrency: 0,
                 base_url: DEMO_MOCK_URL.to_string(),
                 proxy: None,
                 models: models
@@ -293,6 +294,7 @@ async fn duplicate_keys_are_skipped_not_rejected() {
         aequi::model::UpstreamKeyCreate {
             secrets: secrets.into_iter().map(str::to_string).collect(),
             weight: 1,
+            never_disable: false,
         },
     );
 
