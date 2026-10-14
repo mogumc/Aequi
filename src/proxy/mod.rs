@@ -620,19 +620,15 @@ pub async fn chat_completion_stream(
                         .failed(&error),
                 )
                 .await;
-                if let Err(log_error) = crate::db::usage::insert_error(
+                record_usage_error(
                     pool,
                     &key.id,
                     &request.model,
                     Some(block.id.as_str()),
                     &user_message,
                     true,
-                    time::now_secs(),
                 )
-                .await
-                {
-                    tracing::warn!(error = %log_error, "写入失败用量记录失败");
-                }
+                .await;
                 return Err(error);
             }
         };
@@ -766,19 +762,15 @@ pub async fn chat_completion_stream(
                             .failed(&Error::UpstreamUnavailable(message.clone())),
                     )
                     .await;
-                    if let Err(log_error) = crate::db::usage::insert_error(
+                    record_usage_error(
                         pool,
                         &key.id,
                         &request.model,
                         Some(block.id.as_str()),
                         &format!("上游响应异常: 返回 {status}"),
                         true,
-                        time::now_secs(),
                     )
-                    .await
-                    {
-                        tracing::warn!(error = %log_error, "写入失败用量记录失败");
-                    }
+                    .await;
                     return Err(Error::UpstreamUnavailable(message));
                 }
                 Err(error) => {
@@ -904,19 +896,15 @@ pub async fn chat_completion_stream(
                             .failed(&error),
                     )
                     .await;
-                    if let Err(log_error) = crate::db::usage::insert_error(
+                    record_usage_error(
                         pool,
                         &key.id,
                         &model,
                         Some(block_id.as_str()),
                         &user_message,
                         true,
-                        time::now_secs(),
                     )
-                    .await
-                    {
-                        tracing::warn!(error = %log_error, "写入失败用量记录失败");
-                    }
+                    .await;
                     // 客户端已经走了就别费劲发错误帧，但仍要把已产出的
                     // 内容按估算记上去——上游那部分额度是真花掉了的。
                     if !produced {
@@ -949,19 +937,15 @@ pub async fn chat_completion_stream(
                             .failed(&error),
                     )
                     .await;
-                    if let Err(log_error) = crate::db::usage::insert_error(
+                    record_usage_error(
                         pool,
                         &key.id,
                         &model,
                         Some(block_id.as_str()),
                         &user_message,
                         true,
-                        time::now_secs(),
                     )
-                    .await
-                    {
-                        tracing::warn!(error = %log_error, "写入失败用量记录失败");
-                    }
+                    .await;
                     if !produced {
                         let _ = tx.send(Ok(error_frame(&user_message))).await;
                         return;
@@ -1078,19 +1062,15 @@ pub async fn chat_completion_stream(
                     .failed(&Error::UpstreamUnavailable(detail.clone())),
             )
             .await;
-            if let Err(log_error) = crate::db::usage::insert_error(
+            record_usage_error(
                 pool,
                 &key.id,
                 &model,
                 Some(block_id.as_str()),
                 "上游响应异常: 上游没有返回任何内容",
                 true,
-                time::now_secs(),
             )
-            .await
-            {
-                tracing::warn!(error = %log_error, "写入失败用量记录失败");
-            }
+            .await;
             // 给客户端的是不含内部细节的短句；原始载荷进日志供排障。
             let _ = tx
                 .send(Ok(error_frame("上游提前结束了响应且没有返回任何内容，请重试")))
@@ -1178,19 +1158,15 @@ pub async fn chat_completion_stream(
                         .failed_with_context(&error, Some((block_id, upstream_key_id))),
                 )
                 .await;
-                if let Err(log_error) = crate::db::usage::insert_error(
+                record_usage_error(
                     pool,
                     &key.id,
                     &model,
                     Some(failed_block.as_str()),
                     &user_message,
                     true,
-                    time::now_secs(),
                 )
-                .await
-                {
-                    tracing::warn!(error = %log_error, "写入失败用量记录失败");
-                }
+                .await;
                 if !client_gone {
                     let _ = tx.send(Ok(error_frame(&user_message))).await;
                 }
@@ -1219,6 +1195,11 @@ async fn dispatch(
 
     for _ in 0..MAX_ATTEMPTS {
         // 每一轮都重新挑：上一把密钥进入退避后，这里会自然落到下一把。
+        //
+        // 这里失败**直接返回、不留上一轮的失败**：`select_block` 的失败是
+        // 确定性的——模型没有可处理的上游、块不提供该模型、密钥无权用它，
+        // 重试不会改变结果。别顺手「对齐」成流式那样的保留上一轮，
+        // 那是给可重试失败准备的。
         let block =
             match upstream::select_block(pool, &state.upstream, &key, &request.model, only).await {
                 Ok(block) => block,
@@ -1743,7 +1724,21 @@ impl<'a> LogDraft<'a> {
         // 详情里带上重试链：只写最终那句的话，前面几次失败（尤其是
         // 「被限流后换钥匙」）在流水里查不到。
         let detail = match render_attempts(&self.attempts) {
-            Some(chain) => format!("{chain}；最终失败：{error}"),
+            // 链尾那一轮往往就是这次失败本身（比如 5xx），总结句只是把同一句话
+            // 换个前缀再说一遍；真有额外信息（比如上游原话归到链里、总结句是
+            // 给下游看的那句）才追加。
+            Some(chain) => {
+                let error_text = error.to_string();
+                let restates = self
+                    .attempts
+                    .last()
+                    .is_some_and(|last| error_text.contains(&last.reason));
+                if restates {
+                    chain
+                } else {
+                    format!("{chain}；最终失败：{error_text}")
+                }
+            }
             None => error.to_string(),
         };
 
@@ -1843,12 +1838,35 @@ pub(crate) async fn log_failure(
     )
     .await;
 
-    if let Err(error) = crate::db::usage::insert_error(
+    record_usage_error(
         pool,
         &key.id,
         model,
         failed_block.as_deref(),
         &failure.user_message,
+        stream,
+    )
+    .await;
+}
+
+/// 写一条密钥侧的脱敏失败记录（管理员侧明细由调用方自行落）。
+///
+/// 流式路径的失败点分散在十来处，每处都手抄一遍 `insert_error` 的七个参数
+/// 既啰嗦又容易漏掉「失败也要留痕」这件事——收成一个入口，调用点只剩一行。
+async fn record_usage_error(
+    pool: &sqlx::SqlitePool,
+    key_id: &str,
+    model: &str,
+    block_id: Option<&str>,
+    user_message: &str,
+    stream: bool,
+) {
+    if let Err(error) = crate::db::usage::insert_error(
+        pool,
+        key_id,
+        model,
+        block_id,
+        user_message,
         stream,
         time::now_secs(),
     )
