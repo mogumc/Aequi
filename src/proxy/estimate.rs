@@ -517,6 +517,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            reasoning: None,
             stop: Vec::new(),
         }
     }

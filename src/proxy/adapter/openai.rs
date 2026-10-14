@@ -47,6 +47,11 @@ impl Adapter for OpenAiAdapter {
         if let Some(max_tokens) = request.max_tokens {
             insert_if_present(&mut body, "max_tokens", json!(max_tokens));
         }
+        if let Some(reasoning) = &request.reasoning {
+            // 本家格式一字不改地转发：网关不换算、也不添上游没要的字段。
+            // 档位与模型世代的适配（如 gpt-5-pro 只支持 high）由上游自己报错。
+            insert_if_present(&mut body, "reasoning_effort", json!(reasoning.effort));
+        }
         if !request.stop.is_empty() {
             insert_if_present(&mut body, "stop", json!(request.stop));
         }

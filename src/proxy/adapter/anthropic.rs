@@ -79,6 +79,26 @@ impl Adapter for AnthropicAdapter {
             body.insert("tool_choice".into(), choice);
         }
 
+        if let Some(reasoning) = &request.reasoning {
+            if reasoning.is_disabled() {
+                // 官方关闭写法。此时**不**碰 effort：关了就是关了，
+                // 顺手塞个档位只会把「输出预算」也一并压下去。
+                body.insert("thinking".into(), json!({ "type": "disabled" }));
+            } else {
+                // 强度走官方顶层的 output_config.effort，值域与 OpenAI 基本同名
+                // （low/medium/high/xhigh）。
+                //
+                // 不写 `thinking` 字段：手写预算那套（type:"enabled" + budget_tokens）
+                // 在新模型上已标废弃，而且还有「≥1024 且 < max_tokens」两条硬约束——
+                // 我们的 max_tokens 兜底是 4096，硬凑预算随时会把请求顶 400。
+                // 关掉显式开关后由模型按复杂度自决，官方说明低 effort 下本就会跳过思考。
+                body.insert(
+                    "output_config".into(),
+                    json!({ "effort": effort_name(&reasoning.effort) }),
+                );
+            }
+        }
+
         UpstreamRequest {
             path: CHAT_PATH.to_string(),
             body: Some(Value::Object(body)),
@@ -428,6 +448,22 @@ fn convert_tool_choice(choice: &Value) -> Option<Value> {
             .and_then(Value::as_str)
             .map(|name| json!({ "type": "tool", "name": name })),
         _ => None,
+    }
+}
+
+/// OpenAI 档位 → Anthropic 档位。
+///
+/// 两边几乎同名（low/medium/high/xhigh），只有 `minimal` 没有对应档——
+/// Anthropic 最省的一档就是 `low`，往下没有更细的（`none` 在上层已走关闭分支，
+/// 到不了这里）。`max` 是 Anthropic 独有，入口没有对应来源。
+fn effort_name(effort: &str) -> &'static str {
+    match effort {
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" => "xhigh",
+        // low 与 minimal 都落这里。理论上到不了兜底分支（入口只放行官方六个值），
+        // 真到了也给最省档——不能把认不出的档位放大成默认的 high。
+        _ => "low",
     }
 }
 

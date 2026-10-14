@@ -8,8 +8,8 @@ use serde_json::{Map, Value, json};
 use crate::error::{Error, Result};
 
 use super::scheme::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Role, ToolCall, ToolCallDelta,
-    ToolDefinition, Usage,
+    ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Reasoning, Role, ToolCall,
+    ToolCallDelta, ToolDefinition, Usage,
 };
 
 /// 解析用户发来的对话请求。
@@ -32,6 +32,8 @@ pub fn parse_request(body: &Value) -> Result<ChatRequest> {
         messages.push(parse_message(raw)?);
     }
 
+    let reasoning = parse_reasoning(body)?;
+
     Ok(ChatRequest {
         model,
         messages,
@@ -45,7 +47,40 @@ pub fn parse_request(body: &Value) -> Result<ChatRequest> {
             .or_else(|| body.get("max_completion_tokens"))
             .and_then(Value::as_u64)
             .map(|value| value as u32),
+        reasoning,
         stop: parse_stop(body.get("stop")),
+    })
+}
+
+/// 解析思考开关与强度。
+///
+/// 只认 OpenAI 官方的 `reasoning_effort`（Chat Completions 的字段名），
+/// 兼容 Responses 风格的 `reasoning.effort` 作为兜底。
+///
+/// **不解析任何预算字段**（`thinking.budget_tokens` / `thinkingBudget` /
+/// `enable_thinking`）：预算以各家官方为准，客户端说了不算，网关也不替它猜。
+fn parse_reasoning(body: &Value) -> Result<Option<Reasoning>> {
+    let top = body.get("reasoning_effort").and_then(Value::as_str);
+    let nested = body.pointer("/reasoning/effort").and_then(Value::as_str);
+
+    let effort = match (top, nested) {
+        // 两个来源都在且不一致时不猜。
+        (Some(top), Some(nested)) if top != nested => {
+            return Err(Error::BadRequest(
+                "reasoning_effort 与 reasoning.effort 取值不一致".to_string(),
+            ));
+        }
+        (Some(top), _) => top,
+        (None, Some(nested)) => nested,
+        (None, None) => return Ok(None),
+    };
+
+    Reasoning::parse(effort).map(Some).ok_or_else(|| {
+        // 静默丢弃会让用户以为开关生效了，所以明确报错。
+        Error::BadRequest(format!(
+            "reasoning_effort 取值无法识别：{effort}（可用：{}）",
+            Reasoning::EFFORTS.join(" / ")
+        ))
     })
 }
 
@@ -388,6 +423,74 @@ mod tests {
         assert_eq!(request.tools[0].description.as_deref(), Some("包装式"));
         assert_eq!(request.tools[1].description.as_deref(), Some("扁平式"));
         assert!(request.tools[1].parameters["type"] == "object");
+    }
+
+    #[test]
+    fn reasoning_effort_is_parsed_in_both_official_shapes() {
+        let flat = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning_effort": "high"
+        });
+        assert_eq!(
+            parse_request(&flat).unwrap().reasoning.unwrap().effort,
+            "high"
+        );
+
+        // Responses 风格的 reasoning.effort 也认。
+        let nested = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning": { "effort": "low" }
+        });
+        assert_eq!(
+            parse_request(&nested).unwrap().reasoning.unwrap().effort,
+            "low"
+        );
+
+        // 两个来源一致时按同一个值走，不算冲突。
+        let both = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning_effort": "medium",
+            "reasoning": { "effort": "medium" }
+        });
+        assert_eq!(
+            parse_request(&both).unwrap().reasoning.unwrap().effort,
+            "medium"
+        );
+    }
+
+    #[test]
+    fn absent_reasoning_stays_none() {
+        // None 才是「下游没提」——adapter 靠它决定一个字段都不写。
+        let body = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        assert!(parse_request(&body).unwrap().reasoning.is_none());
+    }
+
+    #[test]
+    fn unknown_reasoning_effort_is_rejected_instead_of_dropped() {
+        // 静默丢弃会让用户以为开关生效了。
+        let body = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning_effort": "very-high"
+        });
+        assert!(parse_request(&body).is_err());
+    }
+
+    #[test]
+    fn conflicting_reasoning_sources_are_rejected() {
+        let body = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning_effort": "low",
+            "reasoning": { "effort": "high" }
+        });
+        assert!(parse_request(&body).is_err());
     }
 
     #[test]

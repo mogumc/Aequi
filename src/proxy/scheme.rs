@@ -82,6 +82,43 @@ impl Message {
     }
 }
 
+/// 思考（推理）的开关与强度。
+///
+/// 入口只认 OpenAI 官方的 `reasoning_effort`：`none` 是官方的**关闭**写法
+/// （gpt-5.1 起支持），其余档位是强度。
+///
+/// 存字符串而不是自定义枚举，是因为 openai 格式的块要按**官方拼写**原样转发，
+/// 而 `none` 与 `minimal` 在别家并没有对应档位——先归一反而要多存一层原文。
+/// 解析时会 trim 并转成小写，所以存下来的、转发出去的始终是官方拼写
+/// （官方取值本身全是小写）。
+///
+/// 预算（budget）**不在这里**：客户端说了不算，网关也不替它猜（见各 adapter）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reasoning {
+    pub effort: String,
+}
+
+impl Reasoning {
+    /// 官方取值，网关只认这六个。
+    ///
+    /// 官方还分模型世代（5.1 之前默认 medium 且不支持 none、gpt-5-pro 只支持 high），
+    /// 那些差异由上游自己报错——网关不按模型名代判。
+    pub const EFFORTS: [&'static str; 6] = ["none", "minimal", "low", "medium", "high", "xhigh"];
+
+    /// 解析强度，非官方取值一律不认（由调用方报 400）。
+    pub fn parse(effort: &str) -> Option<Self> {
+        let effort = effort.trim().to_ascii_lowercase();
+        Self::EFFORTS
+            .contains(&effort.as_str())
+            .then_some(Self { effort })
+    }
+
+    /// 客户端明确要求关闭思考。
+    pub fn is_disabled(&self) -> bool {
+        self.effort == "none"
+    }
+}
+
 /// 标准对话请求。
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
@@ -93,6 +130,8 @@ pub struct ChatRequest {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<u32>,
+    /// 思考开关与强度。`None` = 下游没提，**三家都不得写任何思考字段**。
+    pub reasoning: Option<Reasoning>,
     pub stop: Vec<String>,
 }
 

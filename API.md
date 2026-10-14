@@ -455,6 +455,30 @@ chunk 结构与 OpenAI 完全一致（`chat.completion.chunk`），流末尾依�
 `thinking_delta`、Gemini 带 `"thought": true` 标志的 part。思考 token 计入输出用量
 参与计费（上游 usage 未报时，估算同样包含推理文本）。
 
+**思考开关与强度**：请求体可带 OpenAI 官方的 `reasoning_effort`（也认 Responses 风格的
+`reasoning.effort`），取值 `none` / `minimal` / `low` / `medium` / `high` / `xhigh`；
+两个来源都给了且取值不一致 → **400**。网关按各家官方档位换算：
+
+| `reasoning_effort` | `openai` 块 | `anthropic` 块 | `google` 块 |
+|---|---|---|---|
+| 未提交 | 不写 | 不写 | 不写 |
+| `none` | `reasoning_effort: "none"` | `thinking: {type:"disabled"}` | `thinkingLevel: "MINIMAL"` ⚠️ |
+| `minimal` | 同名转发 | `output_config.effort: "low"` | `thinkingLevel: "MINIMAL"` |
+| `low` / `medium` / `high` | 同名转发 | 同名 `low` / `medium` / `high` | `LOW` / `MEDIUM` / `HIGH` |
+| `xhigh` | 同名转发 | `"xhigh"` | `HIGH`（Gemini 无此档，封顶） |
+
+- **客户端不能指定思考预算**：`budget_tokens`、`thinkingBudget`、`enable_thinking` 一律不解析，
+  预算以各家官方为准。Anthropic 的手写预算在新模型上已废弃，且要求「≥1024 且小于
+  `max_tokens`」；Gemini 3 的 `thinkingBudget` 也已废弃，官方明确会产生间歇性 400。
+- **不提交就不添加**：没给 `reasoning_effort` 时，三家的请求体里都不会出现任何思考字段。
+- Anthropic 侧非关闭档只写 `output_config.effort`，**不写 `thinking`**：思考由模型按复杂度
+  自决（官方说明低 effort 下本就会跳过思考），避免被手写预算的硬约束顶掉请求。
+- ⚠️ **Gemini 没有真正关闭思考的档位**：`none` 只能降级为 `MINIMAL`（官方原话是它
+  「与大多数查询的不思考设置相当」，**不保证关闭**），网关会记一条告警日志。
+- Gemini 的思考档位走 `thinkingLevel`，**请给 `google` 块配 Gemini 3 及以后的模型**；
+  2.5 及更早只认已废弃的 `thinkingBudget`。网关同时会带 `includeThoughts: true`
+  ——不写这个字段，思考内容不会随响应返回，出口的 `reasoning_content` 就是空的。
+
 ### `POST /v1/images/generations`
 
 OpenAI 生图协议，与对话共用认证、调度、重试与双轨日志。

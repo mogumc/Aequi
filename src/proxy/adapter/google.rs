@@ -487,6 +487,26 @@ fn build_body(request: &ChatRequest) -> Value {
     if !request.stop.is_empty() {
         config.insert("stopSequences".to_string(), json!(request.stop));
     }
+    if let Some(reasoning) = &request.reasoning {
+        // Gemini 3 起用 thinkingLevel 枚举。旧版的 thinkingBudget 在 Gemini 3 上
+        // 已废弃、官方明说会产生间歇性 400 INVALID_ARGUMENT，两者同给直接报错——
+        // 所以只给 level，不给预算数字。
+        if reasoning.is_disabled() {
+            // Gemini 没有真正的「关」：最省的 MINIMAL 官方也只说「与大多数查询的
+            // 不思考设置相当」，**不保证关闭**。降级并留痕——报错等于让 Gemini 的块
+            // 用不了「关思考」这个动作。
+            tracing::warn!("Gemini 无关闭思考的档位，已将 none 降级为 thinkingLevel=MINIMAL");
+        }
+        config.insert(
+            "thinkingConfig".to_string(),
+            json!({
+                "thinkingLevel": thinking_level(&reasoning.effort),
+                // 不写这个字段，思考 part 根本不会随响应回来，出口的
+                // reasoning_content 就永远是空的——响应侧早就按 thought 标志分流了。
+                "includeThoughts": true,
+            }),
+        );
+    }
     if let Some(choice) = &request.tool_choice {
         let mode = match choice {
             Value::String(text) => match text.as_str() {
@@ -510,6 +530,21 @@ fn build_body(request: &ChatRequest) -> Value {
     }
 
     body
+}
+
+/// OpenAI 档位 → Gemini 的 `thinkingLevel`。
+///
+/// 官方枚举就是 `MINIMAL/LOW/MEDIUM/HIGH`（REST 里写大写，见官方 curl 示例），
+/// 与 OpenAI 的档位基本一一对应；Gemini 没有 `xhigh`，封顶到 HIGH。
+/// `none` 落 MINIMAL——上游没有真正的关闭档（见 [`build_body`] 里的告警）。
+fn thinking_level(effort: &str) -> &'static str {
+    match effort {
+        "none" | "minimal" => "MINIMAL",
+        "medium" => "MEDIUM",
+        "high" | "xhigh" => "HIGH",
+        // low 与认不出的值都落这里：给最省档，不把未知档位放大成默认强度。
+        _ => "LOW",
+    }
 }
 
 /// new-api 同款的签名兜底：Gemini 3 的严格签名校验发生在工具循环里，
@@ -704,6 +739,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            reasoning: None,
             stop: vec![],
         }
     }
