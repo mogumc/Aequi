@@ -6,10 +6,11 @@
 use serde_json::{Map, Value, json};
 
 use crate::error::{Error, Result};
+use crate::proxy::diagnostics::{self, Adjustment};
 
 use super::scheme::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Role, ToolCall, ToolCallDelta,
-    ToolDefinition, Usage,
+    ChatRequest, ChatResponse, ContentPart, FinishReason, Message, Reasoning, Role,
+    TokenLimitField, ToolCall, ToolCallDelta, ToolDefinition, Usage,
 };
 
 /// 解析用户发来的对话请求。
@@ -20,6 +21,12 @@ pub fn parse_request(body: &Value) -> Result<ChatRequest> {
         .filter(|model| !model.is_empty())
         .ok_or_else(|| Error::BadRequest("请求里缺少 model".to_string()))?
         .to_string();
+
+    // 入口不认的思考相关字段：不解析，但绝不静默丢掉。
+    //
+    // 放在所有参数校验**之前**：任何一个 400 都不该吞掉这条线索——
+    // 用户最需要排查的恰恰是没成功的那次请求。
+    diagnostics::log(&model, &ignored_reasoning_fields(body));
 
     let raw_messages = body
         .get("messages")
@@ -32,6 +39,9 @@ pub fn parse_request(body: &Value) -> Result<ChatRequest> {
         messages.push(parse_message(raw)?);
     }
 
+    let (max_tokens, max_tokens_field) = parse_max_tokens(body)?;
+    let reasoning = parse_reasoning(body)?;
+
     Ok(ChatRequest {
         model,
         messages,
@@ -39,14 +49,133 @@ pub fn parse_request(body: &Value) -> Result<ChatRequest> {
         tool_choice: body.get("tool_choice").cloned(),
         temperature: body.get("temperature").and_then(Value::as_f64),
         top_p: body.get("top_p").and_then(Value::as_f64),
-        // 新旧两套字段名都认。
-        max_tokens: body
-            .get("max_tokens")
-            .or_else(|| body.get("max_completion_tokens"))
-            .and_then(Value::as_u64)
-            .map(|value| value as u32),
+        max_tokens,
+        max_tokens_field,
+        reasoning,
         stop: parse_stop(body.get("stop")),
     })
+}
+
+/// 解析输出上限，并记住客户端用的是哪个字段名。
+///
+/// 两个名字都认，但**不能合成一个就完事**：`max_tokens` 与 o 系模型不兼容，
+/// openai 格式的块必须按原名回写（见 [`TokenLimitField`]）。
+fn parse_max_tokens(body: &Value) -> Result<(Option<u32>, TokenLimitField)> {
+    let legacy = read_token_limit(body, "max_tokens")?;
+    let modern = read_token_limit(body, "max_completion_tokens")?;
+
+    match (legacy, modern) {
+        // 两个都给：`max_completion_tokens` 官方就是前者的别名，值相同说明
+        // 客户端在同时兼容新旧上游，按新字段走即可。值不同才是真的说不清。
+        (Some(legacy), Some(modern)) if legacy != modern => Err(Error::BadRequest(
+            "max_tokens 与 max_completion_tokens 取值不一致".to_string(),
+        )),
+        (_, Some(value)) => Ok((Some(value), TokenLimitField::MaxCompletionTokens)),
+        (Some(value), None) => Ok((Some(value), TokenLimitField::MaxTokens)),
+        (None, None) => Ok((None, TokenLimitField::MaxTokens)),
+    }
+}
+
+/// 读一个输出上限字段。
+///
+/// **字段存在但取值不可用时报错，不能当成「没给」**：静默降级会让用户以为
+/// 上限已经生效（实际用的是另一个值，甚至根本没有上限），而日志里什么都没有。
+/// 超出 `u32` 也一样拒绝——截断后发上去的上限会变成一个毫无关系的小数。
+fn read_token_limit(body: &Value, field: &str) -> Result<Option<u32>> {
+    let Some(value) = body.get(field) else {
+        return Ok(None);
+    };
+
+    let number = value
+        .as_u64()
+        .ok_or_else(|| Error::BadRequest(format!("{field} 必须是非负整数")))?;
+    let number = u32::try_from(number)
+        .map_err(|_| Error::BadRequest(format!("{field} 超出上限 {}", u32::MAX)))?;
+
+    Ok(Some(number))
+}
+
+/// 解析思考开关与强度。
+///
+/// 只认 OpenAI 官方的 `reasoning_effort`（Chat Completions 的字段名），
+/// 兼容 Responses 风格的 `reasoning.effort` 作为兜底。
+///
+/// **不解析任何预算字段**（`thinking.budget_tokens` / `thinkingBudget` /
+/// `enable_thinking`）：预算以各家官方为准，客户端说了不算，网关也不替它猜。
+fn parse_reasoning(body: &Value) -> Result<Option<Reasoning>> {
+    let top = body.get("reasoning_effort").and_then(Value::as_str);
+    let nested = body.pointer("/reasoning/effort").and_then(Value::as_str);
+
+    let effort = match (top, nested) {
+        // 两个来源都在且不一致时不猜。
+        (Some(top), Some(nested)) if top != nested => {
+            return Err(Error::BadRequest(
+                "reasoning_effort 与 reasoning.effort 取值不一致".to_string(),
+            ));
+        }
+        (Some(top), _) => top,
+        (None, Some(nested)) => nested,
+        (None, None) => return Ok(None),
+    };
+
+    Reasoning::parse(effort).map(Some).ok_or_else(|| {
+        // 静默丢弃会让用户以为开关生效了，所以明确报错。
+        Error::BadRequest(format!(
+            "reasoning_effort 取值无法识别：{effort}（可用：{}）",
+            Reasoning::EFFORTS.join(" / ")
+        ))
+    })
+}
+
+/// 入口不认、但生态里确实在用的思考相关字段。
+///
+/// 网关对外只承诺 OpenAI 官方子集，这些厂商私有写法一律不解析——但**不能静默丢**：
+/// 用户以为开关生效、日志里什么都没有，是最难查的一类问题。
+/// 名单覆盖实际在用的几种：vLLM 的 `chat_template_kwargs`、Qwen / GLM 的
+/// `enable_thinking` / `thinking`、Ollama 的 `think`。
+///
+/// 只留痕，不改行为：真要支持这些写法，正确的形态是按块配置放行（见 API.md）。
+fn ignored_reasoning_fields(body: &Value) -> Vec<Adjustment> {
+    // 这些在入口都是**非标**字段：网关对外只有 OpenAI 一种协议，
+    // 客户端不该在这里用 Anthropic / GLM / vLLM / Ollama 的写法。
+    // 字段名逐字对应各家的真实拼写（vLLM 是 `thinking_token_budget`，
+    // 与 DashScope 的 `thinking_budget` 是两个东西，都要收）。
+    const FIELDS: [&str; 7] = [
+        "thinking",
+        "enable_thinking",
+        "think",
+        "chat_template_kwargs",
+        "thinking_budget",
+        "thinking_token_budget",
+        "include_reasoning",
+    ];
+    // `reasoning` 对象只读 `effort`（Responses 风格的兜底来源），其余键是 OpenRouter 语义。
+    const REASONING_KEYS: [&str; 3] = ["enabled", "max_tokens", "exclude"];
+
+    let mut adjustments = Vec::new();
+    for field in FIELDS {
+        if body.get(field).is_some() {
+            adjustments.push(Adjustment::new(
+                diagnostics::FIELD_IGNORED,
+                field,
+                format!("入口不支持 `{field}`，已忽略；要调思考请用 `reasoning_effort`"),
+            ));
+        }
+    }
+
+    if let Some(reasoning) = body.get("reasoning").and_then(Value::as_object) {
+        for key in REASONING_KEYS {
+            if reasoning.contains_key(key) {
+                adjustments.push(Adjustment::new(
+                    diagnostics::FIELD_IGNORED,
+                    "reasoning",
+                    format!("`reasoning` 只读取 `effort`，`{key}` 已忽略"),
+                ));
+            }
+        }
+    }
+
+    adjustments
 }
 
 /// 把标准响应封装成 OpenAI 的响应体。
@@ -388,6 +517,213 @@ mod tests {
         assert_eq!(request.tools[0].description.as_deref(), Some("包装式"));
         assert_eq!(request.tools[1].description.as_deref(), Some("扁平式"));
         assert!(request.tools[1].parameters["type"] == "object");
+    }
+
+    #[test]
+    fn reasoning_effort_is_parsed_in_both_official_shapes() {
+        let flat = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning_effort": "high"
+        });
+        assert_eq!(
+            parse_request(&flat).unwrap().reasoning.unwrap().effort,
+            "high"
+        );
+
+        // Responses 风格的 reasoning.effort 也认。
+        let nested = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning": { "effort": "low" }
+        });
+        assert_eq!(
+            parse_request(&nested).unwrap().reasoning.unwrap().effort,
+            "low"
+        );
+
+        // 两个来源一致时按同一个值走，不算冲突。
+        let both = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning_effort": "medium",
+            "reasoning": { "effort": "medium" }
+        });
+        assert_eq!(
+            parse_request(&both).unwrap().reasoning.unwrap().effort,
+            "medium"
+        );
+    }
+
+    #[test]
+    fn unsupported_reasoning_fields_are_reported_not_silently_dropped() {
+        // 这些写法网关不解析，但必须在日志里留下痕迹——否则用户看到的是
+        // 「开关不生效、日志里什么都没有」。
+        let body = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "chat_template_kwargs": { "enable_thinking": false },
+            "enable_thinking": true,
+            "think": false,
+            "thinking_budget": 2048,
+            "thinking_token_budget": 2048,
+            "reasoning": { "effort": "high", "enabled": true }
+        });
+
+        let adjustments = ignored_reasoning_fields(&body);
+        let paths: Vec<&str> = adjustments.iter().map(|item| item.path).collect();
+        for expected in [
+            "chat_template_kwargs",
+            "enable_thinking",
+            "think",
+            "thinking_budget",
+            // vLLM 的拼写与 DashScope 不同，两个都得认。
+            "thinking_token_budget",
+            "reasoning",
+        ] {
+            assert!(paths.contains(&expected), "{expected} 必须留痕：{paths:?}");
+        }
+        // `reasoning.effort` 是支持的，只报其余键。
+        assert_eq!(
+            adjustments
+                .iter()
+                .filter(|item| item.path == "reasoning")
+                .count(),
+            1
+        );
+        // 统一用同一个 code，便于按码筛日志。
+        for adjustment in adjustments {
+            assert_eq!(adjustment.code, diagnostics::FIELD_IGNORED);
+        }
+    }
+
+    #[test]
+    fn supported_reasoning_fields_are_not_reported_as_ignored() {
+        // 只给官方字段时不该有任何「被忽略」的记录——留痕太密等于没有留痕。
+        let flat = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning_effort": "high"
+        });
+        assert!(ignored_reasoning_fields(&flat).is_empty());
+
+        // `reasoning` 只用 effort 是支持的（Responses 风格兜底）。
+        let nested = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning": { "effort": "low" }
+        });
+        assert!(ignored_reasoning_fields(&nested).is_empty());
+    }
+
+    #[test]
+    fn absent_reasoning_stays_none() {
+        // None 才是「下游没提」——adapter 靠它决定一个字段都不写。
+        let body = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        assert!(parse_request(&body).unwrap().reasoning.is_none());
+    }
+
+    #[test]
+    fn unknown_reasoning_effort_is_rejected_instead_of_dropped() {
+        // 静默丢弃会让用户以为开关生效了。
+        let body = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning_effort": "very-high"
+        });
+        assert!(parse_request(&body).is_err());
+    }
+
+    #[test]
+    fn conflicting_reasoning_sources_are_rejected() {
+        let body = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning_effort": "low",
+            "reasoning": { "effort": "high" }
+        });
+        assert!(parse_request(&body).is_err());
+    }
+
+    #[test]
+    fn token_limit_keeps_the_field_name_the_client_used() {
+        // 回归：o 系与 gpt-5 只认 max_completion_tokens。把两个名字合成一个值、
+        // 却按 max_tokens 发出去，上游会判「不支持的参数」，上限等于没设。
+        let modern = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_completion_tokens": 256
+        });
+        let request = parse_request(&modern).unwrap();
+        assert_eq!(request.max_tokens, Some(256));
+        assert_eq!(
+            request.max_tokens_field,
+            TokenLimitField::MaxCompletionTokens
+        );
+
+        let legacy = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 256
+        });
+        let request = parse_request(&legacy).unwrap();
+        assert_eq!(request.max_tokens, Some(256));
+        assert_eq!(request.max_tokens_field, TokenLimitField::MaxTokens);
+
+        // 两个都给且值相同：官方说后者是前者的别名，兼容新旧上游的客户端
+        // 会两个都发，按新字段走即可。
+        let same = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 256,
+            "max_completion_tokens": 256
+        });
+        assert_eq!(
+            parse_request(&same).unwrap().max_tokens_field,
+            TokenLimitField::MaxCompletionTokens
+        );
+
+        // 两个都给但不一样：这才是真的说不清，拒绝而不是猜。
+        let conflict = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 256,
+            "max_completion_tokens": 512
+        });
+        assert!(parse_request(&conflict).is_err());
+    }
+
+    #[test]
+    fn unusable_token_limit_is_rejected_instead_of_treated_as_absent() {
+        // 字段给了但取值用不了时报错，不能当成「没给」——否则用户以为上限生效了，
+        // 实际用的是另一个值（甚至根本没有上限），而日志里什么都没有。
+        for value in [json!("256"), json!(256.5), json!(-1), json!(null)] {
+            let body = json!({
+                "model": "gpt-x",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "max_completion_tokens": value
+            });
+            assert!(parse_request(&body).is_err(), "{value} 应当被拒绝");
+        }
+
+        // 超出 u32 也不行：截断后发上去的上限会变成一个无关的小数。
+        let overflow = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_completion_tokens": 5_000_000_000u64
+        });
+        assert!(parse_request(&overflow).is_err());
+
+        // 一个给、另一个没给时不受影响（这些本来就走得通）。
+        let single = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 256
+        });
+        assert_eq!(parse_request(&single).unwrap().max_tokens, Some(256));
     }
 
     #[test]

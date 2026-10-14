@@ -33,6 +33,7 @@ use crate::service::{billing, upstream};
 use crate::utils::{random, time};
 
 pub mod adapter;
+pub(crate) mod diagnostics;
 pub mod estimate;
 pub mod image;
 pub mod openai_in;

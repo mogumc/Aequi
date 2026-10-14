@@ -209,7 +209,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    use crate::proxy::scheme::{ChatRequest, ContentPart, FinishReason, Message, Role};
+    use crate::proxy::scheme::{
+        ChatRequest, ContentPart, FinishReason, Message, Reasoning, Role, TokenLimitField,
+    };
     use crate::service::upstream::UpstreamState;
 
     /// 一个带 system、user、可选参数的标准请求。
@@ -237,6 +239,8 @@ mod tests {
             temperature: Some(0.7),
             top_p: None,
             max_tokens: Some(1024),
+            max_tokens_field: TokenLimitField::MaxTokens,
+            reasoning: None,
             stop: vec![],
         }
     }
@@ -454,6 +458,134 @@ mod tests {
             "缓存命中在 cachedContentTokenCount，且已含在输入内，不重复计入总数"
         );
         assert_eq!(response.finish_reason, FinishReason::Stop);
+    }
+
+    /// 把 `reasoning` 设成指定档位的请求。
+    fn request_with_effort(effort: &str) -> ChatRequest {
+        let mut request = sample_request();
+        request.reasoning = Some(Reasoning::parse(effort).expect("用例只用官方取值"));
+        request
+    }
+
+    #[test]
+    fn adapters_add_no_thinking_fields_when_client_sent_none() {
+        // 下游没提交思考参数时，三家都不得凭空添加任何相关字段——
+        // 顺手塞一个默认档位就等于替用户改了行为与成本。
+        let request = sample_request();
+
+        for format in [ApiFormat::Openai, ApiFormat::Anthropic, ApiFormat::Google] {
+            let outgoing = adapter_for(format).build_chat(&request, "some-model");
+            let serialized = outgoing.body.unwrap().to_string();
+            for field in [
+                "reasoning_effort",
+                "reasoning",
+                "thinking",
+                "output_config",
+                "includeThoughts",
+            ] {
+                assert!(
+                    !serialized.contains(field),
+                    "{format:?} 在客户端没提思考时不得添加 {field}：{serialized}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn openai_forwards_reasoning_effort_verbatim() {
+        // 本家格式不换算：网关不解释档位，也不添上游没要的字段。
+        let outgoing =
+            adapter_for(ApiFormat::Openai).build_chat(&request_with_effort("xhigh"), "gpt-real");
+
+        assert_eq!(outgoing.body.as_ref().unwrap()["reasoning_effort"], "xhigh");
+    }
+
+    #[test]
+    fn anthropic_maps_effort_to_output_config() {
+        // 强度走官方顶层的 output_config.effort，且**不写 thinking**：
+        // 手写预算那套（enabled + budget_tokens）在新模型上已废弃，
+        // 还有「≥1024 且 < max_tokens」的硬约束，硬凑随时会把请求顶 400。
+        let outgoing =
+            adapter_for(ApiFormat::Anthropic).build_chat(&request_with_effort("medium"), "claude");
+        let body = outgoing.body.as_ref().unwrap();
+
+        assert_eq!(body["output_config"]["effort"], "medium");
+        assert!(
+            body.get("thinking").is_none(),
+            "非关闭档不该出现 thinking，思考由模型自决"
+        );
+    }
+
+    #[test]
+    fn anthropic_disables_thinking_without_touching_effort() {
+        // 关了就是关了：这时候再塞一个档位只会把输出预算一并压下去。
+        let outgoing =
+            adapter_for(ApiFormat::Anthropic).build_chat(&request_with_effort("none"), "claude");
+        let body = outgoing.body.as_ref().unwrap();
+
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn anthropic_minimal_falls_back_to_low() {
+        // Anthropic 没有 minimal，最省一档就是 low。
+        let outgoing =
+            adapter_for(ApiFormat::Anthropic).build_chat(&request_with_effort("minimal"), "claude");
+        assert_eq!(
+            outgoing.body.as_ref().unwrap()["output_config"]["effort"],
+            "low"
+        );
+    }
+
+    #[test]
+    fn google_maps_effort_to_thinking_level_and_asks_for_thoughts() {
+        let adapter = adapter_for(ApiFormat::Google);
+
+        let outgoing = adapter.build_chat(&request_with_effort("high"), "gemini-3.5");
+        let config = &outgoing.body.as_ref().unwrap()["generationConfig"]["thinkingConfig"];
+        assert_eq!(config["thinkingLevel"], "HIGH", "REST 里枚举写大写");
+        // 不发这个字段，思考 part 根本不会随响应回来，
+        // 出口的 reasoning_content 就永远是空的。
+        assert_eq!(config["includeThoughts"], true);
+        assert!(
+            config.get("thinkingBudget").is_none(),
+            "thinkingBudget 在 Gemini 3 上已废弃且会产生间歇 400"
+        );
+
+        // Gemini 没有 xhigh，封顶 HIGH。
+        let outgoing = adapter.build_chat(&request_with_effort("xhigh"), "gemini-3.5");
+        assert_eq!(
+            outgoing.body.as_ref().unwrap()["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
+        );
+
+        // 官方没有真正的关闭档，none 降级到 MINIMAL（最小思考）。
+        let outgoing = adapter.build_chat(&request_with_effort("none"), "gemini-3.5");
+        assert_eq!(
+            outgoing.body.as_ref().unwrap()["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "MINIMAL"
+        );
+    }
+
+    #[test]
+    fn openai_keeps_the_token_limit_field_name_the_client_used() {
+        // 回归：o 系与 gpt-5 只认 max_completion_tokens，一律回写 max_tokens
+        // 会被上游判「不支持的参数」——客户端设的上限等于没设。
+        let mut request = sample_request();
+        request.max_tokens_field = TokenLimitField::MaxCompletionTokens;
+
+        let outgoing = adapter_for(ApiFormat::Openai).build_chat(&request, "gpt-real");
+        let body = outgoing.body.as_ref().unwrap();
+        assert_eq!(body["max_completion_tokens"], 1024);
+        assert!(body.get("max_tokens").is_none());
+
+        // 用旧名字时保持原样。
+        let request = sample_request();
+        let outgoing = adapter_for(ApiFormat::Openai).build_chat(&request, "gpt-real");
+        let body = outgoing.body.as_ref().unwrap();
+        assert_eq!(body["max_tokens"], 1024);
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]

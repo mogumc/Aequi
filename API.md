@@ -455,6 +455,58 @@ chunk 结构与 OpenAI 完全一致（`chat.completion.chunk`），流末尾依�
 `thinking_delta`、Gemini 带 `"thought": true` 标志的 part。思考 token 计入输出用量
 参与计费（上游 usage 未报时，估算同样包含推理文本）。
 
+**思考开关与强度**：请求体可带 OpenAI 官方的 `reasoning_effort`（也认 Responses 风格的
+`reasoning.effort`），取值 `none` / `minimal` / `low` / `medium` / `high` / `xhigh`；
+两个来源都给了且取值不一致 → **400**。网关按各家官方档位换算：
+
+| `reasoning_effort` | `openai` 块 | `anthropic` 块 | `google` 块 |
+|---|---|---|---|
+| 未提交 | 不写 | 不写 | 不写 |
+| `none` | `reasoning_effort: "none"` | `thinking: {type:"disabled"}` | `thinkingLevel: "MINIMAL"` ⚠️ |
+| `minimal` | 同名转发 | `output_config.effort: "low"` | `thinkingLevel: "MINIMAL"` |
+| `low` / `medium` / `high` | 同名转发 | 同名 `low` / `medium` / `high` | `LOW` / `MEDIUM` / `HIGH` |
+| `xhigh` | 同名转发 | `"xhigh"` | `HIGH`（Gemini 无此档，封顶） |
+
+- **客户端不能指定思考预算**：`budget_tokens`、`thinkingBudget`、`enable_thinking` 一律不解析，
+  预算以各家官方为准。Anthropic 的手写预算在新模型上已废弃，且要求「≥1024 且小于
+  `max_tokens`」；Gemini 3 的 `thinkingBudget` 也已废弃，官方明确会产生间歇性 400。
+- **不提交就不添加**：没给 `reasoning_effort` 时，三家的请求体里都不会出现任何思考字段。
+- Anthropic 侧非关闭档只写 `output_config.effort`，**不写 `thinking`**：思考由模型按复杂度
+  自决（官方说明低 effort 下本就会跳过思考），避免被手写预算的硬约束顶掉请求。
+- ⚠️ **Gemini 没有真正关闭思考的档位**：`none` 只能降级为 `MINIMAL`（官方原话是它
+  「与大多数查询的不思考设置相当」，**不保证关闭**），网关会记一条告警日志。
+- Gemini 的思考档位走 `thinkingLevel`，**请给 `google` 块配 Gemini 3 及以后的模型**；
+  2.5 及更早只认已废弃的 `thinkingBudget`。网关同时会带 `includeThoughts: true`
+  ——不写这个字段，思考内容不会随响应返回，出口的 `reasoning_content` 就是空的。
+
+**输出上限**：`max_tokens` 与 `max_completion_tokens` 都接受，**并记住用的是哪个**——
+`o` 系与 gpt-5 只认 `max_completion_tokens`，所以 `openai` 块按**原字段名**发往上游，
+不会把新名字改写成已 deprecated 的 `max_tokens`。两个都给了且**取值不同 → 400**；
+取值相同则按 `max_completion_tokens` 走。`anthropic` 块写 `max_tokens`（上游必填，
+缺省兜 4096），`google` 块写 `maxOutputTokens`。
+
+注意三家的输出上限都是**「思考 + 正文」共用一个池子**（官方对
+`max_completion_tokens` 的定义即「含可见输出与推理 token」）：用高强度思考档时，
+按正文长度设的上限会被思考吃掉一部分，需要自己给足。
+
+**转换调整会留痕**：网关有若干处会替你改设置——档位取不到就近降级、超出值域封顶、
+入口不认的非标字段直接忽略。这些**都不静默**，统一以结构化告警落日志：
+`code` + 字段路径 + 模型名，可按 `code` 直接筛。
+
+被忽略的非标字段（逐个对应各家的真实拼写）：`thinking`、`enable_thinking`、`think`、
+`chat_template_kwargs`、`thinking_budget`、`thinking_token_budget`、`include_reasoning`，
+以及 `reasoning` 里除 `effort` 以外的键（`enabled` / `max_tokens` / `exclude`）。
+
+| `code` | 含义 |
+|---|---|
+| `effort_adjusted` | 档位被就近取到别的档（Anthropic 没有 `minimal`，落到 `low`——**比请求的更强**） |
+| `effort_capped` | 档位超出上游值域被封顶（Gemini 没有 `xhigh`，顶到 `HIGH`） |
+| `thinking_disable_unsupported` | 上游没有关闭思考的能力，降级为最省档（Gemini 的 `none` → `MINIMAL`） |
+| `reasoning_field_ignored` | 入口不认该字段，已忽略 |
+
+「不提交就不添加」说的是**不替你加**；而一旦你提交了、网关却用不上，就一定有一条记录
+——否则「设了 `high` 却只有 `medium` 的效果」这类问题在日志里查不出来。
+
 ### `POST /v1/images/generations`
 
 OpenAI 生图协议，与对话共用认证、调度、重试与双轨日志。
