@@ -40,7 +40,7 @@ pub enum FailureKind {
     Transient,
 }
 
-/// 连续失败达到该次数后自动停用密钥。
+/// 连续硬失败（密钥被上游拒绝）达到该次数后自动停用密钥。
 ///
 /// 只数 [`FailureKind::Hard`]；限流与瞬时故障走退避，不碰停用判定。
 const FAILURE_THRESHOLD: u32 = 3;

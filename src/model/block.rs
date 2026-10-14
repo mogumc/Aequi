@@ -184,7 +184,7 @@ pub struct UpstreamKey {
     pub weight: u32,
     /// 连续失败次数，成功后清零。
     pub failure_count: u32,
-    /// 429 退避的截止时间；在此之前不参与调度。
+    /// 退避截止时间（限流或瞬时故障）；在此之前不参与调度。
     pub cooldown_until: Option<i64>,
     pub last_error: Option<String>,
     pub last_used_at: Option<i64>,
