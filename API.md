@@ -160,6 +160,7 @@
 | `PATCH` | `/api/keys/{id}` | 更新：`{ name?, enabled?, allowed_models? }` |
 | `DELETE` | `/api/keys/{id}` | 删除 |
 | `POST` | `/api/keys/{id}/credits` | 调整额度：`{ credits?, unlimited? }`，只改提交的那部分 |
+| `POST` | `/api/keys/{id}/reset` | 重置密钥值：`id` 不变，返回含新明文的 `KeyView` |
 | `GET` | `/api/keys/{id}/usage` | 该密钥的用量（结构同 `/api/key/usage`） |
 
 **无限额度**：`unlimited: true` 的密钥不参与余额判定——扣费时跳过余额检查，
@@ -172,6 +173,16 @@
 金额** = 全部剩余积分，token 数照实），余额直接置 0，客户端照常拿到
 本次响应。结算完余额为 0，入口检查即拒绝后续调用，必须充值才能再用；
 单次透支的漏损上限为一笔请求。密钥被停用/删除时仍按错误处理，不记账。
+
+#### `POST /api/keys/{id}/reset`
+
+重置密钥值：`id`、积分、白名单、启用状态、用量记录都不变，换掉的只是凭证本身。
+响应是重置后的完整 `KeyView`，`secret` 里就是新明文（`key_prefix` 同步刷新）。
+旧密钥在响应之前就失效了——鉴权按 `secret` 精确匹配，没有过渡期。
+密钥不存在返回 404。
+
+持有者也能自己重置（`POST /api/key/me/reset`，见「密钥自助接口」），
+两处走的是同一条业务逻辑。
 
 #### `GET /api/keys?page=1&page_size=20&search=xxx`
 
@@ -449,13 +460,19 @@ Google 的 `generationConfig` 这类更细的开关时，配在该模型的 `ext
 
 ## 密钥自助接口
 
-以下要求访问密钥，**只读**，且只能看到自己。
+以下要求访问密钥，只能看到自己。除了重置自己的密钥，全是只读。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/key/me` | 自身信息（`KeySelfView`：`name`、`key_prefix`、`credits`、`credits_scaled`、`unlimited`、`enabled`、`allowed_models`、`created_at`、`last_used_at`——不含明文） |
+| `POST` | `/api/key/me/reset` | 重置自己的密钥：`id` 不变，旧密钥立即失效 |
 | `GET` | `/api/key/usage?limit=50&before_id=0` | 自身用量（游标分页） |
 | `GET` | `/api/key/models` | 自身可用的模型路由（脱敏视图，见下） |
+
+`POST /api/key/me/reset` 响应 `{ secret, key }`：`secret` 是新明文（**只在这个响应里
+给一次**，常规的 `KeySelfView` 不回显），`key` 是重置后的自身信息（`key_prefix` 已刷新）。
+额度、白名单、启用状态、历史用量一概不动，`id` 也不变。没有请求体。
+停用的密钥本来就过不了认证，自然也无法自助重置；管理员那边可以随时重置。
 
 `/api/key/models` 返回 `{ models: [...] }`，每条为该密钥实际可调用的
 「块/模型」路由（与 `/v1/models` 同一套白名单过滤口径，但保留结构化

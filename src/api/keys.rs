@@ -1,7 +1,7 @@
 //! 密钥管理接口（管理员专用）。
 //!
 //! 这里的每一次操作都要求管理员令牌，走的 [`crate::api::middleware::require_auth`]；
-//! 密钥体系自己那套只读接口在 [`crate::api::key_portal`]。
+//! 密钥体系自己那套自助接口（查自己、重置自己的密钥）在 [`crate::api::key_portal`]。
 
 use std::sync::Arc;
 
@@ -108,6 +108,25 @@ pub async fn set_credits(
         credits = %key.credits_scaled,
         unlimited = key.unlimited,
         "已调整密钥额度"
+    );
+
+    Ok(Json(KeyView::from(&key)))
+}
+
+/// `POST /api/keys/{id}/reset`
+///
+/// 换一串新密钥，`id` 与额度、白名单、启用状态都不变。旧密钥立即失效。
+/// 返回的就是新明文，管理员可直接转交给使用者。
+pub async fn reset(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<KeyView>> {
+    let key = keys::reset(&state.store.data, &id).await?;
+
+    tracing::info!(
+        key_id = %key.id,
+        key_prefix = %key.key_prefix,
+        "已重置访问密钥"
     );
 
     Ok(Json(KeyView::from(&key)))

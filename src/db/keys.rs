@@ -49,6 +49,10 @@ const SQL_SET_CREDITS: &str = "UPDATE api_keys SET credits_scaled = ?, updated_a
 
 const SQL_SET_UNLIMITED: &str = "UPDATE api_keys SET unlimited = ?, updated_at = ? WHERE id = ?";
 
+/// 换掉凭证本身：只动 `secret` 与展示前缀，其余字段（余额、白名单、启用状态）原样保留。
+const SQL_RESET_SECRET: &str =
+    "UPDATE api_keys SET secret = ?, key_prefix = ?, updated_at = ? WHERE id = ?";
+
 /// 原子扣费：`credits_scaled >= ?` 保证不会透支，余额不足时一条都不会命中。
 ///
 /// 用 `RETURNING` 一次拿到扣减后的余额，省掉「先查余额再更新」的竞态与额外往返。
@@ -325,6 +329,30 @@ pub async fn set_unlimited(
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(SQL_SET_UNLIMITED)
         .bind(i64::from(unlimited))
+        .bind(now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// 重置密钥值。
+///
+/// 主键不变，所以用量记录、积分与白名单都自然跟着走——换掉的只是凭证。
+/// 返回 `false` 表示没有这行（密钥已被删）。
+///
+/// `secret` 上有唯一约束，撞车会抛出约束冲突：与创建同口径，
+/// 这是低频的人工操作，重试一次即可。
+pub async fn reset_secret(
+    pool: &SqlitePool,
+    id: &str,
+    secret: &str,
+    key_prefix: &str,
+    now: i64,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(SQL_RESET_SECRET)
+        .bind(secret)
+        .bind(key_prefix)
         .bind(now)
         .bind(id)
         .execute(pool)
