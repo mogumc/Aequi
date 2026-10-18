@@ -379,6 +379,63 @@ async fn admin_reset_swaps_the_secret_but_keeps_the_identity() {
 }
 
 #[tokio::test]
+async fn admin_reset_keeps_a_disabled_key_disabled() {
+    let app = TestApp::new().await;
+    app.seed_account().await;
+    let admin_token = app.login().await;
+    let old_secret = app.create_key(&admin_token, "10").await;
+
+    let key = key_service::authenticate(app.data(), &old_secret)
+        .await
+        .unwrap();
+
+    // 先停用，再重置：重置只换凭证，不是「复活」按钮
+    key_service::update(
+        app.data(),
+        &key.id,
+        aequi::model::KeyUpdate {
+            enabled: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let body = json_body(
+        app.router()
+            .oneshot(authorized(
+                json_request(
+                    Method::POST,
+                    &format!("/api/keys/{}/reset", key.id),
+                    json!({}),
+                ),
+                &admin_token,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(body["id"], key.id.as_str(), "重置不该换主键");
+    assert_eq!(body["enabled"], false, "重置不该把停用的密钥点活");
+    assert_eq!(body["credits"], "10.0000", "余额照旧");
+
+    let new_secret = body["secret"].as_str().unwrap().to_string();
+    assert_ne!(new_secret, old_secret);
+
+    // 新串查得到记录，但仍被停用挡住；旧串连记录都查不到了
+    let error = key_service::authenticate(app.data(), &new_secret)
+        .await
+        .expect_err("停用状态应当保留");
+    assert!(matches!(error, Error::Forbidden(_)));
+
+    let error = key_service::authenticate(app.data(), &old_secret)
+        .await
+        .expect_err("旧密钥在重置后应当查不到");
+    assert!(matches!(error, Error::Unauthorized(_)));
+}
+
+#[tokio::test]
 async fn a_key_holder_can_reset_its_own_secret() {
     let app = TestApp::new().await;
     app.seed_account().await;

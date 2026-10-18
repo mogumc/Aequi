@@ -163,24 +163,15 @@ pub async fn set_credits(pool: &SqlitePool, id: &str, patch: KeyCreditsUpdate) -
 /// 主键不变：额度、白名单、启用状态、用量记录都留在原处，换掉的只是凭证本身。
 /// 旧密钥在这一刻起立刻失效（鉴权按 `secret` 精确匹配），新明文随返回值给出。
 ///
-/// 调用方拿到的 [`ApiKey`] 是最新快照，`secret` 里就是新明文——
-/// 明文只在这一次响应里出现，之后仍可从管理员接口取回。
+/// 返回值直接取自 `UPDATE ... RETURNING`，就是本次写入的那一行——
+/// 不「写完再查」，因此不存在读到并发重置结果的窗口。
 pub async fn reset(pool: &SqlitePool, id: &str) -> Result<ApiKey> {
     let plaintext = generate();
+    let prefix = prefix_of(&plaintext);
 
-    if !db::keys::reset_secret(
-        pool,
-        id,
-        &plaintext,
-        &prefix_of(&plaintext),
-        time::now_secs(),
-    )
-    .await?
-    {
-        return Err(Error::NotFound("密钥不存在".to_string()));
-    }
-
-    get(pool, id).await
+    db::keys::reset_secret(pool, id, &plaintext, &prefix, time::now_secs())
+        .await?
+        .ok_or_else(|| Error::NotFound("密钥不存在".to_string()))
 }
 
 /// 删除密钥。用量记录随外键级联清理。

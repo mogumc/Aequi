@@ -50,8 +50,15 @@ const SQL_SET_CREDITS: &str = "UPDATE api_keys SET credits_scaled = ?, updated_a
 const SQL_SET_UNLIMITED: &str = "UPDATE api_keys SET unlimited = ?, updated_at = ? WHERE id = ?";
 
 /// 换掉凭证本身：只动 `secret` 与展示前缀，其余字段（余额、白名单、启用状态）原样保留。
-const SQL_RESET_SECRET: &str =
-    "UPDATE api_keys SET secret = ?, key_prefix = ?, updated_at = ? WHERE id = ?";
+///
+/// `WHERE id = ?` 用的是主键，SET 里没有 id——**重置不可能改主键**。
+/// 用 `RETURNING` 一次拿到写入后的整行（与 [`SQL_CHARGE`] 同一手法）：
+/// 「写完再另起一条 SELECT」在两次并发重置之间会读到对方写的那串，
+/// 这里返回值恒等于本次写入的内容。
+const SQL_RESET_SECRET: &str = "\
+UPDATE api_keys SET secret = ?, key_prefix = ?, updated_at = ? WHERE id = ? \
+RETURNING id, name, secret, key_prefix, credits_scaled, unlimited, enabled, allowed_models, \
+          created_at, updated_at, last_used_at";
 
 /// 原子扣费：`credits_scaled >= ?` 保证不会透支，余额不足时一条都不会命中。
 ///
@@ -339,7 +346,7 @@ pub async fn set_unlimited(
 /// 重置密钥值。
 ///
 /// 主键不变，所以用量记录、积分与白名单都自然跟着走——换掉的只是凭证。
-/// 返回 `false` 表示没有这行（密钥已被删）。
+/// 返回写入后的整行，`None` 表示没有这行（密钥已被删）。
 ///
 /// `secret` 上有唯一约束，撞车会抛出约束冲突：与创建同口径，
 /// 这是低频的人工操作，重试一次即可。
@@ -349,15 +356,15 @@ pub async fn reset_secret(
     secret: &str,
     key_prefix: &str,
     now: i64,
-) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(SQL_RESET_SECRET)
+) -> Result<Option<ApiKey>, sqlx::Error> {
+    let row = sqlx::query(SQL_RESET_SECRET)
         .bind(secret)
         .bind(key_prefix)
         .bind(now)
         .bind(id)
-        .execute(pool)
+        .fetch_optional(pool)
         .await?;
-    Ok(result.rows_affected() > 0)
+    Ok(row.as_ref().map(map_row))
 }
 
 /// 删除密钥。用量记录随外键级联清理。
