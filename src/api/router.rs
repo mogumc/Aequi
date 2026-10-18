@@ -8,7 +8,7 @@
 //! | `/health` | 健康检查 | 公开 |
 //! | `/api/auth/login`、`/api/auth/providers` | 登录相关 | 公开 |
 //! | `/api/*`（管理员） | 账号、设备、OTP、设置、密钥管理 | 管理员令牌 |
-//! | `/api/key/*` | 密钥自助（只读） | 访问密钥 |
+//! | `/api/key/*` | 密钥自助（查自己、重置自己的密钥） | 访问密钥 |
 //! | `/web/*` | 管理面板静态资源 | 公开（页面内自行守卫） |
 //!
 //! 两套认证各挂各的中间件，**互不越权**：管理员令牌进不了 `/api/key/*`，
@@ -61,6 +61,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(keys::detail).patch(keys::update).delete(keys::delete),
         )
         .route("/keys/{id}/credits", post(keys::set_credits))
+        .route("/keys/{id}/reset", post(keys::reset))
         .route("/keys/{id}/usage", get(keys::usage))
         .route("/blocks", get(blocks::list).post(blocks::create))
         .route(
@@ -91,9 +92,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             auth_middleware::require_auth,
         ));
 
-    // 密钥自助：另一套认证，只读，且只作用在自己身上。
+    // 密钥自助：另一套认证，只作用在自己身上（查询 + 重置自己的密钥）。
     let portal = Router::new()
         .route("/key/me", get(key_portal::me))
+        .route("/key/me/reset", post(key_portal::reset))
         .route("/key/usage", get(key_portal::usage))
         .route("/key/models", get(key_portal::models))
         .route_layer(middleware::from_fn_with_state(

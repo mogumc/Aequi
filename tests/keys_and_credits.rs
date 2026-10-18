@@ -315,6 +315,202 @@ async fn the_two_auth_systems_do_not_overlap() {
 }
 
 #[tokio::test]
+async fn admin_reset_swaps_the_secret_but_keeps_the_identity() {
+    let app = TestApp::new().await;
+    app.seed_account().await;
+    let admin_token = app.login().await;
+    let old_secret = app.create_key(&admin_token, "10").await;
+
+    let key_id = key_service::authenticate(app.data(), &old_secret)
+        .await
+        .unwrap()
+        .id;
+
+    let body = json_body(
+        app.router()
+            .oneshot(authorized(
+                json_request(
+                    Method::POST,
+                    &format!("/api/keys/{key_id}/reset"),
+                    json!({}),
+                ),
+                &admin_token,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    let new_secret = body["secret"].as_str().unwrap().to_string();
+    assert_eq!(body["id"], key_id.as_str(), "重置不该换主键");
+    assert_ne!(new_secret, old_secret, "密钥值必须换掉");
+    assert!(new_secret.starts_with("ak_"));
+
+    let prefix: String = new_secret.chars().take(11).collect();
+    assert_eq!(
+        body["key_prefix"], prefix,
+        "展示前缀应跟着新密钥走，列表里才认得出来"
+    );
+    assert_eq!(body["credits"], "10.0000", "余额不重置");
+    assert_eq!(body["enabled"], true, "启用状态不重置");
+
+    // 旧密钥立刻失效，新密钥指回同一条记录（额度、白名单、用量都还在原处）
+    let error = key_service::authenticate(app.data(), &old_secret)
+        .await
+        .expect_err("旧密钥在重置后就该失效");
+    assert!(matches!(error, Error::Unauthorized(_)));
+
+    let current = key_service::authenticate(app.data(), &new_secret)
+        .await
+        .expect("新密钥应当能认证");
+    assert_eq!(current.id, key_id);
+    assert_eq!(current.credits_scaled, 10 * credits::CREDIT_SCALE);
+
+    // 重置不存在的密钥：明确报找不到，而不是静默成功
+    let response = app
+        .router()
+        .oneshot(authorized(
+            json_request(Method::POST, "/api/keys/mock-missing/reset", json!({})),
+            &admin_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn admin_reset_keeps_a_disabled_key_disabled() {
+    let app = TestApp::new().await;
+    app.seed_account().await;
+    let admin_token = app.login().await;
+    let old_secret = app.create_key(&admin_token, "10").await;
+
+    let key = key_service::authenticate(app.data(), &old_secret)
+        .await
+        .unwrap();
+
+    // 先停用，再重置：重置只换凭证，不是「复活」按钮
+    key_service::update(
+        app.data(),
+        &key.id,
+        aequi::model::KeyUpdate {
+            enabled: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let body = json_body(
+        app.router()
+            .oneshot(authorized(
+                json_request(
+                    Method::POST,
+                    &format!("/api/keys/{}/reset", key.id),
+                    json!({}),
+                ),
+                &admin_token,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(body["id"], key.id.as_str(), "重置不该换主键");
+    assert_eq!(body["enabled"], false, "重置不该把停用的密钥点活");
+    assert_eq!(body["credits"], "10.0000", "余额照旧");
+
+    let new_secret = body["secret"].as_str().unwrap().to_string();
+    assert_ne!(new_secret, old_secret);
+
+    // 新串查得到记录，但仍被停用挡住；旧串连记录都查不到了
+    let error = key_service::authenticate(app.data(), &new_secret)
+        .await
+        .expect_err("停用状态应当保留");
+    assert!(matches!(error, Error::Forbidden(_)));
+
+    let error = key_service::authenticate(app.data(), &old_secret)
+        .await
+        .expect_err("旧密钥在重置后应当查不到");
+    assert!(matches!(error, Error::Unauthorized(_)));
+}
+
+#[tokio::test]
+async fn a_key_holder_can_reset_its_own_secret() {
+    let app = TestApp::new().await;
+    app.seed_account().await;
+    let admin_token = app.login().await;
+    let old_secret = app.create_key(&admin_token, "10").await;
+
+    let key = key_service::authenticate(app.data(), &old_secret)
+        .await
+        .unwrap();
+    charge_total(app.data(), &key, "demo-model", 5_000)
+        .await
+        .unwrap();
+
+    let body = json_body(
+        app.router()
+            .oneshot(authorized(
+                json_request(Method::POST, "/api/key/me/reset", json!({})),
+                &old_secret,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    let new_secret = body["secret"].as_str().unwrap().to_string();
+    assert_ne!(new_secret, old_secret);
+    assert!(new_secret.starts_with("ak_"));
+    // 明文只在这个响应里给出一次；其余字段仍是自助视图那一套
+    assert_eq!(body["key"]["credits"], "9.5000");
+    assert!(body["key"].get("secret").is_none());
+
+    // 换掉之后旧的不认，新的能用，历史用量还挂在同一个 id 上
+    assert!(key_service::authenticate(app.data(), &old_secret).await.is_err());
+    let renewed = key_service::authenticate(app.data(), &new_secret).await.unwrap();
+    assert_eq!(renewed.id, key.id);
+    let summary = key_service::usage_summary(app.data(), &key.id).await.unwrap();
+    assert_eq!(summary.requests, 1);
+    assert_eq!(summary.credits, "0.5000");
+
+    // 但自助重置仍然只是「自己的凭证」这一件事：
+    // 管理员接口不认访问密钥，自助接口不认管理员令牌。
+    let response = app
+        .router()
+        .oneshot(authorized(
+            json_request(
+                Method::POST,
+                &format!("/api/keys/{}/reset", key.id),
+                json!({}),
+            ),
+            &new_secret,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .router()
+        .oneshot(authorized(
+            json_request(Method::POST, "/api/key/me/reset", json!({})),
+            &admin_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // 无凭证同样拒绝
+    let response = app
+        .router()
+        .oneshot(json_request(Method::POST, "/api/key/me/reset", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn charging_deducts_credits_and_records_usage() {
     let app = TestApp::new().await;
     let key = app.make_key("1", Vec::new()).await;

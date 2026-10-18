@@ -1,12 +1,13 @@
 //! 密钥自助接口。
 //!
-//! 只读：能看自己的信息和用量，**不具备任何管理能力**，
-//! 也无法触达管理员体系的任何数据。
+//! 能看自己的信息和用量、拉一份脱敏的模型路由，以及**重置自己的密钥**。
+//! 能做的仅限这些——碰不到管理员体系的任何数据，也改不了自己的额度与白名单。
 
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Extension, Query, State};
+use serde::Serialize;
 
 use crate::AppState;
 use crate::api::key_auth::KeyContext;
@@ -18,6 +19,39 @@ use crate::service::{keys, upstream};
 /// `GET /api/key/me`
 pub async fn me(Extension(context): Extension<KeyContext>) -> Json<KeySelfView> {
     Json(KeySelfView::from(&context.key))
+}
+
+/// 自助重置的响应。
+///
+/// 明文只在这个响应里出现一次：常规的自助视图刻意不带明文，
+/// 但重置后旧密钥立刻失效，不给出新的那串就等于把人锁在门外。
+#[derive(Debug, Serialize)]
+pub struct KeyResetResponse {
+    pub secret: String,
+    /// 重置后的自身信息（`key_prefix` 已同步为新值）。
+    pub key: KeySelfView,
+}
+
+/// `POST /api/key/me/reset`
+///
+/// 用当前密钥认证，换一串新的、`id` 不变，额度与白名单照旧。
+/// 这是一次不可逆操作：响应之后旧密钥就认证不过了。
+pub async fn reset(
+    State(state): State<Arc<AppState>>,
+    Extension(context): Extension<KeyContext>,
+) -> Result<Json<KeyResetResponse>> {
+    let key = keys::reset(&state.store.data, &context.key.id).await?;
+
+    tracing::info!(
+        key_id = %key.id,
+        key_prefix = %key.key_prefix,
+        "访问密钥持有者自助重置了密钥"
+    );
+
+    Ok(Json(KeyResetResponse {
+        secret: key.secret.clone(),
+        key: KeySelfView::from(&key),
+    }))
 }
 
 /// `GET /api/key/usage`
