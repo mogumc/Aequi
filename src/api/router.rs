@@ -87,6 +87,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/blocks/{id}/models/fetch", post(blocks::fetch_models))
         .route("/logs", get(logs::list))
         .route("/stats", get(stats::overview))
+        .route("/stats/dashboard", get(stats::dashboard))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware::require_auth,

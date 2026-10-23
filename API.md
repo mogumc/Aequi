@@ -108,6 +108,31 @@
 - `trend` 按**本地时区**切天，只包含有记录的天（无记录的日期不补零）。
 - `usage.requests` 含失败请求，`failed` 是其中失败的数量。
 
+#### `GET /api/stats/dashboard`
+
+首页专用快照，**不收任何参数**——「今天从几点算起」「小时桶怎么切」这类口径由服务端定，客户端不该自己算一遍，否则同一个页面上会出现两个「今天」。
+
+```json
+{
+  "today": { "requests": 42, "success": 39, "failed": 3 },
+  "recent_errors": [
+    { "id": 88, "created_at": 1761000000, "model": "gpt-x", "block_id": "demo-block", "error_detail": "共 3 次尝试：… 最终失败：上游返回 502" }
+  ],
+  "keys": { "total": 5, "enabled": 4 },
+  "low_credits": {
+    "threshold": "5.0000", "threshold_scaled": 50000, "count": 2,
+    "keys": [ { "id": "k1", "name": "演示", "credits": "1.0000", "credits_scaled": 10000 } ]
+  },
+  "hourly": [ { "hour": 1760997600, "requests": 7, "failed": 1 } ]
+}
+```
+
+- 数据源是 `proxy_logs`（管理员详细日志），一次请求一行；**聚合全在库里完成**，不再把日志正文搬进浏览器。
+- `today`：**本地时区**当天 0 点起，三个数一次算完（`success + failed` 应等于 `requests`）。
+- `recent_errors`：最近 3 条失败的摘要，新的在前；只有 `model`、`block_id`、`error_detail` 这几个首页要显示的字段，想看 IP/UA/耗时去 `/api/logs`。走 `(status, id)` 索引，不会因为最近没有错误而扫全表。
+- `low_credits`：**启用的、非无限额度**的密钥中余额低于 5 积分的。`count` 是命中总数，`keys` 只给余额最低的 20 把（升序），`threshold` 由服务端给出，界面上直接显示这个数。
+- `hourly`：最近 **24 个整点**，从旧到新，固定 24 项；**没有流量的小时补 0**（`requests`/`failed` 都为 0），最后一个桶是当前这一小时（尚未走完）。`hour` 是该小时的起点（Unix 秒，UTC 整点；对整小时偏移的时区即本地整点）。
+
 ### 账号与会话
 
 | 方法 | 路径 | 说明 |

@@ -37,6 +37,17 @@ WHERE (? IS NULL OR name LIKE '%' || ? || '%' OR key_prefix LIKE '%' || ? || '%'
 const SQL_COUNT_ENABLED: &str = "\
 SELECT COUNT(*) AS total, COALESCE(SUM(enabled), 0) AS enabled FROM api_keys";
 
+/// 余额偏低的启用密钥计数（与列表同口径）。
+const SQL_COUNT_LOW_CREDITS: &str = "\
+SELECT COUNT(*) FROM api_keys \
+WHERE enabled = 1 AND unlimited = 0 AND credits_scaled < ?";
+
+/// 余额偏低的启用密钥明细，余额低的在前。
+const SQL_LIST_LOW_CREDITS: &str = "\
+SELECT id, name, credits_scaled FROM api_keys \
+WHERE enabled = 1 AND unlimited = 0 AND credits_scaled < ? \
+ORDER BY credits_scaled ASC, id ASC LIMIT ?";
+
 const SQL_INSERT: &str = "\
 INSERT INTO api_keys \
 (id, name, secret, key_prefix, credits_scaled, unlimited, enabled, allowed_models, created_at, updated_at) \
@@ -187,6 +198,44 @@ pub async fn count_enabled(pool: &SqlitePool) -> Result<crate::model::ResourceCo
         total: row.get("total"),
         enabled: row.get("enabled"),
     })
+}
+
+/// 余额低于 `threshold` 的启用密钥有多少把。
+///
+/// 无限额度的密钥不参与余额判定，停用的也不提醒——两者都不该出现在
+/// 首页的额度预警里。
+pub async fn count_low_credits(pool: &SqlitePool, threshold: i64) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query(SQL_COUNT_LOW_CREDITS)
+        .bind(threshold)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.get(0))
+}
+
+/// 余额最低的几把启用密钥，从低到高——最危险的排在最前面。
+pub async fn list_low_credits(
+    pool: &SqlitePool,
+    threshold: i64,
+    limit: i64,
+) -> Result<Vec<crate::model::LowCreditKey>, sqlx::Error> {
+    let rows = sqlx::query(SQL_LIST_LOW_CREDITS)
+        .bind(threshold)
+        .bind(limit.clamp(1, 50))
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let credits_scaled: i64 = row.get("credits_scaled");
+            crate::model::LowCreditKey {
+                id: row.get("id"),
+                name: row.get("name"),
+                credits: crate::model::credits::format_credits(credits_scaled),
+                credits_scaled,
+            }
+        })
+        .collect())
 }
 
 /// 创建密钥。

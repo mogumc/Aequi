@@ -273,6 +273,7 @@ pub async fn migrate_data(pool: &SqlitePool) -> anyhow::Result<()> {
         ("proxy_logs", PROXY_LOGS_DDL),
         ("idx_proxy_logs_time", PROXY_LOGS_TIME_INDEX),
         ("idx_proxy_logs_id", PROXY_LOGS_ID_INDEX),
+        ("idx_proxy_logs_status_id", PROXY_LOGS_STATUS_ID_INDEX),
     ] {
         sqlx::query(ddl)
             .execute(pool)
@@ -450,6 +451,12 @@ const USAGE_KEY_ID_INDEX: &str =
 /// 管理端日志的游标查询只有 `id < ?` + 各筛选列，id 序扫描是唯一免排序路径。
 const PROXY_LOGS_ID_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_proxy_logs_id ON proxy_logs(id)";
+
+/// 首页「最近几条错误」是 `WHERE status = 'error' ORDER BY id DESC LIMIT 3`。
+/// 没有这个索引就得倒序扫全表直到凑够三条——错误稀疏时等于每次刷新全表扫，
+/// 正是首页慢的原因之一。
+const PROXY_LOGS_STATUS_ID_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_proxy_logs_status_id ON proxy_logs(status, id)";
 
 #[cfg(test)]
 mod tests {
