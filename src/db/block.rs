@@ -263,26 +263,73 @@ pub async fn set_key_status(
     Ok(())
 }
 
-/// 更新密钥的运行时状态（失败计数、退避、错误信息）。
-pub async fn update_key_runtime(
-    executor: &mut SqliteConnection,
+/// 记一次「被拒」：失败计数与原因，不动退避。
+///
+/// 硬失败（401/403）专用。**不碰 `cooldown_until`** 是刻意的：并发下另一个
+/// 请求可能刚给这把钥匙挂上 429 退避，这里写成 NULL 会把那个窗口抹掉，
+/// 下一个请求立刻又去撞限流。
+pub async fn note_key_failure(
+    pool: &SqlitePool,
     key_id: &str,
     failure_count: u32,
-    cooldown_until: Option<i64>,
-    last_error: Option<String>,
+    last_error: &str,
     now: i64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE upstream_keys \
-         SET failure_count = ?, cooldown_until = ?, last_error = ?, updated_at = ? \
+         SET failure_count = ?, last_error = ?, updated_at = ? \
          WHERE id = ?",
     )
     .bind(failure_count as i64)
+    .bind(last_error)
+    .bind(now)
+    .bind(key_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 只记一条错误信息，不动失败计数与退避。
+///
+/// 给「上游自己的毛病」用：后台要看得见最近一次失败的原因，但那不是这把
+/// 钥匙的账——计数别涨、退避别挂，否则一个坏掉的上游能把整块钥匙按住。
+pub async fn note_key_error(
+    pool: &SqlitePool,
+    key_id: &str,
+    last_error: &str,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE upstream_keys SET last_error = ?, updated_at = ? WHERE id = ?")
+        .bind(last_error)
+        .bind(now)
+        .bind(key_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// 挂上一次退避：只写退避截止与原因，不动失败计数。
+///
+/// 失败计数记的是「密钥被拒」（401/403），限流的连续次数活在进程内
+/// （见 `service::upstream::UpstreamState::bump_rate_limit`）。两者混在一起，
+/// 连吃几次限流再挨一次 401 就够把钥匙停用——负载问题不该替密钥有效性作证。
+pub async fn note_key_cooldown(
+    pool: &SqlitePool,
+    key_id: &str,
+    cooldown_until: i64,
+    last_error: &str,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE upstream_keys \
+         SET cooldown_until = ?, last_error = ?, updated_at = ? \
+         WHERE id = ?",
+    )
     .bind(cooldown_until)
     .bind(last_error)
     .bind(now)
     .bind(key_id)
-    .execute(&mut *executor)
+    .execute(pool)
     .await?;
     Ok(())
 }

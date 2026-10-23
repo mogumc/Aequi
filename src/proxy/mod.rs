@@ -650,7 +650,7 @@ pub async fn chat_completion_stream(
                     // 上游用这把钥匙接下来并开始返回了：算一次成功使用。
                     // 流式这条路以前漏了这一步——`last_used_at` 不更新、
                     // 失败计数也不清零，只有非流式与生图在记。
-                    upstream::report_success(pool, &upstream_key.id).await;
+                    upstream::report_success(pool, &state.upstream, &upstream_key.id).await;
                     upstream = Some(response);
                     chosen = Some((block.id, upstream_key.id, block.api_format));
                     // 位子移交给流：整条流占着这个上游连接，直到它结束。
@@ -688,6 +688,7 @@ pub async fn chat_completion_stream(
                     if status == 429 {
                         let wait = upstream::report_failure(
                             pool,
+                            &state.upstream,
                             &upstream_key,
                             upstream::FailureKind::RateLimited,
                             &format!("上游返回 429 {detail}"),
@@ -712,6 +713,7 @@ pub async fn chat_completion_stream(
                     if status == 401 || status == 403 {
                         upstream::report_failure(
                             pool,
+                            &state.upstream,
                             &upstream_key,
                             upstream::FailureKind::Hard,
                             &format!("上游返回 {status} {detail}"),
@@ -732,11 +734,13 @@ pub async fn chat_completion_stream(
                     if status >= 500 {
                         upstream::report_failure(
                             pool,
+                            &state.upstream,
                             &upstream_key,
                             upstream::FailureKind::Transient,
                             &format!("上游返回 {status} {detail}"),
-                            // 503 也常见带 Retry-After，有就照它等。
-                            retry_after,
+                            // 上游故障不退避（只留痕），它给的等待提示
+                            // 也就无处可用——跟着一起按住等于替坏上游关块。
+                            None,
                         )
                         .await;
                         last_failure = Some(record_retry(
@@ -777,6 +781,7 @@ pub async fn chat_completion_stream(
                     let user_message = sanitize_user_message(&error);
                     upstream::report_failure(
                         pool,
+                        &state.upstream,
                         &upstream_key,
                         upstream::FailureKind::Transient,
                         &error.to_string(),
@@ -1278,6 +1283,7 @@ async fn dispatch(
                         .unwrap_or("");
                     let wait = upstream::report_failure(
                         pool,
+                        &state.upstream,
                         &upstream_key,
                         upstream::FailureKind::RateLimited,
                         &format!("上游返回 429 {detail}"),
@@ -1311,6 +1317,7 @@ async fn dispatch(
                         .unwrap_or("");
                     upstream::report_failure(
                         pool,
+                        &state.upstream,
                         &upstream_key,
                         upstream::FailureKind::Hard,
                         &format!("上游返回 {status} {detail}"),
@@ -1331,8 +1338,9 @@ async fn dispatch(
                     continue;
                 }
 
-                // 上游自己的故障（5xx）不算密钥的账：退避后换一把，
-                // 不停用——上游打个嗝不该把好密钥永久禁掉。
+                // 上游自己的故障（5xx）不算密钥的账：只留痕、换一把重试，
+                // 不退避不停用——给它挂退避的话，一次请求连试三把就等于
+                // 把整块钥匙按住，上游缓过来也没人能试。
                 if status >= 500 {
                     let detail = response_body
                         .pointer("/error/message")
@@ -1340,11 +1348,12 @@ async fn dispatch(
                         .unwrap_or("");
                     upstream::report_failure(
                         pool,
+                        &state.upstream,
                         &upstream_key,
                         upstream::FailureKind::Transient,
                         &format!("上游返回 {status} {detail}"),
-                        // 503 也常见带 Retry-After，有就照它等。
-                        retry_after,
+                        // 不退避，响应头里的 Retry-After 也无处可用。
+                        None,
                     )
                     .await;
                     last_failure = Some(record_retry(
@@ -1382,6 +1391,7 @@ async fn dispatch(
                         let user_message = sanitize_user_message(&error);
                         upstream::report_failure(
                             pool,
+                            &state.upstream,
                             &upstream_key,
                             upstream::FailureKind::Transient,
                             &error.to_string(),
@@ -1396,7 +1406,7 @@ async fn dispatch(
                         continue;
                     }
                 };
-                upstream::report_success(pool, &upstream_key.id).await;
+                upstream::report_success(pool, &state.upstream, &upstream_key.id).await;
 
                 // 上游没报用量、或只报了一半，就用本地估算补齐缺的那项，
                 // 记账不能被钻空子。估算口径含推理文本——思考模型的思考
@@ -1451,6 +1461,7 @@ async fn dispatch(
                 let user_message = sanitize_user_message(&error);
                 upstream::report_failure(
                     pool,
+                    &state.upstream,
                     &upstream_key,
                     upstream::FailureKind::Transient,
                     &error.to_string(),

@@ -33,6 +33,35 @@ WHERE (? IS NULL OR created_at >= ?) \
   AND (? = 0 OR id < ?) \
 ORDER BY id DESC LIMIT ?";
 
+/// 首页看板：一段时间内的成功/失败计数。
+///
+/// 三个数一次算完——首页要的就是这三个，别让调用方再拿一次 COUNT 去减。
+const SQL_COUNTERS_SINCE: &str = "\
+SELECT COUNT(*)                              AS requests, \
+       COALESCE(SUM(status = 'success'), 0)  AS success, \
+       COALESCE(SUM(status = 'error'), 0)    AS failed \
+FROM proxy_logs WHERE created_at >= ?";
+
+/// 首页看板：按整点聚合。
+///
+/// 整点取 UTC 整点（`created_at` 整除 3600）——对整小时偏移的时区就等于本地
+/// 整点，且不依赖 SQLite 的本地时区换算；缺失的小时由调用方补 0。
+const SQL_HOURLY_SINCE: &str = "\
+SELECT (created_at / 3600) * 3600        AS hour, \
+       COUNT(*)                          AS requests, \
+       COALESCE(SUM(status = 'error'), 0) AS failed \
+FROM proxy_logs WHERE created_at >= ? \
+GROUP BY hour ORDER BY hour";
+
+/// 首页看板：最近几条失败。
+///
+/// 走 `idx_proxy_logs_status_id`（status, id）：定位到 `error` 段后倒序取
+/// 前几条即止，不会因为「最近没有错误」而把整张表扫一遍。
+const SQL_RECENT_ERRORS: &str = "\
+SELECT id, created_at, model, block_id, error_detail \
+FROM proxy_logs WHERE status = 'error' \
+ORDER BY id DESC LIMIT ?";
+
 const SQL_PURGE: &str = "DELETE FROM proxy_logs WHERE created_at <= ?";
 
 /// 单次查询能返回的最大日志条数。
@@ -139,4 +168,59 @@ pub async fn list_filtered(
 pub async fn purge_before(pool: &SqlitePool, cutoff: i64) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(SQL_PURGE).bind(cutoff).execute(pool).await?;
     Ok(result.rows_affected())
+}
+
+/// 从 `since`（含）起、按状态分开的请求计数。
+pub async fn counters_since(
+    pool: &SqlitePool,
+    since: i64,
+) -> Result<crate::model::DayCounters, sqlx::Error> {
+    let row = sqlx::query(SQL_COUNTERS_SINCE).bind(since).fetch_one(pool).await?;
+    Ok(crate::model::DayCounters {
+        requests: row.get("requests"),
+        success: row.get("success"),
+        failed: row.get("failed"),
+    })
+}
+
+/// 从 `since`（含）起的按整点聚合，按时间升序；没有流量的整点不会出现。
+pub async fn hourly_since(
+    pool: &SqlitePool,
+    since: i64,
+) -> Result<Vec<crate::model::HourlyPoint>, sqlx::Error> {
+    let rows = sqlx::query(SQL_HOURLY_SINCE)
+        .bind(since)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows
+        .iter()
+        .map(|row| crate::model::HourlyPoint {
+            hour: row.get("hour"),
+            requests: row.get("requests"),
+            failed: row.get("failed"),
+        })
+        .collect())
+}
+
+/// 最近几条失败的摘要，新的在前。
+pub async fn recent_errors(
+    pool: &SqlitePool,
+    limit: i64,
+) -> Result<Vec<crate::model::RecentError>, sqlx::Error> {
+    let rows = sqlx::query(SQL_RECENT_ERRORS)
+        .bind(limit.clamp(1, 50))
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows
+        .iter()
+        .map(|row| crate::model::RecentError {
+            id: row.get("id"),
+            created_at: row.get("created_at"),
+            model: row.get("model"),
+            block_id: row.get("block_id"),
+            error_detail: row.get("error_detail"),
+        })
+        .collect())
 }

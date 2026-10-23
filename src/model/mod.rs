@@ -18,5 +18,8 @@ pub use block::{
 pub use key::{ApiKey, KeyCreate, KeyCreditsUpdate, KeySelfView, KeyUpdate, KeyView};
 pub use log::{NewProxyLog, ProxyLog, ProxyLogView};
 pub use session::{NewSession, Session, SessionView};
-pub use stats::{ResourceCount, StatsCounters, StatsPoint, StatsView};
+pub use stats::{
+    DashboardView, DayCounters, HourlyPoint, LowCreditAlert, LowCreditKey, RecentError,
+    ResourceCount, StatsCounters, StatsPoint, StatsView,
+};
 pub use usage::{UsageRecord, UsageSummary, UsageView};

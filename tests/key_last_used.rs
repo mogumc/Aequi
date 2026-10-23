@@ -115,17 +115,9 @@ impl TestApp {
 
     /// 先给这把钥匙记上「用过两次、还在报错」，用来验证成功会把它们清掉。
     async fn seed_prior_failures(&self, key_id: &str) {
-        let mut connection = self.data().acquire().await.expect("取连接失败");
-        db::block::update_key_runtime(
-            connection.as_mut(),
-            key_id,
-            2,
-            None,
-            Some("旧错误：上游返回 502".to_string()),
-            time::now_secs(),
-        )
-        .await
-        .expect("写入旧失败失败");
+        db::block::note_key_failure(self.data(), key_id, 2, "旧错误：上游返回 502", time::now_secs())
+            .await
+            .expect("写入旧失败失败");
     }
 }
 

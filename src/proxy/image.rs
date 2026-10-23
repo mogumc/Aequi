@@ -257,6 +257,7 @@ async fn dispatch(
             let user_message = sanitize_user_message(&error);
             upstream::report_failure(
                 pool,
+                &state.upstream,
                 &upstream_key,
                 upstream::FailureKind::Transient,
                 &error.to_string(),
@@ -277,6 +278,7 @@ async fn dispatch(
         let detail = error_message(&response_body);
         let wait = upstream::report_failure(
             pool,
+            &state.upstream,
             &upstream_key,
             upstream::FailureKind::RateLimited,
             &format!("上游返回 429 {detail}"),
@@ -302,6 +304,7 @@ async fn dispatch(
         let detail = error_message(&response_body);
         upstream::report_failure(
             pool,
+            &state.upstream,
             &upstream_key,
             upstream::FailureKind::Hard,
             &format!("上游返回 {status} {detail}"),
@@ -316,16 +319,18 @@ async fn dispatch(
         ));
     }
 
-    // 上游自己的故障（5xx）不算密钥的账：退避但不停用。
+    // 上游自己的故障（5xx）不算密钥的账：只留痕，不退避不停用——
+    // 按住一把钥匙只会让下一个请求撞上另一把，整块被同一个坏上游拖住。
     if status >= 500 {
         let detail = error_message(&response_body);
         upstream::report_failure(
             pool,
+            &state.upstream,
             &upstream_key,
             upstream::FailureKind::Transient,
             &format!("上游返回 {status} {detail}"),
-            // 503 也常见带 Retry-After，有就照它等。
-            retry_after,
+            // 不退避，响应头里的 Retry-After 也无处可用。
+            None,
         )
         .await;
         return Err(Failure::with_context(
@@ -351,6 +356,7 @@ async fn dispatch(
         let user_message = sanitize_user_message(&error);
         upstream::report_failure(
             pool,
+            &state.upstream,
             &upstream_key,
             upstream::FailureKind::Transient,
             &error.to_string(),
@@ -361,7 +367,7 @@ async fn dispatch(
         return Err(Failure::with_context(error, user_message, context));
     };
 
-    upstream::report_success(pool, &upstream_key.id).await;
+    upstream::report_success(pool, &state.upstream, &upstream_key.id).await;
 
     // gpt-image-1 等新一代接口自带 usage；DALL-E 系列按张估算。
     let usage = parse_usage(&response_body).unwrap_or_else(|| {
