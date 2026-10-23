@@ -1410,22 +1410,10 @@ async fn report_hard_failure(pool: &SqlitePool, key: &UpstreamKey, detail: &str,
         );
     }
 
-    let mut connection = match pool.acquire().await {
-        Ok(connection) => connection,
-        Err(error) => {
-            tracing::warn!(key_id = %key.id, error = %error, "获取连接失败");
-            return;
-        }
-    };
-    if let Err(error) = db::block::update_key_runtime(
-        connection.as_mut(),
-        &key.id,
-        failures,
-        None,
-        Some(detail.to_string()),
-        now,
-    )
-    .await
+    // 只写计数与原因：并发下另一个请求可能刚给这把钥匙挂上 429 退避，
+    // 这里连退避一起写会把那个窗口抹掉（见 `db::block::note_key_failure`）。
+    if let Err(error) =
+        db::block::note_key_failure(pool, &key.id, failures, detail, now).await
     {
         tracing::warn!(key_id = %key.id, error = %error, "记录密钥失败状态失败");
     }
@@ -1443,20 +1431,11 @@ async fn disable_key(
 ) -> Result<()> {
     let now = time::now_secs();
 
-    let mut connection = pool.acquire().await?;
-    // `set_key_status` 只在转 active 时清场，disabled 原样保留——所以这里
-    // 写下去的计数与原因就是后台看到的最终值。
-    db::block::update_key_runtime(
-        connection.as_mut(),
-        &key.id,
-        failures,
-        None,
-        Some(detail.to_string()),
-        now,
-    )
-    .await?;
-    drop(connection);
-
+    // 顺序无妨：`set_key_status` 只在转 active 时清场，disabled 原样保留——
+    // 所以这里写下去的计数与原因就是后台看到的最终值。反而**不能**在这里
+    // 清退避：停用只是不再调度，退避窗口留着，真被恢复时 set_key_status
+    // 会替它清掉。
+    db::block::note_key_failure(pool, &key.id, failures, detail, now).await?;
     db::block::set_key_status(pool, &key.block_id, &key.id, KeyStatus::Disabled, now).await?;
     Ok(())
 }
@@ -2132,6 +2111,39 @@ mod tests {
         );
         assert_eq!(key.status, KeyStatus::Active, "永不暂停：只记录，不改状态");
         assert!(key.cooldown_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_hard_failure_does_not_clear_an_active_cooldown() {
+        // 并发窗口：这把钥匙刚被 429 挂上退避，另一个在退避生效前就选中它的
+        // 请求回了个 401。硬失败只该记自己的账，不能把退避窗口抹掉——
+        // 抹掉的下场是下一个请求立刻又去撞限流。
+        let pool = test_pool().await;
+        let state = test_state();
+        let key = seed_key(&pool, false).await;
+
+        report_failure(
+            &pool,
+            &state,
+            &key,
+            FailureKind::RateLimited,
+            "被限流，暂时退避",
+            Some(45),
+        )
+        .await;
+        let cooling = reload(&pool).await;
+        let until = cooling.cooldown_until.expect("限流必须退避");
+
+        report_failure(&pool, &state, &cooling, FailureKind::Hard, "上游返回 401", None).await;
+
+        let fresh = reload(&pool).await;
+        assert_eq!(
+            fresh.cooldown_until,
+            Some(until),
+            "硬失败不该动退避窗口"
+        );
+        assert_eq!(fresh.failure_count, 1, "被拒的计数照记");
+        assert_eq!(fresh.last_error.as_deref(), Some("上游返回 401"));
     }
 
     #[tokio::test]

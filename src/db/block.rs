@@ -263,26 +263,28 @@ pub async fn set_key_status(
     Ok(())
 }
 
-/// 更新密钥的运行时状态（失败计数、退避、错误信息）。
-pub async fn update_key_runtime(
-    executor: &mut SqliteConnection,
+/// 记一次「被拒」：失败计数与原因，不动退避。
+///
+/// 硬失败（401/403）专用。**不碰 `cooldown_until`** 是刻意的：并发下另一个
+/// 请求可能刚给这把钥匙挂上 429 退避，这里写成 NULL 会把那个窗口抹掉，
+/// 下一个请求立刻又去撞限流。
+pub async fn note_key_failure(
+    pool: &SqlitePool,
     key_id: &str,
     failure_count: u32,
-    cooldown_until: Option<i64>,
-    last_error: Option<String>,
+    last_error: &str,
     now: i64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE upstream_keys \
-         SET failure_count = ?, cooldown_until = ?, last_error = ?, updated_at = ? \
+         SET failure_count = ?, last_error = ?, updated_at = ? \
          WHERE id = ?",
     )
     .bind(failure_count as i64)
-    .bind(cooldown_until)
     .bind(last_error)
     .bind(now)
     .bind(key_id)
-    .execute(&mut *executor)
+    .execute(pool)
     .await?;
     Ok(())
 }
