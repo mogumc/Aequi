@@ -4,7 +4,8 @@
 //! 按模型挑块、块内挑密钥，都走平滑加权轮询。
 //!
 //! 密钥的生命周期是自治的：请求成功清零失败计数；被限流（429）时按上游
-//! 提示（`Retry-After`）或连续限流次数退避；只有密钥被上游明确拒绝（401/403）
+//! 提示（`Retry-After`）或连续限流次数退避（连续次数只记在进程里，见
+//! `UpstreamState::bump_rate_limit`）；只有密钥被上游明确拒绝（401/403）
 //! 累计到阈值才自动停用。上游 5xx、网络抖动这类故障只留痕，不退避也不计数
 //! ——那是上游的病，按住钥匙只会让整块跟着趴下。
 //! `never_disable` 的密钥连自动停用也免掉。
@@ -53,6 +54,11 @@ const FAILURE_THRESHOLD: u32 = 3;
 /// 指数翻倍到 8 分钟等于把整个块按停。真需要更久时，上游会用
 /// `Retry-After` 告诉我们，那时照它说的等（见 [`RETRY_AFTER_MAX_SECS`]）。
 const BACKOFF_LADDER: [i64; 3] = [10, 15, 30];
+/// 限流阶梯的计数窗口（秒）：距上次限流超过这么久，档位归零重新爬。
+///
+/// 不给窗口的话，一天里零散几次 429 会一路爬到 30 秒档，看上去像「这把
+/// 钥匙一直被限流」；隔一小时才来一次的限流和第一次没什么区别。
+const RATE_LIMIT_STREAK_WINDOW: i64 = 60;
 /// 采纳上游 `Retry-After` 提示时的时长上限（秒）。
 ///
 /// 上游让等多久就等多久，但封个顶：一把钥匙被按住太久，对只有一两把
@@ -116,6 +122,20 @@ pub struct UpstreamState {
     /// 旧门后排队的请求按旧容量放行（上界就是旧容量，不会超额），
     /// 新请求立即按新容量走——调大立即生效，调小最多让老队列的人走完。
     gates: Mutex<HashMap<String, Arc<BlockGate>>>,
+    /// 每把密钥的连续限流记录：键是密钥 id。
+    ///
+    /// 只活在进程里——退避阶梯是几十秒级的运行时状态，重启后从第一档
+    /// 重来没有任何损失，不值得为它在库里加一列。条目跟着密钥的删除走
+    /// （见 [`UpstreamState::forget`]），不会越积越多。
+    rate_limit_streaks: Mutex<HashMap<String, RateLimitStreak>>,
+}
+
+/// 一把密钥的连续限流记录。
+struct RateLimitStreak {
+    /// 含最近一次在内的连续限流次数。
+    count: u32,
+    /// 最近一次限流的时间戳，用来判断档位该不该归零。
+    last_at: i64,
 }
 
 /// 一个块的并发闸门。
@@ -237,6 +257,44 @@ impl UpstreamState {
             for id in ids {
                 currents.remove(id);
             }
+        }
+        if let Ok(mut streaks) = self.rate_limit_streaks.lock() {
+            for id in ids {
+                streaks.remove(id);
+            }
+        }
+    }
+
+    /// 记一次限流，返回**含本次在内**的连续限流次数（退避阶梯的档位依据）。
+    ///
+    /// 隔了 [`RATE_LIMIT_STREAK_WINDOW`] 以上就重新从 1 数起。只记在内存里：
+    /// 库里的 `failure_count` 是「被拒」的计数，两者不能混——混在一起，
+    /// 连吃几次限流再挨一次 401 就够把钥匙停用。
+    pub(crate) fn bump_rate_limit(&self, key_id: &str, now: i64) -> u32 {
+        // 锁中毒（别的线程持锁时 panic）时退回第一档：宁可少歇一会儿，
+        // 也别让上报路径跟着 panic。
+        let Ok(mut streaks) = self.rate_limit_streaks.lock() else {
+            return 1;
+        };
+
+        let streak = streaks
+            .entry(key_id.to_string())
+            .or_insert(RateLimitStreak {
+                count: 0,
+                last_at: now,
+            });
+        if now - streak.last_at > RATE_LIMIT_STREAK_WINDOW {
+            streak.count = 0;
+        }
+        streak.count += 1;
+        streak.last_at = now;
+        streak.count
+    }
+
+    /// 一次成功：清掉限流记录，下次限流从第一档重来。
+    pub(crate) fn clear_rate_limit(&self, key_id: &str) {
+        if let Ok(mut streaks) = self.rate_limit_streaks.lock() {
+            streaks.remove(key_id);
         }
     }
 
@@ -764,11 +822,19 @@ pub async fn update_block(
 
 /// 删除块及其全部密钥。
 pub async fn delete_block(pool: &SqlitePool, state: &UpstreamState, id: &str) -> Result<()> {
+    // 先记下它有哪些密钥：块一删，密钥跟着走，它们的运行时记录也该跟着走。
+    let mut gone: Vec<String> = db::block::list_keys(pool, id)
+        .await?
+        .into_iter()
+        .map(|key| key.id)
+        .collect();
+
     if !db::block::delete_block(pool, id).await? {
         return Err(Error::NotFound("块不存在".to_string()));
     }
 
-    state.forget(&[id.to_string()]);
+    gone.push(id.to_string());
+    state.forget(&gone);
     state.invalidate_client(id);
     state.invalidate_gate(id);
     Ok(())
@@ -926,9 +992,17 @@ pub async fn pause_keys(pool: &SqlitePool, block_id: &str, ids: &[String]) -> Re
 }
 
 /// 恢复一批密钥：清掉停用与失败计数，重新参与调度。
-pub async fn resume_keys(pool: &SqlitePool, block_id: &str, ids: &[String]) -> Result<()> {
+pub async fn resume_keys(
+    pool: &SqlitePool,
+    state: &UpstreamState,
+    block_id: &str,
+    ids: &[String],
+) -> Result<()> {
     for id in ids {
         db::block::set_key_status(pool, block_id, id, KeyStatus::Active, time::now_secs()).await?;
+        // 库里清了失败计数与退避，内存里的限流档位也得跟着清——
+        // 重新上岗就该干净地上岗，别接着上次的阶梯数。
+        state.clear_rate_limit(id);
     }
     Ok(())
 }
@@ -1013,6 +1087,7 @@ pub async fn test_key(
     // 探测结果同步落库：测出坏密钥就不用等真实流量再踩一遍。
     match &outcome {
         ProbeOutcome::Valid => {
+            state.clear_rate_limit(&key.id);
             db::block::mark_key_success(pool, &key.id, time::now_secs()).await?;
         }
         ProbeOutcome::Invalid(detail) => {
@@ -1244,8 +1319,9 @@ fn earliest_retry(keys: &[UpstreamKey], now: i64) -> Option<i64> {
         .map(|until| until - now)
 }
 
-/// 一次成功：清零失败计数。
-pub async fn report_success(pool: &SqlitePool, key_id: &str) {
+/// 一次成功：清零失败计数、解除退避，并把内存里的限流档位一起清掉。
+pub async fn report_success(pool: &SqlitePool, state: &UpstreamState, key_id: &str) {
+    state.clear_rate_limit(key_id);
     if let Err(error) = db::block::mark_key_success(pool, key_id, time::now_secs()).await {
         tracing::warn!(key_id, error = %error, "记录密钥成功状态失败");
     }
@@ -1253,16 +1329,20 @@ pub async fn report_success(pool: &SqlitePool, key_id: &str) {
 
 /// 一次失败：按类型决定留痕、退避与停用。
 ///
-/// - 硬失败（密钥被上游拒绝）：计数累计到阈值自动停用；`never_disable` 的密钥
-///   除外——计数、留痕照旧，状态不动。
-/// - 限流（429）：**唯一会退避的失败**。按失败次数（或上游在响应头里给的
-///   `Retry-After` / `retry-after-ms`，有就听它的）把这把密钥按住几十秒，
+/// - 硬失败（401/403）：`failure_count` 累计到阈值自动停用；`never_disable`
+///   的密钥除外——计数、留痕照旧，状态不动。
+/// - 限流（429）：**唯一会退避的失败**。退避时长按**内存里的连续限流次数**
+///   取阶梯；上游在响应头里给了 `Retry-After` / `retry-after-ms` 就听它的。
 ///   永不停用——配额迟早会回来，等一等就有用。
 /// - 上游故障（5xx / 网络 / 200 但结构坏）：**只留痕**。不是这把钥匙的账，
 ///   计数与退避一概不动：一次请求内部本来就要试三把钥匙，若三把都被同一场
 ///   上游故障按住，整块会从「响应失败」恶化成「上游不可用」——故障过去也
 ///   没人能试。
 /// - 三种都写 `last_error`：后台看得见最近一次失败的原因。
+///
+/// **两种计数分开**：`failure_count` 只数 401/403（那是「这把钥匙还行不行」的
+/// 判据），限流次数只进内存（`UpstreamState::bump_rate_limit`）。混在一起的话，
+/// 连吃两次限流再挨一次 401 就够把钥匙停用——负载问题不该替密钥有效性作证。
 ///
 /// 退避是**密钥级**（`cooldown_until`），从不上升到块：同块别的钥匙照常轮。
 ///
@@ -1271,6 +1351,7 @@ pub async fn report_success(pool: &SqlitePool, key_id: &str) {
 /// 客户端这会儿回头多半也讨不到好。
 pub async fn report_failure(
     pool: &SqlitePool,
+    state: &UpstreamState,
     key: &UpstreamKey,
     kind: FailureKind,
     detail: &str,
@@ -1278,57 +1359,69 @@ pub async fn report_failure(
 ) -> Option<i64> {
     let now = time::now_secs();
 
-    // 上游自己的毛病：留一条错误信息就够，别动计数与退避。
-    if kind == FailureKind::Transient {
-        if let Err(error) = db::block::note_key_error(pool, &key.id, detail, now).await {
-            tracing::warn!(key_id = %key.id, error = %error, "记录密钥错误信息失败");
+    match kind {
+        // 上游自己的毛病：留一条错误信息就够，别动计数与退避。
+        FailureKind::Transient => {
+            if let Err(error) = db::block::note_key_error(pool, &key.id, detail, now).await {
+                tracing::warn!(key_id = %key.id, error = %error, "记录密钥错误信息失败");
+            }
+            None
         }
-        return None;
-    }
 
+        // 密钥被拒：累计到阈值就停用，没到就只记计数与原因。
+        FailureKind::Hard => {
+            report_hard_failure(pool, key, detail, now).await;
+            None
+        }
+
+        // 限流：按内存里的连续次数退避，库里的失败计数留给「被拒」。
+        FailureKind::RateLimited => {
+            let streak = state.bump_rate_limit(&key.id, now);
+            let secs = cooldown_secs(streak, retry_after);
+            if let Err(error) =
+                db::block::note_key_cooldown(pool, &key.id, now + secs, detail, now).await
+            {
+                tracing::warn!(key_id = %key.id, error = %error, "记录密钥退避失败");
+            }
+            Some(secs)
+        }
+    }
+}
+
+/// 401/403：累计到阈值就停用，否则只把计数与原因落库。
+///
+/// 停用与留痕一把做完——`Disabled` 是终态，停机原因要跟着落库，否则后台
+/// 只看到「停了」，看不到「为什么停」。
+async fn report_hard_failure(pool: &SqlitePool, key: &UpstreamKey, detail: &str, now: i64) {
     let failures = key.failure_count + 1;
 
-    if kind == FailureKind::Hard && failures >= FAILURE_THRESHOLD {
-        if key.never_disable {
-            tracing::info!(
-                key_id = %key.id,
-                failures,
-                "密钥连续被拒，但已设为永不暂停，仅记录不停用"
-            );
-        } else {
-            // 留痕与停用一把做完：Disabled 是终态，停机原因要跟着落库，
-            // 否则后台只看到「停了」，看不到「为什么停」。
-            if let Err(error) = disable_key(pool, key, failures, detail).await {
-                tracing::warn!(key_id = %key.id, error = %error, "停用密钥失败");
-            } else {
-                tracing::warn!(key_id = %key.id, failures, "密钥连续被拒，已自动停用");
-            }
-            return None;
+    if failures >= FAILURE_THRESHOLD && !key.never_disable {
+        match disable_key(pool, key, failures, detail).await {
+            Ok(()) => tracing::warn!(key_id = %key.id, failures, "密钥连续被拒，已自动停用"),
+            Err(error) => tracing::warn!(key_id = %key.id, error = %error, "停用密钥失败"),
         }
+        return;
     }
-
-    let cooldown = match kind {
-        // 限流是唯一会退避的失败：配额迟早会回来，等一等有用。
-        FailureKind::RateLimited => Some(cooldown_secs(failures, retry_after)),
-        // 硬失败不急：它要么即将停用，要么该由人工看一眼，歇着没用。
-        // 瞬时故障上面已经提前返回，这里只是补全分支。
-        FailureKind::Hard | FailureKind::Transient => None,
-    };
-    let cooldown_until = cooldown.map(|secs| now + secs);
+    if failures >= FAILURE_THRESHOLD {
+        tracing::info!(
+            key_id = %key.id,
+            failures,
+            "密钥连续被拒，但已设为永不暂停，仅记录不停用"
+        );
+    }
 
     let mut connection = match pool.acquire().await {
         Ok(connection) => connection,
         Err(error) => {
             tracing::warn!(key_id = %key.id, error = %error, "获取连接失败");
-            return cooldown;
+            return;
         }
     };
-
     if let Err(error) = db::block::update_key_runtime(
         connection.as_mut(),
         &key.id,
         failures,
-        cooldown_until,
+        None,
         Some(detail.to_string()),
         now,
     )
@@ -1336,8 +1429,6 @@ pub async fn report_failure(
     {
         tracing::warn!(key_id = %key.id, error = %error, "记录密钥失败状态失败");
     }
-
-    cooldown
 }
 
 /// 停用一把密钥，并把停机原因写进 `last_error`。
@@ -1757,9 +1848,15 @@ mod tests {
         assert_eq!(cooldown_secs(2, None), 15);
     }
 
+    /// 上报路径要用的运行时状态：限流档位记在这里，不进库。
+    fn test_state() -> UpstreamState {
+        UpstreamState::default()
+    }
+
     #[tokio::test]
     async fn rate_limit_only_backs_off_never_disables() {
         let pool = test_pool().await;
+        let state = test_state();
         let mut key = seed_key(&pool, false).await;
 
         // 连吃 5 个 429：一次都不该停用，退避按阶梯取（第 3 次起就是 30 秒）。
@@ -1767,6 +1864,7 @@ mod tests {
             let before = time::now_secs();
             report_failure(
                 &pool,
+                &state,
                 &key,
                 FailureKind::RateLimited,
                 "被限流，暂时退避",
@@ -1775,7 +1873,10 @@ mod tests {
             .await;
             key = reload(&pool).await;
 
-            assert_eq!(key.failure_count, expected, "计数逐次累计");
+            assert_eq!(
+                key.failure_count, 0,
+                "限流只进内存阶梯，不写库里的失败计数"
+            );
             assert_eq!(key.status, KeyStatus::Active, "限流永不停用密钥");
             let cooldown = key.cooldown_until.expect("限流必须退避");
             assert!(
@@ -1791,11 +1892,13 @@ mod tests {
     async fn retry_after_sets_the_cooldown_window() {
         // 上游在头里给了「等 45 秒」：退避就照它走，不按本地阶梯。
         let pool = test_pool().await;
+        let state = test_state();
         let key = seed_key(&pool, false).await;
 
         let before = time::now_secs();
         report_failure(
             &pool,
+            &state,
             &key,
             FailureKind::RateLimited,
             "被限流，暂时退避",
@@ -1817,11 +1920,19 @@ mod tests {
         // 一次请求内部要试三把钥匙，退避会顺着把整块按住——上游缓过来时
         // 一把能试的都没有，报错就从「这次失败」变成「上游不可用」。
         let pool = test_pool().await;
+        let state = test_state();
         let mut key = seed_key(&pool, false).await;
 
         for _ in 0..5 {
-            let cooldown =
-                report_failure(&pool, &key, FailureKind::Transient, "上游返回 502", None).await;
+            let cooldown = report_failure(
+                &pool,
+                &state,
+                &key,
+                FailureKind::Transient,
+                "上游返回 502",
+                None,
+            )
+            .await;
             assert!(cooldown.is_none(), "上游故障不该给下游 Retry-After");
             key = reload(&pool).await;
         }
@@ -1841,15 +1952,25 @@ mod tests {
         // 5xx 不计数，随后真被限流时仍从阶梯第一档（10 秒）起算——
         // 否则一场上游故障会把之后的限流罚得更重。
         let pool = test_pool().await;
+        let state = test_state();
         let mut key = seed_key(&pool, false).await;
 
         for _ in 0..2 {
-            report_failure(&pool, &key, FailureKind::Transient, "上游返回 502", None).await;
+            report_failure(
+                &pool,
+                &state,
+                &key,
+                FailureKind::Transient,
+                "上游返回 502",
+                None,
+            )
+            .await;
             key = reload(&pool).await;
         }
 
         let cooldown = report_failure(
             &pool,
+            &state,
             &key,
             FailureKind::RateLimited,
             "上游返回 429",
@@ -1861,13 +1982,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_limit_does_not_raise_the_disable_threshold() {
+        // 这是把两种计数分开的原因：连吃两次限流再挨一次 401，
+        // 混着数就够三次、钥匙被停用；分开数则只算那一次 401。
+        let pool = test_pool().await;
+        let state = test_state();
+        let mut key = seed_key(&pool, false).await;
+
+        for _ in 0..2 {
+            report_failure(
+                &pool,
+                &state,
+                &key,
+                FailureKind::RateLimited,
+                "被限流，暂时退避",
+                None,
+            )
+            .await;
+            key = reload(&pool).await;
+        }
+        report_failure(&pool, &state, &key, FailureKind::Hard, "上游返回 401", None).await;
+        key = reload(&pool).await;
+
+        assert_eq!(
+            key.status,
+            KeyStatus::Active,
+            "限流是负载问题，不该替密钥有效性凑停用次数"
+        );
+        assert_eq!(key.failure_count, 1, "只有那一次 401 算数");
+    }
+
+    #[tokio::test]
+    async fn success_resets_the_rate_limit_ladder() {
+        // 三次限流爬到 30 秒档，成功后档位归零：下次限流又是 10 秒。
+        let pool = test_pool().await;
+        let state = test_state();
+        let mut key = seed_key(&pool, false).await;
+
+        for _ in 0..3 {
+            report_failure(
+                &pool,
+                &state,
+                &key,
+                FailureKind::RateLimited,
+                "被限流，暂时退避",
+                None,
+            )
+            .await;
+            key = reload(&pool).await;
+        }
+
+        report_success(&pool, &state, &key.id).await;
+        key = reload(&pool).await;
+
+        let cooldown = report_failure(
+            &pool,
+            &state,
+            &key,
+            FailureKind::RateLimited,
+            "被限流，暂时退避",
+            None,
+        )
+        .await
+        .expect("限流必须退避");
+        assert_eq!(cooldown, backoff_secs(1), "成功之后阶梯从第一档重来");
+    }
+
+    #[test]
+    fn rate_limit_ladder_decays_after_the_window() {
+        // 隔得久了就重新数：零散的限流不该累积成「一直被限流」。
+        let state = test_state();
+        let start = 1_000_000;
+
+        assert_eq!(state.bump_rate_limit("key-1", start), 1);
+        assert_eq!(
+            state.bump_rate_limit("key-1", start + RATE_LIMIT_STREAK_WINDOW),
+            2,
+            "窗口内接着数"
+        );
+        assert_eq!(
+            state.bump_rate_limit("key-1", start + 2 * RATE_LIMIT_STREAK_WINDOW + 1),
+            1,
+            "超过窗口就归零重来"
+        );
+        assert_eq!(
+            state.bump_rate_limit("key-2", start),
+            1,
+            "档位按密钥分开记"
+        );
+    }
+
+    #[tokio::test]
     async fn hard_failures_disable_at_threshold_with_a_reason() {
         let pool = test_pool().await;
+        let state = test_state();
         let mut key = seed_key(&pool, false).await;
 
         for _ in 0..FAILURE_THRESHOLD {
             report_failure(
                 &pool,
+                &state,
                 &key,
                 FailureKind::Hard,
                 "上游返回 401 密钥无效",
@@ -1891,9 +2105,10 @@ mod tests {
     async fn a_single_hard_failure_does_not_disable() {
         // 阈值是 3：一次被拒（上游打个嗹、限流误报）不该把密钥停掉。
         let pool = test_pool().await;
+        let state = test_state();
         let key = seed_key(&pool, false).await;
 
-        report_failure(&pool, &key, FailureKind::Hard, "上游返回 401", None).await;
+        report_failure(&pool, &state, &key, FailureKind::Hard, "上游返回 401", None).await;
 
         let fresh = reload(&pool).await;
         assert_eq!(fresh.status, KeyStatus::Active);
@@ -1903,10 +2118,11 @@ mod tests {
     #[tokio::test]
     async fn never_disable_survives_hard_failures() {
         let pool = test_pool().await;
+        let state = test_state();
         let mut key = seed_key(&pool, true).await;
 
         for _ in 0..5 {
-            report_failure(&pool, &key, FailureKind::Hard, "上游返回 401", None).await;
+            report_failure(&pool, &state, &key, FailureKind::Hard, "上游返回 401", None).await;
             key = reload(&pool).await;
         }
 
@@ -1921,17 +2137,19 @@ mod tests {
     #[tokio::test]
     async fn success_clears_count_cooldown_and_error() {
         let pool = test_pool().await;
+        let state = test_state();
         let key = seed_key(&pool, false).await;
 
         report_failure(
             &pool,
+            &state,
             &key,
             FailureKind::RateLimited,
             "被限流，暂时退避",
             None,
         )
         .await;
-        report_success(&pool, &key.id).await;
+        report_success(&pool, &state, &key.id).await;
 
         let fresh = reload(&pool).await;
         assert_eq!(fresh.failure_count, 0, "成功清零失败计数");

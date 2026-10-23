@@ -650,7 +650,7 @@ pub async fn chat_completion_stream(
                     // 上游用这把钥匙接下来并开始返回了：算一次成功使用。
                     // 流式这条路以前漏了这一步——`last_used_at` 不更新、
                     // 失败计数也不清零，只有非流式与生图在记。
-                    upstream::report_success(pool, &upstream_key.id).await;
+                    upstream::report_success(pool, &state.upstream, &upstream_key.id).await;
                     upstream = Some(response);
                     chosen = Some((block.id, upstream_key.id, block.api_format));
                     // 位子移交给流：整条流占着这个上游连接，直到它结束。
@@ -688,6 +688,7 @@ pub async fn chat_completion_stream(
                     if status == 429 {
                         let wait = upstream::report_failure(
                             pool,
+                            &state.upstream,
                             &upstream_key,
                             upstream::FailureKind::RateLimited,
                             &format!("上游返回 429 {detail}"),
@@ -712,6 +713,7 @@ pub async fn chat_completion_stream(
                     if status == 401 || status == 403 {
                         upstream::report_failure(
                             pool,
+                            &state.upstream,
                             &upstream_key,
                             upstream::FailureKind::Hard,
                             &format!("上游返回 {status} {detail}"),
@@ -732,6 +734,7 @@ pub async fn chat_completion_stream(
                     if status >= 500 {
                         upstream::report_failure(
                             pool,
+                            &state.upstream,
                             &upstream_key,
                             upstream::FailureKind::Transient,
                             &format!("上游返回 {status} {detail}"),
@@ -778,6 +781,7 @@ pub async fn chat_completion_stream(
                     let user_message = sanitize_user_message(&error);
                     upstream::report_failure(
                         pool,
+                        &state.upstream,
                         &upstream_key,
                         upstream::FailureKind::Transient,
                         &error.to_string(),
@@ -1279,6 +1283,7 @@ async fn dispatch(
                         .unwrap_or("");
                     let wait = upstream::report_failure(
                         pool,
+                        &state.upstream,
                         &upstream_key,
                         upstream::FailureKind::RateLimited,
                         &format!("上游返回 429 {detail}"),
@@ -1312,6 +1317,7 @@ async fn dispatch(
                         .unwrap_or("");
                     upstream::report_failure(
                         pool,
+                        &state.upstream,
                         &upstream_key,
                         upstream::FailureKind::Hard,
                         &format!("上游返回 {status} {detail}"),
@@ -1342,6 +1348,7 @@ async fn dispatch(
                         .unwrap_or("");
                     upstream::report_failure(
                         pool,
+                        &state.upstream,
                         &upstream_key,
                         upstream::FailureKind::Transient,
                         &format!("上游返回 {status} {detail}"),
@@ -1384,6 +1391,7 @@ async fn dispatch(
                         let user_message = sanitize_user_message(&error);
                         upstream::report_failure(
                             pool,
+                            &state.upstream,
                             &upstream_key,
                             upstream::FailureKind::Transient,
                             &error.to_string(),
@@ -1398,7 +1406,7 @@ async fn dispatch(
                         continue;
                     }
                 };
-                upstream::report_success(pool, &upstream_key.id).await;
+                upstream::report_success(pool, &state.upstream, &upstream_key.id).await;
 
                 // 上游没报用量、或只报了一半，就用本地估算补齐缺的那项，
                 // 记账不能被钻空子。估算口径含推理文本——思考模型的思考
@@ -1453,6 +1461,7 @@ async fn dispatch(
                 let user_message = sanitize_user_message(&error);
                 upstream::report_failure(
                     pool,
+                    &state.upstream,
                     &upstream_key,
                     upstream::FailureKind::Transient,
                     &error.to_string(),

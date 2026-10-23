@@ -306,6 +306,32 @@ pub async fn note_key_error(
     Ok(())
 }
 
+/// 挂上一次退避：只写退避截止与原因，不动失败计数。
+///
+/// 失败计数记的是「密钥被拒」（401/403），限流的连续次数活在进程内
+/// （见 `service::upstream::UpstreamState::bump_rate_limit`）。两者混在一起，
+/// 连吃几次限流再挨一次 401 就够把钥匙停用——负载问题不该替密钥有效性作证。
+pub async fn note_key_cooldown(
+    pool: &SqlitePool,
+    key_id: &str,
+    cooldown_until: i64,
+    last_error: &str,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE upstream_keys \
+         SET cooldown_until = ?, last_error = ?, updated_at = ? \
+         WHERE id = ?",
+    )
+    .bind(cooldown_until)
+    .bind(last_error)
+    .bind(now)
+    .bind(key_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// 设置密钥的「永不暂停」开关（免自动停用）。
 ///
 /// 带上 block_id 一起匹配：密钥只应通过它所属的块来操作。

@@ -257,6 +257,7 @@ async fn dispatch(
             let user_message = sanitize_user_message(&error);
             upstream::report_failure(
                 pool,
+                &state.upstream,
                 &upstream_key,
                 upstream::FailureKind::Transient,
                 &error.to_string(),
@@ -277,6 +278,7 @@ async fn dispatch(
         let detail = error_message(&response_body);
         let wait = upstream::report_failure(
             pool,
+            &state.upstream,
             &upstream_key,
             upstream::FailureKind::RateLimited,
             &format!("上游返回 429 {detail}"),
@@ -302,6 +304,7 @@ async fn dispatch(
         let detail = error_message(&response_body);
         upstream::report_failure(
             pool,
+            &state.upstream,
             &upstream_key,
             upstream::FailureKind::Hard,
             &format!("上游返回 {status} {detail}"),
@@ -322,6 +325,7 @@ async fn dispatch(
         let detail = error_message(&response_body);
         upstream::report_failure(
             pool,
+            &state.upstream,
             &upstream_key,
             upstream::FailureKind::Transient,
             &format!("上游返回 {status} {detail}"),
@@ -352,6 +356,7 @@ async fn dispatch(
         let user_message = sanitize_user_message(&error);
         upstream::report_failure(
             pool,
+            &state.upstream,
             &upstream_key,
             upstream::FailureKind::Transient,
             &error.to_string(),
@@ -362,7 +367,7 @@ async fn dispatch(
         return Err(Failure::with_context(error, user_message, context));
     };
 
-    upstream::report_success(pool, &upstream_key.id).await;
+    upstream::report_success(pool, &state.upstream, &upstream_key.id).await;
 
     // gpt-image-1 等新一代接口自带 usage；DALL-E 系列按张估算。
     let usage = parse_usage(&response_body).unwrap_or_else(|| {

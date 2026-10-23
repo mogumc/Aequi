@@ -328,8 +328,8 @@ async fn upstream_failures_do_not_stretch_the_rate_limit_ladder() {
     for key in app.keys().await {
         let until = key.cooldown_until.expect("撞上 429 的钥匙要退避");
         assert_eq!(
-            key.failure_count, 1,
-            "限流计数从 1 起——之前的 502 不该计进去"
+            key.failure_count, 0,
+            "限流不写失败计数——它只数「密钥被拒」，之前的 502 更不算"
         );
         assert!(
             until - now <= 10,

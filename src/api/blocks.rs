@@ -142,7 +142,7 @@ pub async fn resume_keys(
     Path(id): Path<String>,
     Json(payload): Json<KeyIdsRequest>,
 ) -> Result<Json<MessageResponse>> {
-    upstream::resume_keys(&state.store.data, &id, &payload.ids).await?;
+    upstream::resume_keys(&state.store.data, &state.upstream, &id, &payload.ids).await?;
     Ok(Json(MessageResponse::ok("已恢复")))
 }
 
