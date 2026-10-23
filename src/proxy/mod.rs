@@ -735,8 +735,9 @@ pub async fn chat_completion_stream(
                             &upstream_key,
                             upstream::FailureKind::Transient,
                             &format!("上游返回 {status} {detail}"),
-                            // 503 也常见带 Retry-After，有就照它等。
-                            retry_after,
+                            // 上游故障不退避（只留痕），它给的等待提示
+                            // 也就无处可用——跟着一起按住等于替坏上游关块。
+                            None,
                         )
                         .await;
                         last_failure = Some(record_retry(
@@ -1331,8 +1332,9 @@ async fn dispatch(
                     continue;
                 }
 
-                // 上游自己的故障（5xx）不算密钥的账：退避后换一把，
-                // 不停用——上游打个嗝不该把好密钥永久禁掉。
+                // 上游自己的故障（5xx）不算密钥的账：只留痕、换一把重试，
+                // 不退避不停用——给它挂退避的话，一次请求连试三把就等于
+                // 把整块钥匙按住，上游缓过来也没人能试。
                 if status >= 500 {
                     let detail = response_body
                         .pointer("/error/message")
@@ -1343,8 +1345,8 @@ async fn dispatch(
                         &upstream_key,
                         upstream::FailureKind::Transient,
                         &format!("上游返回 {status} {detail}"),
-                        // 503 也常见带 Retry-After，有就照它等。
-                        retry_after,
+                        // 不退避，响应头里的 Retry-After 也无处可用。
+                        None,
                     )
                     .await;
                     last_failure = Some(record_retry(

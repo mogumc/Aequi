@@ -196,14 +196,16 @@ pub struct UpstreamKey {
     pub status: KeyStatus,
     /// 免于被自动停用。
     ///
-    /// 连续失败只记录、不改状态；429 与瞬时故障的退避照常生效
+    /// 连续失败只记录、不改状态；429 的退避照常生效
     /// （退避是几十秒级的临时避让，不是停用）。手动暂停/恢复不受影响。
     /// 管理员测试确认无效时仍会停用——那是带证据的人工动作，不是自动规则。
     pub never_disable: bool,
     pub weight: u32,
-    /// 连续失败次数，成功后清零。
+    /// 连续失败次数（401/403 与 429 累加，上游 5xx 不计），成功后清零。
+    ///
+    /// 401/403 的停用阈值与 429 的退避阶梯都读它。
     pub failure_count: u32,
-    /// 退避截止时间（限流或瞬时故障）；在此之前不参与调度。
+    /// 退避截止时间（只有 429 会设）；在此之前不参与调度。
     pub cooldown_until: Option<i64>,
     pub last_error: Option<String>,
     pub last_used_at: Option<i64>,

@@ -287,6 +287,25 @@ pub async fn update_key_runtime(
     Ok(())
 }
 
+/// 只记一条错误信息，不动失败计数与退避。
+///
+/// 给「上游自己的毛病」用：后台要看得见最近一次失败的原因，但那不是这把
+/// 钥匙的账——计数别涨、退避别挂，否则一个坏掉的上游能把整块钥匙按住。
+pub async fn note_key_error(
+    pool: &SqlitePool,
+    key_id: &str,
+    last_error: &str,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE upstream_keys SET last_error = ?, updated_at = ? WHERE id = ?")
+        .bind(last_error)
+        .bind(now)
+        .bind(key_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// 设置密钥的「永不暂停」开关（免自动停用）。
 ///
 /// 带上 block_id 一起匹配：密钥只应通过它所属的块来操作。

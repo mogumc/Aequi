@@ -3,10 +3,10 @@
 //! 管理面（增删改查、暂停、恢复、测试）在这里；调度面只有两个入口——
 //! 按模型挑块、块内挑密钥，都走平滑加权轮询。
 //!
-//! 密钥的生命周期是自治的：请求成功清零失败计数；可恢复的失败按上游
-//! 提示（`Retry-After`）或失败次数退避；只有密钥被上游明确拒绝（401/403）
-//! 累计到阈值才自动停用——限流、上游 5xx、网络抖动这类短期故障不该把
-//! 好密钥永久禁掉。
+//! 密钥的生命周期是自治的：请求成功清零失败计数；被限流（429）时按上游
+//! 提示（`Retry-After`）或连续限流次数退避；只有密钥被上游明确拒绝（401/403）
+//! 累计到阈值才自动停用。上游 5xx、网络抖动这类故障只留痕，不退避也不计数
+//! ——那是上游的病，按住钥匙只会让整块跟着趴下。
 //! `never_disable` 的密钥连自动停用也免掉。
 
 use std::collections::HashMap;
@@ -31,10 +31,11 @@ use crate::utils::{random, time};
 ///
 /// - [`Hard`](FailureKind::Hard)：密钥本身被上游拒绝（401/403）。换密钥也救不了，
 ///   累计到阈值就自动停用。
-/// - [`RateLimited`](FailureKind::RateLimited)：被限流（429）。优先按上游
-///   `Retry-After` 退避避让，没给提示才走本地阶梯，永不停用。
+/// - [`RateLimited`](FailureKind::RateLimited)：被限流（429）。**唯一会退避的失败**：
+///   优先按上游 `Retry-After` 退避避让，没给提示才走本地阶梯，永不停用。
 /// - [`Transient`](FailureKind::Transient)：上游瞬时故障（5xx、网络、200 但结构不对）。
-///   同样退避，但**不计入停用**——上游打个嗝不该把好密钥永久禁掉。
+///   只留痕：不退避、不计数、不停用——它不是这把钥匙的错，退避只会让一个坏掉的
+///   上游把整块钥匙连着按住，等上游缓过来时一把能试的都没有。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     Hard,
@@ -44,9 +45,9 @@ pub enum FailureKind {
 
 /// 连续硬失败（密钥被上游拒绝）达到该次数后自动停用密钥。
 ///
-/// 只数 [`FailureKind::Hard`]；限流与瞬时故障走退避，不碰停用判定。
+/// 只数 [`FailureKind::Hard`]；限流只退避，瞬时故障连计数都不动。
 const FAILURE_THRESHOLD: u32 = 3;
-/// 退避阶梯（秒）：上游没给 `Retry-After` 提示时，按连续失败次数取。
+/// 退避阶梯（秒）：上游限流却没给 `Retry-After` 提示时，按连续失败次数取。
 ///
 /// 阶梯刻意做得短：只有一两把密钥的块，遇到上游过载会连续吃 429，
 /// 指数翻倍到 8 分钟等于把整个块按停。真需要更久时，上游会用
@@ -78,7 +79,7 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(120);
 /// 复用到它就会表现为「响应读到一半流就没了」且概率性出现。
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 没有上游提示时，这一次该退避多久：按连续失败次数在阶梯上取一档。
+/// 没有上游提示时，这次限流该退避多久：按连续失败次数在阶梯上取一档。
 ///
 /// `failures` 是含本次在内的连续失败次数：第一次 10 秒，之后 15、30，
 /// 第三步起固定 30 秒——再往上翻只会把好密钥雪藏太久。
@@ -87,7 +88,7 @@ fn backoff_secs(failures: u32) -> i64 {
     BACKOFF_LADDER[index]
 }
 
-/// 这次实际该退避多久（秒）。
+/// 这次限流实际该退避多久（秒）。
 ///
 /// 有上游提示（`Retry-After` / `retry-after-ms`）就听上游的——它比我们更清楚
 /// 配额什么时候回来；提示缺失时才退回按次数取阶梯。提示值封顶见
@@ -1250,19 +1251,23 @@ pub async fn report_success(pool: &SqlitePool, key_id: &str) {
     }
 }
 
-/// 一次失败：按类型决定退避与停用。
+/// 一次失败：按类型决定留痕、退避与停用。
 ///
-/// - 硬失败（密钥被上游拒绝）累计到阈值自动停用；`never_disable` 的密钥
+/// - 硬失败（密钥被上游拒绝）：计数累计到阈值自动停用；`never_disable` 的密钥
 ///   除外——计数、留痕照旧，状态不动。
-/// - 限流与瞬时故障按失败次数退避（见 [`backoff_secs`]），**不停用**：
-///   上游打个嗝不该把好密钥永久禁掉，等管理员发现时故障早就过去了。
-///   `retry_after` 是上游在响应头里给出的等待秒数（`Retry-After` /
-///   `retry-after-ms`），有就听它的、没有才走阶梯——它比我们更清楚
-///   配额什么时候回来。
+/// - 限流（429）：**唯一会退避的失败**。按失败次数（或上游在响应头里给的
+///   `Retry-After` / `retry-after-ms`，有就听它的）把这把密钥按住几十秒，
+///   永不停用——配额迟早会回来，等一等就有用。
+/// - 上游故障（5xx / 网络 / 200 但结构坏）：**只留痕**。不是这把钥匙的账，
+///   计数与退避一概不动：一次请求内部本来就要试三把钥匙，若三把都被同一场
+///   上游故障按住，整块会从「响应失败」恶化成「上游不可用」——故障过去也
+///   没人能试。
 /// - 三种都写 `last_error`：后台看得见最近一次失败的原因。
 ///
-/// 返回这把密钥本次实际挂上的退避秒数（硬失败不退避、或已直接停用时为
-/// `None`）——调用方拿它当对下游的 `Retry-After`：既然这把钥匙要歇这么久，
+/// 退避是**密钥级**（`cooldown_until`），从不上升到块：同块别的钥匙照常轮。
+///
+/// 返回这把密钥本次实际挂上的退避秒数（只有限流会给，其余为 `None`）——
+/// 调用方拿它当对下游的 `Retry-After`：既然这把钥匙要歇这么久，
 /// 客户端这会儿回头多半也讨不到好。
 pub async fn report_failure(
     pool: &SqlitePool,
@@ -1271,8 +1276,17 @@ pub async fn report_failure(
     detail: &str,
     retry_after: Option<i64>,
 ) -> Option<i64> {
-    let failures = key.failure_count + 1;
     let now = time::now_secs();
+
+    // 上游自己的毛病：留一条错误信息就够，别动计数与退避。
+    if kind == FailureKind::Transient {
+        if let Err(error) = db::block::note_key_error(pool, &key.id, detail, now).await {
+            tracing::warn!(key_id = %key.id, error = %error, "记录密钥错误信息失败");
+        }
+        return None;
+    }
+
+    let failures = key.failure_count + 1;
 
     if kind == FailureKind::Hard && failures >= FAILURE_THRESHOLD {
         if key.never_disable {
@@ -1294,11 +1308,11 @@ pub async fn report_failure(
     }
 
     let cooldown = match kind {
-        // 硬失败不退避：它要么即将停用，要么该由人工看一眼，歇着没用。
-        FailureKind::Hard => None,
-        FailureKind::RateLimited | FailureKind::Transient => {
-            Some(cooldown_secs(failures, retry_after))
-        }
+        // 限流是唯一会退避的失败：配额迟早会回来，等一等有用。
+        FailureKind::RateLimited => Some(cooldown_secs(failures, retry_after)),
+        // 硬失败不急：它要么即将停用，要么该由人工看一眼，歇着没用。
+        // 瞬时故障上面已经提前返回，这里只是补全分支。
+        FailureKind::Hard | FailureKind::Transient => None,
     };
     let cooldown_until = cooldown.map(|secs| now + secs);
 
@@ -1798,21 +1812,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_failures_do_not_disable() {
-        // 上游 5xx / 网络抖动连吃 5 次：只退避，不停用——
-        // 「短期错误把好密钥永久禁掉」正是要避免的那种死法。
+    async fn transient_failures_only_leave_a_trace() {
+        // 上游 5xx / 网络抖动连吃 5 次：不停用、不退避、计数也不动。
+        // 一次请求内部要试三把钥匙，退避会顺着把整块按住——上游缓过来时
+        // 一把能试的都没有，报错就从「这次失败」变成「上游不可用」。
         let pool = test_pool().await;
         let mut key = seed_key(&pool, false).await;
 
         for _ in 0..5 {
+            let cooldown =
+                report_failure(&pool, &key, FailureKind::Transient, "上游返回 502", None).await;
+            assert!(cooldown.is_none(), "上游故障不该给下游 Retry-After");
+            key = reload(&pool).await;
+        }
+
+        assert_eq!(key.failure_count, 0, "不是这把钥匙的错，计数别动");
+        assert_eq!(key.status, KeyStatus::Active, "上游故障不该停用密钥");
+        assert!(key.cooldown_until.is_none(), "只有 429 才退避");
+        assert_eq!(
+            key.last_error.as_deref(),
+            Some("上游返回 502"),
+            "原因仍要留痕，后台看得见最近一次失败"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_failures_do_not_raise_the_rate_limit_ladder() {
+        // 5xx 不计数，随后真被限流时仍从阶梯第一档（10 秒）起算——
+        // 否则一场上游故障会把之后的限流罚得更重。
+        let pool = test_pool().await;
+        let mut key = seed_key(&pool, false).await;
+
+        for _ in 0..2 {
             report_failure(&pool, &key, FailureKind::Transient, "上游返回 502", None).await;
             key = reload(&pool).await;
         }
 
-        assert_eq!(key.failure_count, 5);
-        assert_eq!(key.status, KeyStatus::Active, "上游故障不该停用密钥");
-        assert!(key.cooldown_until.is_some(), "瞬时故障也要退避");
-        assert_eq!(key.last_error.as_deref(), Some("上游返回 502"));
+        let cooldown = report_failure(
+            &pool,
+            &key,
+            FailureKind::RateLimited,
+            "上游返回 429",
+            None,
+        )
+        .await
+        .expect("限流必须退避");
+        assert_eq!(cooldown, backoff_secs(1), "第一次限流走阶梯第一档");
     }
 
     #[tokio::test]
