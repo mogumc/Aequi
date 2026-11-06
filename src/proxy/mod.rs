@@ -250,17 +250,22 @@ fn truncate_detail(detail: &str) -> String {
 /// 这个 future 里，上游已经把 token 生成出来了，这笔钱却不会有人付账，
 /// 日志里也查无此请求。`tokio::spawn` 的任务不随 JoinHandle 被丢弃而取消，
 /// 所以无论客户端怎么跑路，账都一定落下来。
+///
+/// `body` 按**值**接收：`spawn` 要求任务持有 `'static` 的所有权，若这里收
+/// `&Value` 就只能深拷贝一份进任务。而 `Value` 是带标签的枚举树，长上下文
+/// 请求解析出来的树可达数十 MB，多一份副本就是实打实的峰值内存。调用方
+/// （[`crate::api::proxy_api`]）本来就从 `Json<Value>` 解构出了所有权，
+/// 直接移进来即可，不在中途再复制。
 pub async fn chat_completion(
     state: &Arc<AppState>,
     key: &ApiKey,
-    body: &Value,
+    body: Value,
     ip: &str,
     user_agent: Option<&str>,
     header_block: Option<&str>,
 ) -> Result<Value> {
     let state = Arc::clone(state);
     let key = key.clone();
-    let body = body.clone();
     let ip = ip.to_string();
     let user_agent = user_agent.map(str::to_string);
     let header_block = header_block.map(str::to_string);

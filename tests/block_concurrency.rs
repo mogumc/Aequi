@@ -211,7 +211,7 @@ async fn spawn_hammer(
             let key = demo_key();
             let body = request_body();
             async move {
-                proxy::chat_completion(&state, &key, &body, "127.0.0.1", Some("mock-agent"), None)
+                proxy::chat_completion(&state, &key, body, "127.0.0.1", Some("mock-agent"), None)
                     .await
             }
         }));

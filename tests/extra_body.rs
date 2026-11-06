@@ -210,7 +210,7 @@ async fn configured_extra_body_reaches_the_upstream() {
     proxy::chat_completion(
         &app.state,
         &demo_key(),
-        &chat_body(),
+        chat_body(),
         "127.0.0.1",
         Some("mock-agent"),
         None,
@@ -236,7 +236,7 @@ async fn downstream_extra_body_is_ignored() {
     let mut body = chat_body();
     body["extra_body"] = json!({ "top_k": 999, "seed": 123 });
 
-    proxy::chat_completion(&app.state, &demo_key(), &body, "127.0.0.1", Some("mock-agent"), None)
+    proxy::chat_completion(&app.state, &demo_key(), body, "127.0.0.1", Some("mock-agent"), None)
         .await
         .expect("请求应当成功");
 
