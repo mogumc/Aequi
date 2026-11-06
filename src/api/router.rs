@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::HeaderValue;
 use axum::response::Redirect;
 use axum::routing::{delete, get, post};
@@ -36,6 +36,17 @@ use crate::db;
 use crate::error::Result;
 use crate::service::provider::ProviderInfo;
 use crate::web;
+
+/// 代理入口的请求体上限。
+///
+/// axum 对 `Bytes` 系提取器（`Json`、`String`、`Form`）默认只收 2 MiB，
+/// 超出直接以 413 拒掉，请求根本到不了上游。对话类请求的 body 里装的是
+/// 整段上下文历史，百万 token 量级轻松越过这个数，所以这里单独放宽。
+///
+/// 取 10 MiB 而不是无上限：这是对外暴露的入口，仍需要一个兜底，
+/// 避免有人拿超大 body 拖住进程内存。`.layer(DefaultBodyLimit::...)` 放在
+/// 网关分组上而非全局，管理端接口继续沿用默认的 2 MiB。
+const REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
 /// 构建完整路由。
 pub fn router(state: Arc<AppState>) -> Router {
@@ -112,7 +123,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             key_auth::require_key,
-        ));
+        ))
+        // 长上下文对话的 body 会超过 axum 默认的 2 MiB，这里单独放宽；
+        // 只作用于网关分组，管理端接口仍是默认值。
+        .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT));
 
     Router::new()
         .route("/", get(panel_redirect))
