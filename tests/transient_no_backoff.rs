@@ -211,7 +211,7 @@ async fn call_chat(state: &Arc<AppState>) -> Result<Value, Error> {
     proxy::chat_completion(
         state,
         &demo_key(),
-        &json!({
+        json!({
             "model": "demo-model",
             "messages": [{ "role": "user", "content": "hi" }],
         }),

@@ -100,7 +100,7 @@ pub async fn chat_completions(
     let response = proxy::chat_completion(
         &state,
         &context.key,
-        &body,
+        body,
         &ip,
         user_agent.as_deref(),
         header_block(&headers).as_deref(),

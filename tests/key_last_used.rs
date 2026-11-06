@@ -266,7 +266,7 @@ async fn non_streaming_marks_the_key_as_used_too() {
     proxy::chat_completion(
         &app.state,
         &demo_key(),
-        &request_body(false),
+        request_body(false),
         "127.0.0.1",
         Some("mock-agent"),
         None,
